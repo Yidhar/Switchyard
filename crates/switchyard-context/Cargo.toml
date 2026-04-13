@@ -1,0 +1,12 @@
+[package]
+name = "switchyard-context"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+switchyard-config = { workspace = true }
+switchyard-session = { workspace = true }
+switchyard-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

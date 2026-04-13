@@ -1,0 +1,54 @@
+name: hyard-extension
+provider: gemini
+version: 0.1.0
+description: >
+  Gemini CLI extension that exposes `/hyard:*` commands backed by the
+  Switchyard bridge.
+commands:
+  - name: hyard:list
+    alias: /hyard:list
+    description: List available peers.
+    bridge: '{{SWITCHYARD_CMD}} host list'
+  - name: hyard:delegate
+    alias: /hyard:delegate
+    description: Submit a delegate job and wait briefly; may return wait_timeout while it continues.
+    bridge: '{{SWITCHYARD_CMD}} host delegate --provider {provider} --task "{task}" --wait-sec {wait_sec}'
+    args:
+      - provider
+      - task
+      - wait_sec
+  - name: hyard:status
+    alias: /hyard:status
+    description: Check a job's status.
+    bridge: '{{SWITCHYARD_CMD}} host status --job-id {job_id}'
+    args:
+      - job_id
+  - name: hyard:await
+    alias: /hyard:await
+    description: Continue waiting on an existing job without restarting it.
+    bridge: '{{SWITCHYARD_CMD}} host await --job-id {job_id} --timeout-sec {timeout_sec}'
+    args:
+      - job_id
+      - timeout_sec
+  - name: hyard:result
+    alias: /hyard:result
+    description: Retrieve a job's artifact and summary.
+    bridge: '{{SWITCHYARD_CMD}} host result --job-id {job_id}'
+    args:
+      - job_id
+  - name: hyard:cancel
+    alias: /hyard:cancel
+    description: Cancel a running job (best-effort).
+    bridge: '{{SWITCHYARD_CMD}} host cancel --job-id {job_id}'
+    args:
+      - job_id
+  - name: hyard:help
+    alias: /hyard:help
+    description: Dump the protocol help.
+    bridge: '{{SWITCHYARD_CMD}} host help'
+notes:
+  - Command names may be registered either with or without the `/` prefix
+    depending on Gemini conventions.
+  - Each command must return the JSON that `switchyard host` emits verbatim.
+  - `delegate` and `await` may return `status: "wait_timeout"` while the job continues in background.
+  - Models should use `status/result/await` with the same `job_id` instead of re-delegating.

@@ -1,0 +1,18 @@
+[package]
+name = "switchyard-provider-codex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+switchyard-config = { workspace = true }
+switchyard-provider-api = { workspace = true }
+switchyard-provider-subprocess = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

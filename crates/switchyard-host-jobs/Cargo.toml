@@ -1,0 +1,15 @@
+[package]
+name = "switchyard-host-jobs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+switchyard-provider-api = { workspace = true }
+switchyard-text = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

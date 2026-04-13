@@ -1,0 +1,20 @@
+[package]
+name = "switchyard-orchestrator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+switchyard-config = { workspace = true }
+switchyard-provider-api = { workspace = true }
+switchyard-provider-subprocess = { workspace = true }
+switchyard-session = { workspace = true }
+switchyard-store = { workspace = true }
+switchyard-context = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tokio-util = { workspace = true }

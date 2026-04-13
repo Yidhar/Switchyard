@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/switchyard-cli",
+    "crates/switchyard-tui",
+    "crates/switchyard-text",
+    "crates/switchyard-host-jobs",
+    "crates/switchyard-config",
+    "crates/switchyard-core",
+    "crates/switchyard-session",
+    "crates/switchyard-store",
+    "crates/switchyard-context",
+    "crates/switchyard-orchestrator",
+    "crates/switchyard-artifacts",
+    "crates/switchyard-provider-api",
+    "crates/switchyard-provider-subprocess",
+    "crates/switchyard-provider-codex",
+    "crates/switchyard-provider-claude",
+    "crates/switchyard-provider-gemini",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+switchyard-cli = { path = "crates/switchyard-cli" }
+switchyard-tui = { path = "crates/switchyard-tui" }
+switchyard-text = { path = "crates/switchyard-text" }
+switchyard-host-jobs = { path = "crates/switchyard-host-jobs" }
+switchyard-config = { path = "crates/switchyard-config" }
+switchyard-core = { path = "crates/switchyard-core" }
+switchyard-session = { path = "crates/switchyard-session" }
+switchyard-store = { path = "crates/switchyard-store" }
+switchyard-context = { path = "crates/switchyard-context" }
+switchyard-orchestrator = { path = "crates/switchyard-orchestrator" }
+switchyard-artifacts = { path = "crates/switchyard-artifacts" }
+switchyard-provider-api = { path = "crates/switchyard-provider-api" }
+switchyard-provider-subprocess = { path = "crates/switchyard-provider-subprocess" }
+switchyard-provider-codex = { path = "crates/switchyard-provider-codex" }
+switchyard-provider-claude = { path = "crates/switchyard-provider-claude" }
+switchyard-provider-gemini = { path = "crates/switchyard-provider-gemini" }
+
+# External dependencies
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+similar = "2"
+thiserror = "2"
+async-trait = "0.1"
+tempfile = "3"
+anyhow = "1"
+tokio-util = "0.7"
+portable-pty = "0.8"
+vte = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }

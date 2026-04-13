@@ -1,0 +1,34 @@
+[package]
+name = "switchyard-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "switchyard-tui"
+path = "src/main.rs"
+
+[dependencies]
+switchyard-config = { workspace = true }
+switchyard-core = { workspace = true }
+switchyard-host-jobs = { workspace = true }
+switchyard-text = { workspace = true }
+switchyard-session = { workspace = true }
+switchyard-store = { workspace = true }
+switchyard-provider-api = { workspace = true }
+switchyard-provider-codex = { workspace = true }
+switchyard-provider-claude = { workspace = true }
+switchyard-provider-gemini = { workspace = true }
+switchyard-provider-subprocess = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+vte = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

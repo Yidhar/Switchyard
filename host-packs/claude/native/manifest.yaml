@@ -1,0 +1,47 @@
+name: hyard
+provider: claude
+version: 0.1.0
+description: >
+  Native command manifest for the HYARD delegation protocol. Each entry is
+  implemented as a Claude custom command that shells out to `switchyard host ...`.
+commands:
+  - name: /hyard:list
+    description: List available HYARD peers.
+    bridge: '{{SWITCHYARD_CMD}} host list'
+  - name: /hyard:delegate
+    description: Submit a peer task and wait briefly; may return wait_timeout while the job continues.
+    bridge: '{{SWITCHYARD_CMD}} host delegate --provider {provider} --task "{task}" --wait-sec {wait_sec}'
+    args:
+      - provider
+      - task
+      - wait_sec
+  - name: /hyard:status
+    description: Check the status of a delegate job.
+    bridge: '{{SWITCHYARD_CMD}} host status --job-id {job_id}'
+    args:
+      - job_id
+  - name: /hyard:await
+    description: Continue waiting on an existing delegate job without restarting it.
+    bridge: '{{SWITCHYARD_CMD}} host await --job-id {job_id} --timeout-sec {timeout_sec}'
+    args:
+      - job_id
+      - timeout_sec
+  - name: /hyard:result
+    description: Retrieve a delegate job's result.
+    bridge: '{{SWITCHYARD_CMD}} host result --job-id {job_id}'
+    args:
+      - job_id
+  - name: /hyard:cancel
+    description: Cancel a running delegate job.
+    bridge: '{{SWITCHYARD_CMD}} host cancel --job-id {job_id}'
+    args:
+      - job_id
+  - name: /hyard:help
+    description: Emit the HYARD command catalog.
+    bridge: '{{SWITCHYARD_CMD}} host help'
+notes:
+  - The manifest is informational: each command must surface the JSON returned
+    by the bridge back to Claude.
+  - `delegate` and `await` may return `status: "wait_timeout"` while the job keeps running in background.
+  - Hosts should teach the model to use `status/result/await` with the same `job_id` instead of re-delegating.
+  - Job IDs are UUID strings produced by the bridge.

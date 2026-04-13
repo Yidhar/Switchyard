@@ -1,0 +1,26 @@
+[package]
+name = "switchyard-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+switchyard-config = { workspace = true }
+switchyard-host-jobs = { workspace = true }
+switchyard-text = { workspace = true }
+switchyard-session = { workspace = true }
+switchyard-context = { workspace = true }
+switchyard-store = { workspace = true }
+switchyard-orchestrator = { workspace = true }
+switchyard-artifacts = { workspace = true }
+switchyard-provider-api = { workspace = true }
+switchyard-provider-subprocess = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,6 @@
+[package]
+name = "switchyard-text"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

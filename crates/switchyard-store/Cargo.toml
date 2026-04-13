@@ -1,0 +1,17 @@
+[package]
+name = "switchyard-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+switchyard-session = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
