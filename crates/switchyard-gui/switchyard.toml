@@ -1,0 +1,15 @@
+[core]
+default_provider = "codex"
+default_peers = []
+
+[providers]
+
+[session]
+directory = '.switchyard\sessions'
+
+[store]
+backend = "sqlite"
+
+[ui]
+show_diff = true
+show_artifacts = true

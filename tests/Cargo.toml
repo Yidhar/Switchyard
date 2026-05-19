@@ -1,0 +1,43 @@
+[package]
+name = "switchyard-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "switchyard"
+path = "../crates/switchyard-cli/src/main.rs"
+
+[[bin]]
+name = "switchyard-tui"
+path = "../crates/switchyard-tui/src/main.rs"
+
+[dependencies]
+switchyard-core = { workspace = true }
+switchyard-session = { workspace = true }
+switchyard-store = { workspace = true }
+switchyard-orchestrator = { workspace = true }
+switchyard-config = { workspace = true }
+switchyard-provider-api = { workspace = true }
+switchyard-provider-subprocess = { workspace = true }
+switchyard-provider-claude = { workspace = true }
+switchyard-provider-codex = { workspace = true }
+switchyard-provider-gemini = { workspace = true }
+switchyard-cli = { workspace = true }
+switchyard-tui = { workspace = true }
+switchyard-host-jobs = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+portable-pty = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
