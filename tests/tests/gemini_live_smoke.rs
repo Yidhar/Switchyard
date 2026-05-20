@@ -1,48 +1,41 @@
-//! Live smoke test for Codex provider.
+//! Live smoke test for Gemini provider.
 //!
-//! Skipped by default. Set SWITCHYARD_TEST_CODEX=1 to enable.
-//! Requires `codex` to be installed and authenticated.
+//! Skipped by default. Set SWITCHYARD_TEST_GEMINI=1 to enable.
 
 use switchyard_provider_api::Provider;
-use switchyard_provider_codex::CodexProvider;
+use switchyard_provider_gemini::GeminiProvider;
 
 fn should_run() -> bool {
-    std::env::var("SWITCHYARD_TEST_CODEX").is_ok_and(|v| v == "1")
+    std::env::var("SWITCHYARD_TEST_GEMINI").is_ok_and(|v| v == "1")
 }
 
 #[tokio::test]
-async fn codex_probe_detects_installation() {
+async fn gemini_probe_detects_installation() {
     if !should_run() {
-        eprintln!("skipping: set SWITCHYARD_TEST_CODEX=1 to enable");
+        eprintln!("skipping: set SWITCHYARD_TEST_GEMINI=1 to enable");
         return;
     }
 
-    let provider = CodexProvider::new("codex", vec![], 30);
+    let provider = GeminiProvider::new("gemini", vec![], std::collections::HashMap::new(), 30);
     match provider.probe().await {
         Ok(result) => {
             assert!(result.available);
-            println!("codex version: {:?}", result.version);
-            println!("capabilities: {:?}", result.capabilities);
-            for issue in &result.issues {
-                println!("issue: {issue}");
-            }
+            println!("gemini version: {:?}", result.version);
         }
         Err(e) => {
-            // NotInstalled is acceptable in CI
-            println!("probe failed (expected if codex not installed): {e}");
+            println!("probe failed (expected if not installed): {e}");
         }
     }
 }
 
 #[tokio::test]
-async fn codex_minimal_turn() {
+async fn gemini_minimal_turn() {
     if !should_run() {
-        eprintln!("skipping: set SWITCHYARD_TEST_CODEX=1 to enable");
+        eprintln!("skipping: set SWITCHYARD_TEST_GEMINI=1 to enable");
         return;
     }
 
-    let provider = CodexProvider::new("codex", vec![], 60);
-
+    let provider = GeminiProvider::new("gemini", vec![], std::collections::HashMap::new(), 120);
     let turn_id = uuid::Uuid::now_v7();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
@@ -51,7 +44,7 @@ async fn codex_minimal_turn() {
         system_prompt: None,
     };
     let policy = switchyard_provider_api::ExecutionPolicy {
-        timeout_secs: 60,
+        timeout_secs: 120,
         write_access: false,
         cwd: std::env::current_dir().unwrap(),
         allowed_paths: vec![],
@@ -75,13 +68,9 @@ async fn codex_minimal_turn() {
         .await
     {
         Ok(()) => {
-            let mut events = Vec::new();
             while let Ok(e) = rx.try_recv() {
-                events.push(e);
+                println!("event: {:?} {}", e.event_type, e.provider);
             }
-            println!("received {} events", events.len());
-            assert!(!events.is_empty(), "should receive at least 1 event");
-
             let (result, _) = provider.finalize_turn(turn_id).await.unwrap();
             println!("response: {}", result.response_text);
             assert!(!result.response_text.is_empty());

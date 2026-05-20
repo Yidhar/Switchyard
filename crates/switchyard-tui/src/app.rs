@@ -4,9 +4,10 @@
 //! and runtime-event branches in a tokio::select! loop. The UI is never
 //! blocked by a running turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use chrono::Utc;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -14,7 +15,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -25,8 +26,13 @@ use switchyard_core::{
 };
 use switchyard_provider_api::{HostSurfaceProbe, PeerCatalog};
 use switchyard_provider_subprocess::resize_registered_pty;
-use switchyard_session::Session;
-use switchyard_store::{SessionRepository, StoreBackend, StoreHandle};
+use switchyard_session::{
+    InboxDeliveryMode, InboxEntry, InboxStatus, Session, Turn, TurnOrigin, TurnStatus,
+};
+use switchyard_store::{
+    ArtifactStore, SessionInboxRepository, SessionRepository, StoreBackend, StoreHandle,
+    TurnRepository,
+};
 use switchyard_text::{prefix_chars, preview_chars};
 
 use crate::hyard_jobs::read_hyard_job_summaries;
@@ -34,6 +40,14 @@ use crate::state::{
     HostSurfaceReadiness, HostSurfaceState, HyardJobSource, HyardJobSummary, Phase, RuntimeState,
     is_hyard_event_text,
 };
+
+const COLOR_PRIMARY: Color = Color::Rgb(59, 130, 246); // Blue
+const COLOR_SECONDARY: Color = Color::Rgb(45, 212, 191); // Teal
+const COLOR_HIGHLIGHT: Color = Color::Rgb(245, 158, 11); // Soft gold / Amber
+const COLOR_SUCCESS: Color = Color::Rgb(16, 185, 129); // Emerald green
+const COLOR_HYARD: Color = Color::Rgb(236, 72, 153); // Pink
+const COLOR_MUTED: Color = Color::Rgb(120, 130, 140); // Slate gray
+const COLOR_BORDER_INACTIVE: Color = Color::Rgb(55, 65, 81); // Dark slate gray
 
 struct TurnEntry {
     turn_id: Uuid,
@@ -81,6 +95,7 @@ enum RightPane {
     Events,
     RawStream,
     Artifacts,
+    Inbox,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -150,6 +165,7 @@ impl RightPane {
             Self::Events => 0,
             Self::RawStream => 1,
             Self::Artifacts => 2,
+            Self::Inbox => 3,
         }
     }
 
@@ -158,6 +174,7 @@ impl RightPane {
             Self::Events => "事件",
             Self::RawStream => "原始流",
             Self::Artifacts => "工件",
+            Self::Inbox => "收件箱",
         }
     }
 }
@@ -221,6 +238,28 @@ impl ScrollState {
 }
 
 const DEFAULT_SCROLL_STATE: ScrollState = ScrollState::new();
+const CALLBACK_CONSUMER_POLL_MS: u64 = 200;
+const CALLBACK_RESUME_MESSAGE: &str = "Background callback receipts are ready. Continue this existing session, absorb any injected callback results, and proceed with the user's task from the latest state.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallbackConsumerReady {
+    session_id: Uuid,
+    unread_count: usize,
+    unread_callback_count: usize,
+    entry_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallbackConsumerSignal {
+    Ready(CallbackConsumerReady),
+    Error { session_id: Uuid, message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxRefreshMode {
+    InitialLoad,
+    Live,
+}
 
 pub struct App {
     input: String,
@@ -228,7 +267,7 @@ pub struct App {
     turns: Vec<TurnEntry>,
     message_scrolls: HashMap<MessageView, ScrollState>,
     provider_mode_scrolls: HashMap<(String, ProviderPaneMode), ScrollState>,
-    right_pane_scrolls: [ScrollState; 3],
+    right_pane_scrolls: [ScrollState; 4],
     status: String,
     quit: bool,
     focus: Focus,
@@ -244,8 +283,18 @@ pub struct App {
     last_message: Option<String>,
     /// Collected artifact entries for the artifact panel.
     artifact_entries: Vec<ArtifactDisplayEntry>,
+    /// Session callback inbox entries (unread/read/consumed).
+    inbox_entries: Vec<InboxEntry>,
+    /// Inbox receipts that already surfaced a callback event this runtime.
+    announced_inbox_entries: HashSet<Uuid>,
+    /// Unread non-quiet callback receipts that should trigger the next continuation turn.
+    pending_callback_resume_count: usize,
+    /// Selected inbox row when the Inbox pane is visible.
+    selected_inbox: usize,
     /// Cached session id prefix for status display (avoids borrowing session during running).
     session_id_prefix: String,
+    /// Resume an existing session instead of creating a new one.
+    resume_session_id: Option<Uuid>,
     /// CancellationToken for the active turn (None when idle).
     active_cancel: Option<CancellationToken>,
     /// Clickable tab hitboxes from the latest frame.
@@ -267,6 +316,292 @@ pub struct App {
 struct ArtifactDisplayEntry {
     turn_label: String,
     items: Vec<String>,
+}
+
+fn restored_turn_entry(turn: &Turn) -> TurnEntry {
+    let response = match turn.status {
+        TurnStatus::Failed => Some(format!(
+            "Error: {}",
+            turn.error_message
+                .as_deref()
+                .unwrap_or("turn failed without an error message")
+        )),
+        TurnStatus::Cancelled => Some(
+            turn.provider_response
+                .clone()
+                .unwrap_or_else(|| "Cancelled".to_string()),
+        ),
+        _ => turn.provider_response.clone(),
+    };
+
+    TurnEntry {
+        turn_id: turn.turn_id,
+        user_message: turn.user_message.clone(),
+        response,
+        status: turn.status.to_string(),
+        delegated: false,
+    }
+}
+
+fn build_artifact_entries_from_turns(
+    store: &StoreHandle,
+    turns: &[Turn],
+) -> Vec<ArtifactDisplayEntry> {
+    let mut entries = Vec::new();
+    for turn in turns
+        .iter()
+        .filter(|turn| matches!(turn.origin, TurnOrigin::User))
+    {
+        let artifacts = store.list_artifacts(turn.turn_id).unwrap_or_default();
+        if artifacts.is_empty() {
+            continue;
+        }
+        entries.push(ArtifactDisplayEntry {
+            turn_label: format!(
+                "[{}] {}",
+                turn.provider,
+                preview_chars(&turn.user_message, 20, "…")
+            ),
+            items: artifacts
+                .into_iter()
+                .map(|artifact| artifact.title)
+                .collect(),
+        });
+    }
+    entries
+}
+
+fn callback_event_text(entry: &InboxEntry) -> String {
+    let provider = entry.provider.as_deref().unwrap_or("background");
+    let status = match entry.kind {
+        switchyard_session::InboxItemKind::BackgroundJobReceipt => "callback",
+        _ => "event",
+    };
+    let delivery = match entry.delivery_mode() {
+        InboxDeliveryMode::Immediate => "immediate",
+        InboxDeliveryMode::Checkpoint => "checkpoint",
+        InboxDeliveryMode::Quiet => "quiet",
+        _ => "checkpoint",
+    };
+    let mut text = format!(
+        "[hyard/callback/{provider}/{delivery}] {status}: {}",
+        entry.title
+    );
+    if let Some(summary) = entry.summary.as_deref()
+        && !summary.trim().is_empty()
+    {
+        text.push_str(" — ");
+        text.push_str(&preview_chars(summary, 96, "…"));
+    }
+    text
+}
+
+fn should_wake_for_inbox_entry(entry: &InboxEntry, phase: &Phase) -> bool {
+    matches!(entry.delivery_mode(), InboxDeliveryMode::Immediate)
+        || (matches!(phase, Phase::Idle)
+            && !matches!(entry.delivery_mode(), InboxDeliveryMode::Quiet))
+}
+
+fn is_resumable_inbox_entry(entry: &InboxEntry) -> bool {
+    entry.is_unread() && !matches!(entry.delivery_mode(), InboxDeliveryMode::Quiet)
+}
+
+fn count_resumable_inbox_entries(entries: &[InboxEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| is_resumable_inbox_entry(entry))
+        .count()
+}
+
+async fn run_resident_callback_consumer(
+    store_backend: StoreBackend,
+    store_path: PathBuf,
+    session_id: Uuid,
+    tx: mpsc::Sender<CallbackConsumerSignal>,
+    cancel: CancellationToken,
+) {
+    let mut last_resumable_ids: Vec<Uuid> = Vec::new();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(CALLBACK_CONSUMER_POLL_MS)) => {}
+        }
+
+        let store = match StoreHandle::open(store_backend, store_path.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                tx.send(CallbackConsumerSignal::Error {
+                    session_id,
+                    message: format!("open store failed: {error}"),
+                })
+                .await
+                .ok();
+                continue;
+            }
+        };
+
+        let entries = match store.list_inbox_entries(session_id) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tx.send(CallbackConsumerSignal::Error {
+                    session_id,
+                    message: format!("resident callback consumer inbox read failed: {error}"),
+                })
+                .await
+                .ok();
+                continue;
+            }
+        };
+
+        if matches!(store.load_session(session_id), Ok(Some(session)) if session.active_turn_is_live())
+        {
+            last_resumable_ids.clear();
+            continue;
+        }
+
+        let unread_count = entries.iter().filter(|entry| entry.is_unread()).count();
+        let mut resumable_ids = entries
+            .iter()
+            .filter(|entry| is_resumable_inbox_entry(entry))
+            .map(|entry| entry.entry_id)
+            .collect::<Vec<_>>();
+        resumable_ids.sort();
+
+        if resumable_ids.is_empty() {
+            last_resumable_ids.clear();
+            continue;
+        }
+
+        if resumable_ids != last_resumable_ids {
+            last_resumable_ids = resumable_ids.clone();
+            tx.send(CallbackConsumerSignal::Ready(CallbackConsumerReady {
+                session_id,
+                unread_count,
+                unread_callback_count: resumable_ids.len(),
+                entry_ids: resumable_ids,
+            }))
+            .await
+            .ok();
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn emit_callback_bell() {
+    use std::io::Write as _;
+
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x07");
+    let _ = stdout.flush();
+}
+
+#[cfg(test)]
+fn emit_callback_bell() {}
+
+fn inbox_status_label(status: &InboxStatus) -> &'static str {
+    match status {
+        InboxStatus::Unread => "未读",
+        InboxStatus::Read => "已读",
+        InboxStatus::Consumed => "已归档",
+        _ => "状态",
+    }
+}
+
+fn inbox_status_color(status: &InboxStatus) -> Color {
+    match status {
+        InboxStatus::Unread => Color::Yellow,
+        InboxStatus::Read => Color::DarkGray,
+        InboxStatus::Consumed => Color::Blue,
+        _ => Color::DarkGray,
+    }
+}
+
+fn inbox_row_line(entry: &InboxEntry) -> Line<'static> {
+    let provider = entry.provider.as_deref().unwrap_or("background");
+    let unread_marker = if entry.is_unread() { "●" } else { "·" };
+    let summary = entry
+        .summary
+        .as_deref()
+        .map(|summary| preview_chars(summary, 36, "…"))
+        .unwrap_or_else(|| preview_chars(&entry.message, 36, "…"));
+    Line::from(vec![
+        Span::styled(
+            format!("{unread_marker} "),
+            Style::default().fg(inbox_status_color(&entry.status)),
+        ),
+        Span::styled(
+            format!("{provider} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("[{}] ", inbox_status_label(&entry.status)),
+            Style::default().fg(inbox_status_color(&entry.status)),
+        ),
+        Span::styled(
+            preview_chars(&entry.title, 28, "…"),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!(" · {summary}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn inbox_preview_lines(entry: &InboxEntry) -> Vec<Line<'static>> {
+    let provider = entry.provider.as_deref().unwrap_or("background");
+    let summary = entry.summary.as_deref().unwrap_or(entry.message.as_str());
+    vec![
+        Line::from(vec![
+            Span::styled(" provider: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                provider.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                inbox_status_label(&entry.status),
+                Style::default().fg(inbox_status_color(&entry.status)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" title:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(entry.title.clone(), Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(" summary:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                preview_chars(summary, 72, "…"),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" job:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                entry
+                    .job_id
+                    .map(|id| prefix_chars(&id.to_string(), 8))
+                    .unwrap_or_else(|| "-".to_string()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("  turn: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                entry
+                    .turn_id
+                    .map(|id| prefix_chars(&id.to_string(), 8))
+                    .unwrap_or_else(|| "-".to_string()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" hint:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("M 标已读 · X 归档", Style::default().fg(Color::Yellow)),
+        ]),
+    ]
 }
 
 impl App {
@@ -295,7 +630,7 @@ impl App {
             turns: Vec::new(),
             message_scrolls: HashMap::new(),
             provider_mode_scrolls: HashMap::new(),
-            right_pane_scrolls: [ScrollState::new(); 3],
+            right_pane_scrolls: [ScrollState::new(); 4],
             status: format!("provider: {provider_name} | Enter 发送 | Ctrl-C 退出"),
             quit: false,
             focus: Focus::Input,
@@ -309,7 +644,12 @@ impl App {
             runtime,
             last_message: None,
             artifact_entries: Vec::new(),
+            inbox_entries: Vec::new(),
+            announced_inbox_entries: HashSet::new(),
+            pending_callback_resume_count: 0,
+            selected_inbox: 0,
             session_id_prefix: String::new(),
+            resume_session_id: None,
             active_cancel: None,
             message_tab_hitboxes: Vec::new(),
             provider_mode_hitboxes: Vec::new(),
@@ -319,6 +659,10 @@ impl App {
             turn_list_area: Rect::new(0, 0, 0, 0),
             pending_terminal_resize: false,
         }
+    }
+
+    pub fn set_resume_session(&mut self, session_id: Uuid) {
+        self.resume_session_id = Some(session_id);
     }
 
     pub async fn run(
@@ -337,10 +681,9 @@ impl App {
         let mut terminal = ratatui::Terminal::new(backend)?;
 
         let mut store = StoreHandle::open(self.store_backend, self.store_path.clone())?;
-        let mut session = Session::new(self.provider_name.clone());
-        store.save_session(&session)?;
-        self.session_id_prefix = prefix_chars(&session.session_id.to_string(), 8);
+        let mut session = self.initialize_session(&mut store)?;
         self.refresh_hyard_jobs();
+        self.refresh_session_inbox_initial(&mut store, session.session_id);
         self.update_idle_status();
 
         let result = self
@@ -357,6 +700,266 @@ impl App {
         result
     }
 
+    fn initialize_session(&mut self, store: &mut StoreHandle) -> anyhow::Result<Session> {
+        match self.resume_session_id {
+            Some(session_id) => self.load_existing_session(store, session_id),
+            None => self.create_new_session(store),
+        }
+    }
+
+    fn create_new_session(&mut self, store: &mut StoreHandle) -> anyhow::Result<Session> {
+        let session = Session::new(self.provider_name.clone());
+        store.save_session(&session)?;
+        self.session_id_prefix = prefix_chars(&session.session_id.to_string(), 8);
+        Ok(session)
+    }
+
+    fn load_existing_session(
+        &mut self,
+        store: &mut StoreHandle,
+        session_id: Uuid,
+    ) -> anyhow::Result<Session> {
+        let mut session = store
+            .load_session(session_id)?
+            .ok_or_else(|| anyhow::anyhow!("session '{session_id}' not found"))?;
+
+        if session.active_core != self.provider_name {
+            session.active_core = self.provider_name.clone();
+            session.updated_at = Utc::now();
+            store.save_session(&session)?;
+        }
+
+        self.session_id_prefix = prefix_chars(&session.session_id.to_string(), 8);
+        self.restore_session_history(store, session.session_id)?;
+        Ok(session)
+    }
+
+    fn restore_session_history(
+        &mut self,
+        store: &StoreHandle,
+        session_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let turns = store.list_turns(session_id)?;
+        self.turns = turns
+            .iter()
+            .filter(|turn| matches!(turn.origin, TurnOrigin::User))
+            .map(restored_turn_entry)
+            .collect();
+        self.artifact_entries = build_artifact_entries_from_turns(store, &turns);
+        self.runtime.dirty = true;
+        Ok(())
+    }
+
+    fn refresh_session_inbox_initial(&mut self, store: &mut StoreHandle, session_id: Uuid) {
+        self.refresh_session_inbox_with_mode(store, session_id, InboxRefreshMode::InitialLoad);
+    }
+
+    fn sync_session_inbox_snapshot(&mut self, store: &mut StoreHandle, session_id: Uuid) {
+        self.refresh_session_inbox_with_mode(store, session_id, InboxRefreshMode::InitialLoad);
+    }
+
+    fn refresh_session_inbox(&mut self, store: &mut StoreHandle, session_id: Uuid) {
+        self.refresh_session_inbox_with_mode(store, session_id, InboxRefreshMode::Live);
+    }
+
+    fn refresh_session_inbox_with_mode(
+        &mut self,
+        store: &mut StoreHandle,
+        session_id: Uuid,
+        mode: InboxRefreshMode,
+    ) {
+        let mut entries = match store.list_inbox_entries(session_id) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.runtime
+                    .push_event(format!("[callback] inbox read failed: {error}"));
+                self.runtime.dirty = true;
+                return;
+            }
+        };
+
+        entries.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.entry_id.cmp(&right.entry_id))
+        });
+        let previous_pending_callback_resume_count = self.pending_callback_resume_count;
+        let session_active_turn_live = store
+            .load_session(session_id)
+            .ok()
+            .flatten()
+            .map(|session| session.active_turn_is_live())
+            .unwrap_or(false);
+        self.inbox_entries = entries;
+        self.selected_inbox = self
+            .selected_inbox
+            .min(self.inbox_entries.len().saturating_sub(1));
+        self.pending_callback_resume_count = if session_active_turn_live {
+            0
+        } else {
+            self.resumable_inbox_count()
+        };
+        let current_unread_ids = self
+            .inbox_entries
+            .iter()
+            .filter(|entry| entry.is_unread())
+            .map(|entry| entry.entry_id)
+            .collect::<HashSet<_>>();
+        self.announced_inbox_entries
+            .retain(|entry_id| current_unread_ids.contains(entry_id));
+        if matches!(mode, InboxRefreshMode::InitialLoad) {
+            self.announced_inbox_entries
+                .extend(current_unread_ids.iter().copied());
+        }
+
+        let mut announced_new_receipt = false;
+        let mut should_wake = false;
+        if matches!(mode, InboxRefreshMode::Live) {
+            for entry in &self.inbox_entries {
+                if entry.is_unread() && self.announced_inbox_entries.insert(entry.entry_id) {
+                    self.runtime.push_event(callback_event_text(entry));
+                    announced_new_receipt = true;
+                    should_wake |= should_wake_for_inbox_entry(entry, &self.runtime.phase);
+                }
+            }
+        }
+
+        if should_wake {
+            self.right_pane = RightPane::Inbox;
+            self.selected_inbox = 0;
+            emit_callback_bell();
+        }
+
+        if announced_new_receipt
+            || previous_pending_callback_resume_count != self.pending_callback_resume_count
+        {
+            if self.runtime.phase.is_busy() {
+                self.update_running_status();
+            } else {
+                self.update_idle_status();
+            }
+        }
+        self.runtime.dirty = true;
+    }
+
+    fn unread_inbox_count(&self) -> usize {
+        self.inbox_entries
+            .iter()
+            .filter(|entry| entry.is_unread())
+            .count()
+    }
+
+    fn resumable_inbox_count(&self) -> usize {
+        count_resumable_inbox_entries(&self.inbox_entries)
+    }
+
+    fn selected_inbox_entry(&self) -> Option<&InboxEntry> {
+        self.inbox_entries.get(self.selected_inbox)
+    }
+
+    fn move_inbox_selection(&mut self, delta: i32) {
+        if self.inbox_entries.is_empty() {
+            self.selected_inbox = 0;
+            return;
+        }
+        let max_index = self.inbox_entries.len().saturating_sub(1) as i32;
+        let current = self.selected_inbox.min(max_index as usize) as i32;
+        self.selected_inbox = (current + delta).clamp(0, max_index) as usize;
+        self.runtime.dirty = true;
+    }
+
+    fn mark_selected_inbox_entry(
+        &mut self,
+        store: &mut StoreHandle,
+        consumed: bool,
+    ) -> anyhow::Result<()> {
+        let Some(mut entry) = self.selected_inbox_entry().cloned() else {
+            return Ok(());
+        };
+        if consumed {
+            if matches!(entry.status, InboxStatus::Consumed) {
+                return Ok(());
+            }
+            entry.mark_consumed();
+        } else {
+            if matches!(entry.status, InboxStatus::Read | InboxStatus::Consumed) {
+                return Ok(());
+            }
+            entry.mark_read();
+        }
+        let session_id = entry.session_id;
+        let title = entry.title.clone();
+        store.save_inbox_entry(&entry)?;
+        self.runtime.push_event(if consumed {
+            format!("[hyard/callback] 已归档：{title}")
+        } else {
+            format!("[hyard/callback] 已读：{title}")
+        });
+        self.refresh_session_inbox(store, session_id);
+        Ok(())
+    }
+
+    fn maybe_queue_callback_resume(&mut self, pending_submit: &mut Option<String>) -> bool {
+        if self.pending_callback_resume_count == 0
+            || self.runtime.phase.is_busy()
+            || pending_submit.is_some()
+        {
+            return false;
+        }
+
+        *pending_submit = Some(CALLBACK_RESUME_MESSAGE.to_string());
+        self.runtime.push_event(format!(
+            "[callback/follow] auto-resume queued with {} resumable receipt(s)",
+            self.pending_callback_resume_count
+        ));
+        self.runtime.dirty = true;
+        true
+    }
+
+    fn handle_callback_consumer_signal(
+        &mut self,
+        signal: CallbackConsumerSignal,
+        pending_submit: &mut Option<String>,
+        store: Option<&mut StoreHandle>,
+    ) {
+        match signal {
+            CallbackConsumerSignal::Ready(ready) => {
+                self.pending_callback_resume_count = ready.unread_callback_count;
+                if let Some(store) = store {
+                    self.sync_session_inbox_snapshot(store, ready.session_id);
+                }
+                self.right_pane = RightPane::Inbox;
+                self.selected_inbox = 0;
+                emit_callback_bell();
+                if self.runtime.phase.is_busy() || pending_submit.is_some() {
+                    self.runtime.push_event(format!(
+                        "[callback/follow] {} resumable receipt(s) became ready; auto-resume deferred until the current turn/checkpoint finishes",
+                        ready.unread_callback_count
+                    ));
+                } else {
+                    self.runtime.push_event(format!(
+                        "[callback/follow] {} resumable receipt(s) became ready; scheduling auto-resume",
+                        ready.unread_callback_count
+                    ));
+                    self.maybe_queue_callback_resume(pending_submit);
+                }
+
+                if self.runtime.phase.is_busy() {
+                    self.update_running_status();
+                } else {
+                    self.update_idle_status();
+                }
+                self.runtime.dirty = true;
+            }
+            CallbackConsumerSignal::Error { message, .. } => {
+                self.runtime
+                    .push_event(format!("[callback/follow] {message}"));
+                self.runtime.dirty = true;
+            }
+        }
+    }
+
     async fn event_loop(
         &mut self,
         terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
@@ -366,6 +969,15 @@ impl App {
         session: &mut Session,
     ) -> anyhow::Result<()> {
         let (runtime_tx, mut runtime_rx) = mpsc::channel::<RuntimeEvent>(64);
+        let (callback_tx, mut callback_rx) = mpsc::channel::<CallbackConsumerSignal>(16);
+        let callback_consumer_cancel = CancellationToken::new();
+        let _callback_consumer_task = tokio::spawn(run_resident_callback_consumer(
+            self.store_backend,
+            self.store_path.clone(),
+            session.session_id,
+            callback_tx,
+            callback_consumer_cancel.clone(),
+        ));
         let mut status_tick = tokio::time::interval(tokio::time::Duration::from_millis(100));
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut hyard_job_tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
@@ -373,6 +985,11 @@ impl App {
         let mut kbd_tick = tokio::time::interval(tokio::time::Duration::from_millis(16));
         kbd_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut pending_submit: Option<String> = None;
+        self.runtime.push_event(format!(
+            "[callback/follow] resident callback consumer armed for session {}",
+            prefix_chars(&session.session_id.to_string(), 8)
+        ));
+        self.runtime.dirty = true;
 
         // Start with a static catalog (instant, no subprocess calls).
         // Background probe upgrades it to real availability data.
@@ -394,6 +1011,7 @@ impl App {
         self.runtime.dirty = true;
 
         loop {
+            self.maybe_queue_callback_resume(&mut pending_submit);
             if self.runtime.dirty {
                 terminal.draw(|f| self.draw(f))?;
                 self.runtime.dirty = false;
@@ -401,6 +1019,7 @@ impl App {
             self.sync_pending_terminal_resize();
 
             if self.quit {
+                callback_consumer_cancel.cancel();
                 if let Some(cancel) = self.active_cancel.take() {
                     cancel.cancel();
                 }
@@ -409,6 +1028,7 @@ impl App {
 
             // ── Submit: enter running phase ──
             if let Some(msg) = pending_submit.take() {
+                self.pending_callback_resume_count = 0;
                 self.prepare_turn(&msg);
                 self.runtime.phase = Phase::Preparing;
                 self.runtime.started_at = Some(std::time::Instant::now());
@@ -441,6 +1061,13 @@ impl App {
                                 core_probe_done = true;
                                 self.apply_core_host_surface_probe(result);
                             }
+                            Some(signal) = callback_rx.recv() => {
+                                self.handle_callback_consumer_signal(
+                                    signal,
+                                    &mut pending_submit,
+                                    Some(store),
+                                );
+                            }
                             _ = status_tick.tick() => {
                                 self.update_running_status();
                                 self.runtime.dirty = true;
@@ -453,7 +1080,11 @@ impl App {
                                     match event::read()? {
                                         Event::Key(key) => {
                                             if key.kind != KeyEventKind::Press { continue; }
-                                            self.handle_key_running(key.code, key.modifiers);
+                                            self.handle_key_running(
+                                                key.code,
+                                                key.modifiers,
+                                                store,
+                                            );
                                             self.runtime.dirty = true;
                                         }
                                         Event::Mouse(mouse) => {
@@ -475,6 +1106,7 @@ impl App {
                         }
                         self.sync_pending_terminal_resize();
                         if self.quit {
+                            callback_consumer_cancel.cancel();
                             return Ok(());
                         }
                     }
@@ -495,12 +1127,16 @@ impl App {
                         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                         let resolve_peer =
                             |name: &str| registry.create(name, config.providers.get(name));
+                        let running_session_id = session.session_id;
+                        let mut running_ui_store =
+                            StoreHandle::open(self.store_backend, self.store_path.clone())?;
                         let turn_fut = run_routed_turn_observable(
                             store,
                             session,
                             p.as_ref(),
                             &peer_catalog,
                             &resolve_peer,
+                            None,
                             msg,
                             cwd,
                             Some(&artifact_dir),
@@ -517,6 +1153,7 @@ impl App {
                             }
                             self.sync_pending_terminal_resize();
                             if self.quit {
+                                callback_consumer_cancel.cancel();
                                 if let Some(c) = self.active_cancel.take() {
                                     c.cancel();
                                 }
@@ -529,6 +1166,11 @@ impl App {
                                     if let Err(e) = result {
                                         self.handle_turn_error(&e.to_string());
                                     }
+                                    self.refresh_hyard_jobs();
+                                    self.refresh_session_inbox(
+                                        &mut running_ui_store,
+                                        running_session_id,
+                                    );
                                     self.update_idle_status();
                                     self.runtime.dirty = true;
                                     break;
@@ -543,6 +1185,13 @@ impl App {
                                         }
                                     }
                                 }
+                                Some(signal) = callback_rx.recv() => {
+                                    self.handle_callback_consumer_signal(
+                                        signal,
+                                        &mut pending_submit,
+                                        Some(&mut running_ui_store),
+                                    );
+                                }
                                 result = &mut core_probe_fut, if !core_probe_done => {
                                     core_probe_done = true;
                                     self.apply_core_host_surface_probe(result);
@@ -553,13 +1202,21 @@ impl App {
                                 }
                                 _ = hyard_job_tick.tick() => {
                                     self.refresh_hyard_jobs();
+                                    self.refresh_session_inbox(
+                                        &mut running_ui_store,
+                                        running_session_id,
+                                    );
                                 }
                                 _ = kbd_tick.tick() => {
                                     while event::poll(std::time::Duration::ZERO)? {
                                         match event::read()? {
                                             Event::Key(key) => {
                                                 if key.kind != KeyEventKind::Press { continue; }
-                                                self.handle_key_running(key.code, key.modifiers);
+                                                self.handle_key_running(
+                                                    key.code,
+                                                    key.modifiers,
+                                                    &mut running_ui_store,
+                                                );
                                                 self.runtime.dirty = true;
                                             }
                                             Event::Mouse(mouse) => {
@@ -618,6 +1275,13 @@ impl App {
                         }
                     }
                 }
+                Some(signal) = callback_rx.recv() => {
+                    self.handle_callback_consumer_signal(
+                        signal,
+                        &mut pending_submit,
+                        Some(store),
+                    );
+                }
                 _ = status_tick.tick() => {
                     if self.runtime.phase.is_busy() {
                         self.update_running_status();
@@ -626,13 +1290,19 @@ impl App {
                 }
                 _ = hyard_job_tick.tick() => {
                     self.refresh_hyard_jobs();
+                    self.refresh_session_inbox(store, session.session_id);
                 }
                 _ = kbd_tick.tick() => {
                     while event::poll(std::time::Duration::ZERO)? {
                         match event::read()? {
                             Event::Key(key) => {
                                 if key.kind != KeyEventKind::Press { continue; }
-                                self.handle_key_idle(key.code, key.modifiers, &mut pending_submit);
+                                self.handle_key_idle(
+                                    key.code,
+                                    key.modifiers,
+                                    &mut pending_submit,
+                                    store,
+                                );
                                 self.runtime.dirty = true;
                             }
                             Event::Mouse(mouse) => {
@@ -671,6 +1341,7 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
         pending_submit: &mut Option<String>,
+        store: &mut StoreHandle,
     ) {
         if self.focus != Focus::Input && self.try_switch_message_view_by_key(code) {
             return;
@@ -739,12 +1410,66 @@ impl App {
                 _ => {}
             },
             _ if self.focus == Focus::Sidebar => match code {
-                KeyCode::Up | KeyCode::Char('k') => self.scroll_right_pane_by(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.scroll_right_pane_by(1),
-                KeyCode::PageUp => self.scroll_right_pane_by(-10),
-                KeyCode::PageDown => self.scroll_right_pane_by(10),
-                KeyCode::Home => self.scroll_right_pane_to_top(),
-                KeyCode::End => self.scroll_right_pane_to_latest(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.move_inbox_selection(-1);
+                    } else {
+                        self.scroll_right_pane_by(-1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.move_inbox_selection(1);
+                    } else {
+                        self.scroll_right_pane_by(1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.move_inbox_selection(-5);
+                    } else {
+                        self.scroll_right_pane_by(-10);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.move_inbox_selection(5);
+                    } else {
+                        self.scroll_right_pane_by(10);
+                    }
+                }
+                KeyCode::Home => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.selected_inbox = 0;
+                        self.runtime.dirty = true;
+                    } else {
+                        self.scroll_right_pane_to_top();
+                    }
+                }
+                KeyCode::End => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.selected_inbox = self.inbox_entries.len().saturating_sub(1);
+                        self.runtime.dirty = true;
+                    } else {
+                        self.scroll_right_pane_to_latest();
+                    }
+                }
+                KeyCode::Char('m') | KeyCode::Char('M')
+                    if matches!(self.right_pane, RightPane::Inbox) =>
+                {
+                    if let Err(error) = self.mark_selected_inbox_entry(store, false) {
+                        self.runtime
+                            .push_event(format!("[hyard/callback] 标记已读失败：{error}"));
+                    }
+                }
+                KeyCode::Char('x') | KeyCode::Char('X')
+                    if matches!(self.right_pane, RightPane::Inbox) =>
+                {
+                    if let Err(error) = self.mark_selected_inbox_entry(store, true) {
+                        self.runtime
+                            .push_event(format!("[hyard/callback] 归档失败：{error}"));
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -752,7 +1477,12 @@ impl App {
     }
 
     /// Handle key events during running phase (limited: Esc cancel, Ctrl-C quit, pane toggle, scroll).
-    fn handle_key_running(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+    fn handle_key_running(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        store: &mut StoreHandle,
+    ) {
         if self.focus != Focus::Input && self.try_switch_message_view_by_key(code) {
             return;
         }
@@ -803,12 +1533,66 @@ impl App {
                 _ => {}
             },
             _ if self.focus == Focus::Sidebar => match code {
-                KeyCode::Up | KeyCode::Char('k') => self.scroll_right_pane_by(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.scroll_right_pane_by(1),
-                KeyCode::PageUp => self.scroll_right_pane_by(-10),
-                KeyCode::PageDown => self.scroll_right_pane_by(10),
-                KeyCode::Home => self.scroll_right_pane_to_top(),
-                KeyCode::End => self.scroll_right_pane_to_latest(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.move_inbox_selection(-1);
+                    } else {
+                        self.scroll_right_pane_by(-1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.move_inbox_selection(1);
+                    } else {
+                        self.scroll_right_pane_by(1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.move_inbox_selection(-5);
+                    } else {
+                        self.scroll_right_pane_by(-10);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.move_inbox_selection(5);
+                    } else {
+                        self.scroll_right_pane_by(10);
+                    }
+                }
+                KeyCode::Home => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.selected_inbox = 0;
+                        self.runtime.dirty = true;
+                    } else {
+                        self.scroll_right_pane_to_top();
+                    }
+                }
+                KeyCode::End => {
+                    if matches!(self.right_pane, RightPane::Inbox) {
+                        self.selected_inbox = self.inbox_entries.len().saturating_sub(1);
+                        self.runtime.dirty = true;
+                    } else {
+                        self.scroll_right_pane_to_latest();
+                    }
+                }
+                KeyCode::Char('m') | KeyCode::Char('M')
+                    if matches!(self.right_pane, RightPane::Inbox) =>
+                {
+                    if let Err(error) = self.mark_selected_inbox_entry(store, false) {
+                        self.runtime
+                            .push_event(format!("[hyard/callback] 标记已读失败：{error}"));
+                    }
+                }
+                KeyCode::Char('x') | KeyCode::Char('X')
+                    if matches!(self.right_pane, RightPane::Inbox) =>
+                {
+                    if let Err(error) = self.mark_selected_inbox_entry(store, true) {
+                        self.runtime
+                            .push_event(format!("[hyard/callback] 归档失败：{error}"));
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -957,6 +1741,14 @@ impl App {
                     },
                 );
             }
+            RuntimeEvent::CallbackReceiptsInjected { count, .. } => {
+                self.pending_callback_resume_count = 0;
+                self.status = format!(
+                    "已向当前回合送达 {count} 个后台回执 | focus:{} | {}",
+                    self.focus.label(),
+                    self.view_switch_hint(),
+                );
+            }
             _ => {}
         }
 
@@ -966,7 +1758,10 @@ impl App {
         ) && self.runtime.phase.is_busy()
         {
             self.update_running_status();
-        } else if matches!(evt, RuntimeEvent::HyardJobObserved { .. }) {
+        } else if matches!(
+            evt,
+            RuntimeEvent::HyardJobObserved { .. } | RuntimeEvent::CallbackReceiptsInjected { .. }
+        ) {
             self.update_idle_status();
         }
     }
@@ -981,6 +1776,7 @@ impl App {
         self.status = format!("回合失败：{error}");
         self.runtime.phase = Phase::Idle;
         self.runtime.started_at = None;
+        self.runtime.delivered_callback_receipt_count = 0;
         self.runtime.dirty = true;
     }
 
@@ -996,11 +1792,18 @@ impl App {
             self.runtime.waiting_hyard_job_count,
             self.runtime.inferred_hyard_job_count,
         );
+        let follow_suffix = callback_follow_suffix(self.pending_callback_resume_count);
+        let inbox_suffix = match self.unread_inbox_count() {
+            0 => String::new(),
+            unread => format!(" | inbox:{unread}新"),
+        };
         self.status = format!(
-            "session:{} | {}{} | focus:{} | {} | Tab:切焦点 | Enter:发送{} | Esc:取消 | F2:右侧面板 | Ctrl-C:退出",
+            "session:{} | {}{}{}{} | focus:{} | {} | Tab:切焦点 | Enter:发送{} | Esc:取消 | F2:右侧面板 | Ctrl-C:退出",
             self.session_id_prefix,
             self.provider_name,
             hyard_suffix,
+            follow_suffix,
+            inbox_suffix,
             self.focus.label(),
             view_hint,
             retry_hint,
@@ -1017,41 +1820,48 @@ impl App {
             self.runtime.waiting_hyard_job_count,
             self.runtime.inferred_hyard_job_count,
         );
+        let follow_suffix = callback_follow_suffix(self.pending_callback_resume_count);
+        let callback_suffix =
+            callback_delivery_suffix(self.runtime.delivered_callback_receipt_count);
+        let inbox_suffix = match self.unread_inbox_count() {
+            0 => String::new(),
+            unread => format!(" | inbox:{unread}新"),
+        };
         self.status = match &self.runtime.phase {
             Phase::Preparing => format!(
-                "准备回合 [{elapsed}]{hyard_suffix} | focus:{} | {view_hint}",
+                "准备回合 [{elapsed}]{hyard_suffix}{follow_suffix}{callback_suffix}{inbox_suffix} | focus:{} | {view_hint}",
                 self.focus.label(),
             ),
             Phase::ProbingPeers => {
                 format!(
-                    "探测 peers [{elapsed}]{hyard_suffix} | focus:{} | {view_hint}",
+                    "探测 peers [{elapsed}]{hyard_suffix}{follow_suffix}{callback_suffix}{inbox_suffix} | focus:{} | {view_hint}",
                     self.focus.label(),
                 )
             }
             Phase::CoreRunning => format!(
-                "主代理执行中 ({provider}) [{elapsed}]{hyard_suffix} | focus:{} | {view_hint}",
+                "主代理执行中 ({provider}) [{elapsed}]{hyard_suffix}{follow_suffix}{callback_suffix}{inbox_suffix} | focus:{} | {view_hint}",
                 self.focus.label(),
             ),
             Phase::DelegateRequested => {
                 format!(
-                    "已请求委托 -> {} [{elapsed}]{hyard_suffix} | focus:{} | {view_hint}",
+                    "已请求委托 -> {} [{elapsed}]{hyard_suffix}{follow_suffix}{callback_suffix}{inbox_suffix} | focus:{} | {view_hint}",
                     peer.unwrap_or("?"),
                     self.focus.label(),
                 )
             }
             Phase::PeerRunning => {
                 format!(
-                    "peer 执行中 -> {} [{elapsed}]{hyard_suffix} | focus:{} | {view_hint}",
+                    "peer 执行中 -> {} [{elapsed}]{hyard_suffix}{follow_suffix}{callback_suffix}{inbox_suffix} | focus:{} | {view_hint}",
                     peer.unwrap_or("?"),
                     self.focus.label(),
                 )
             }
             Phase::Finalizing => format!(
-                "正在收尾 ({provider}) [{elapsed}]{hyard_suffix} | focus:{} | {view_hint}",
+                "正在收尾 ({provider}) [{elapsed}]{hyard_suffix}{follow_suffix}{callback_suffix}{inbox_suffix} | focus:{} | {view_hint}",
                 self.focus.label(),
             ),
             Phase::Committing => format!(
-                "正在保存结果 [{elapsed}]{hyard_suffix} | focus:{} | {view_hint}",
+                "正在保存结果 [{elapsed}]{hyard_suffix}{follow_suffix}{callback_suffix}{inbox_suffix} | focus:{} | {view_hint}",
                 self.focus.label(),
             ),
             Phase::Idle => String::new(), // shouldn't reach here
@@ -1123,8 +1933,13 @@ impl App {
             RightPane::Events => self.draw_event_log(f, right[1]),
             RightPane::RawStream => self.draw_raw_stream(f, right[1]),
             RightPane::Artifacts => self.draw_artifact_detail(f, right[1]),
+            RightPane::Inbox => self.draw_inbox_list(f, right[1]),
         }
-        self.draw_artifacts(f, right[2]);
+        if matches!(self.right_pane, RightPane::Inbox) {
+            self.draw_inbox_preview(f, right[2]);
+        } else {
+            self.draw_artifacts(f, right[2]);
+        }
         self.draw_hint_bar(f, outer[2]);
         self.draw_input(f, outer[3]);
         self.draw_status(f, outer[4]);
@@ -1144,15 +1959,21 @@ impl App {
         let accent = self.message_view_accent_color(&self.message_view);
         self.message_tab_hitboxes = compute_tab_hitboxes(area, &views, &titles);
 
+        let border_color = if self.focus == Focus::Transcript {
+            accent
+        } else {
+            COLOR_BORDER_INACTIVE
+        };
+
         let tabs = Tabs::new(titles)
             .select(selected)
             .block(
                 Block::default()
                     .title(" Views ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(border_color)),
             )
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(COLOR_MUTED))
             .highlight_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
             .divider(Span::raw(" | "));
 
@@ -1210,19 +2031,25 @@ impl App {
             .collect::<Vec<_>>();
         self.provider_mode_hitboxes = compute_provider_mode_hitboxes(area, &titles);
 
+        let accent = self.message_view_accent_color(&MessageView::Provider(provider.to_string()));
+        let border_color = if self.focus == Focus::Transcript {
+            accent
+        } else {
+            COLOR_BORDER_INACTIVE
+        };
+
         let tabs = Tabs::new(titles)
             .select(current_mode.index())
             .block(
                 Block::default()
                     .title(" 模式 ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(border_color)),
             )
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(COLOR_MUTED))
             .highlight_style(
                 Style::default()
-                    .fg(self
-                        .message_view_accent_color(&MessageView::Provider(provider.to_string())))
+                    .fg(accent)
                     .add_modifier(Modifier::BOLD),
             )
             .divider(Span::raw(" | "));
@@ -1240,7 +2067,7 @@ impl App {
         let border_color = if self.focus == Focus::Transcript {
             self.message_view_accent_color(&MessageView::Provider(provider.to_string()))
         } else {
-            Color::DarkGray
+            COLOR_BORDER_INACTIVE
         };
 
         let lines: Vec<Line<'static>> = match mode {
@@ -1249,7 +2076,7 @@ impl App {
                 if lines.is_empty() {
                     vec![Line::from(Span::styled(
                         empty_provider_mode_text(provider, mode),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(COLOR_MUTED),
                     ))]
                 } else {
                     lines
@@ -1260,13 +2087,13 @@ impl App {
                 if entries.is_empty() {
                     vec![Line::from(Span::styled(
                         empty_provider_mode_text(provider, mode),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(COLOR_MUTED),
                     ))]
                 } else {
                     entries
                         .into_iter()
                         .map(|entry| {
-                            Line::from(Span::styled(entry, Style::default().fg(Color::Green)))
+                            Line::from(Span::styled(entry, Style::default().fg(COLOR_SUCCESS)))
                         })
                         .collect()
                 }
@@ -1276,7 +2103,7 @@ impl App {
                 if entries.is_empty() {
                     vec![Line::from(Span::styled(
                         empty_provider_mode_text(provider, mode),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(COLOR_MUTED),
                     ))]
                 } else {
                     entries
@@ -1328,11 +2155,17 @@ impl App {
             })
             .collect();
 
+        let border_color = if self.focus == Focus::Sidebar {
+            COLOR_PRIMARY
+        } else {
+            COLOR_BORDER_INACTIVE
+        };
+
         let list = List::new(items).block(
             Block::default()
                 .title(" Turns ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(border_color)),
         );
         f.render_widget(list, area);
     }
@@ -1345,7 +2178,7 @@ impl App {
                 Span::styled(
                     format!("#{} You: ", i + 1),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(COLOR_SECONDARY)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(turn.user_message.clone()),
@@ -1361,7 +2194,7 @@ impl App {
                     lines.push(Line::from(Span::styled(
                         label,
                         Style::default()
-                            .fg(Color::Green)
+                            .fg(COLOR_SUCCESS)
                             .add_modifier(Modifier::BOLD),
                     )));
                     for line in resp.lines() {
@@ -1387,19 +2220,19 @@ impl App {
                         };
                         lines.push(Line::from(Span::styled(
                             format!("   {active} ({progress_label}): "),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(COLOR_HIGHLIGHT),
                         )));
                         for sl in self.runtime.stream_lines.iter().rev().take(5).rev() {
                             let preview = prefix_chars(sl, 60);
                             lines.push(Line::from(Span::styled(
                                 format!("   {preview}"),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(COLOR_MUTED),
                             )));
                         }
                     } else {
                         lines.push(Line::from(Span::styled(
                             "   (running...)",
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(COLOR_HIGHLIGHT),
                         )));
                     }
                 }
@@ -1411,14 +2244,14 @@ impl App {
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  Type a message and press Enter.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(COLOR_MUTED),
             )));
         }
 
         let border_color = if self.focus == Focus::Transcript {
-            Color::Blue
+            self.message_view_accent_color(&self.message_view)
         } else {
-            Color::DarkGray
+            COLOR_BORDER_INACTIVE
         };
 
         let scroll = self.sync_current_message_scroll(max_scroll_for_lines(&lines, area));
@@ -1482,30 +2315,48 @@ impl App {
         let elapsed = self.runtime.elapsed_display();
 
         let phase_color = match phase {
-            Phase::Idle => Color::Green,
-            Phase::Committing => Color::Green, // almost done — green
-            Phase::Preparing | Phase::ProbingPeers => Color::Blue,
-            Phase::CoreRunning | Phase::Finalizing => Color::Cyan,
-            Phase::DelegateRequested => Color::Magenta,
-            Phase::PeerRunning => Color::Yellow,
+            Phase::Idle => COLOR_SUCCESS,
+            Phase::Committing => COLOR_SUCCESS,
+            Phase::Preparing | Phase::ProbingPeers => COLOR_PRIMARY,
+            Phase::CoreRunning | Phase::Finalizing => COLOR_SECONDARY,
+            Phase::DelegateRequested => COLOR_HYARD,
+            Phase::PeerRunning => COLOR_HIGHLIGHT,
+        };
+
+        let spinner = if phase.is_busy() {
+            let tick = (chrono::Utc::now().timestamp_millis() / 150) % 8;
+            let tick_char = match tick {
+                0 => "⠋",
+                1 => "⠙",
+                2 => "⠹",
+                3 => "⠸",
+                4 => "⠼",
+                5 => "⠴",
+                6 => "⠦",
+                7 => "⠧",
+                _ => "⠋",
+            };
+            format!(" {} ", tick_char)
+        } else {
+            String::new()
         };
 
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled(" phase: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" phase: ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
-                phase.to_string(),
+                format!("{}{}", phase, spinner),
                 Style::default()
                     .fg(phase_color)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled(" core:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" core:  ", Style::default().fg(COLOR_MUTED)),
             Span::raw(provider),
         ]));
         lines.push(Line::from(vec![
-            Span::styled(" peer:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" peer:  ", Style::default().fg(COLOR_MUTED)),
             Span::raw(peer),
             Span::styled(
                 if elapsed.is_empty() {
@@ -1513,7 +2364,7 @@ impl App {
                 } else {
                     format!("  {elapsed}")
                 },
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(COLOR_MUTED),
             ),
         ]));
         lines.push(Line::from(build_peer_probe_spans(
@@ -1539,18 +2390,23 @@ impl App {
         lines.push(Line::from(build_hyard_job_execution_spans(
             self.runtime.primary_hyard_job(),
         )));
+        lines.push(Line::from(build_inbox_status_spans(
+            self.unread_inbox_count(),
+            self.inbox_entries.len(),
+            self.selected_inbox_entry(),
+        )));
         let latest = self.runtime.latest_hyard_event.as_deref().unwrap_or("-");
         let latest_preview = event_preview(latest, LATEST_EVENT_PREVIEW_CHARS);
         lines.push(Line::from(vec![
-            Span::styled(" hyard: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(latest_preview, Style::default().fg(Color::Magenta)),
+            Span::styled(" hyard: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(latest_preview, Style::default().fg(COLOR_HYARD)),
         ]));
 
         let paragraph = Paragraph::new(lines).block(
             Block::default()
                 .title(" Status ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(COLOR_BORDER_INACTIVE)),
         );
         f.render_widget(paragraph, area);
     }
@@ -1620,6 +2476,77 @@ impl App {
             )
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
+        f.render_widget(paragraph, area);
+    }
+
+    fn draw_inbox_list(&mut self, f: &mut Frame, area: Rect) {
+        let unread = self.unread_inbox_count();
+        let title = if unread == 0 {
+            " Inbox (F2) ".to_string()
+        } else {
+            format!(" Inbox · {} new (F2) ", unread)
+        };
+
+        if self.inbox_entries.is_empty() {
+            let paragraph = Paragraph::new(vec![Line::from(Span::styled(
+                " (no callback receipts yet)",
+                Style::default().fg(Color::DarkGray),
+            ))])
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(self.right_pane_border_color())),
+            )
+            .wrap(Wrap { trim: false });
+            f.render_widget(paragraph, area);
+            return;
+        }
+
+        let items = self
+            .inbox_entries
+            .iter()
+            .map(|entry| ListItem::new(inbox_row_line(entry)))
+            .collect::<Vec<_>>();
+        let mut state = ListState::default();
+        state.select(Some(
+            self.selected_inbox
+                .min(self.inbox_entries.len().saturating_sub(1)),
+        ));
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(self.right_pane_border_color())),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("❯ ");
+
+        f.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn draw_inbox_preview(&mut self, f: &mut Frame, area: Rect) {
+        let lines = match self.selected_inbox_entry() {
+            Some(entry) => inbox_preview_lines(entry),
+            None => vec![Line::from(Span::styled(
+                " (select an inbox receipt)",
+                Style::default().fg(Color::DarkGray),
+            ))],
+        };
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Inbox Preview (M:已读 X:归档) ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(Wrap { trim: false });
         f.render_widget(paragraph, area);
     }
 
@@ -1702,11 +2629,11 @@ impl App {
         let busy = self.runtime.phase.is_busy();
         let executing = self.runtime.phase.is_executing();
         let border_color = if self.focus == Focus::Input && !busy {
-            Color::Blue
+            COLOR_PRIMARY
         } else if executing {
-            Color::Yellow
+            COLOR_HIGHLIGHT
         } else {
-            Color::DarkGray
+            COLOR_BORDER_INACTIVE
         };
         let title = if executing {
             " Input (running...) "
@@ -1737,7 +2664,7 @@ impl App {
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let paragraph = Paragraph::new(Span::styled(
             format!(" {}", self.status),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_MUTED),
         ));
         f.render_widget(paragraph, area);
     }
@@ -1750,10 +2677,10 @@ impl App {
                     " 焦点:{} | Tab/Shift-Tab 切换焦点 | 鼠标点击 Views 切视图 | F2 切换右侧面板 | End 跳到最新 ",
                     self.focus.label(),
                 ),
-                Color::DarkGray,
+                COLOR_MUTED,
             )
         } else {
-            (format!(" {}", hints.join("  |  ")), Color::Yellow)
+            (format!(" {}", hints.join("  |  ")), COLOR_HIGHLIGHT)
         };
 
         let paragraph = Paragraph::new(Span::styled(
@@ -1904,17 +2831,17 @@ impl App {
 
     fn message_view_accent_color(&self, view: &MessageView) -> Color {
         match view {
-            MessageView::Overview => Color::Blue,
+            MessageView::Overview => COLOR_PRIMARY,
             MessageView::Provider(provider) if provider == &self.runtime.current_provider => {
-                Color::Cyan
+                COLOR_SECONDARY
             }
             MessageView::Provider(provider)
                 if self.runtime.current_peer.as_deref() == Some(provider.as_str()) =>
             {
-                Color::Yellow
+                COLOR_HIGHLIGHT
             }
-            MessageView::Provider(_) => Color::Green,
-            MessageView::Hyard => Color::Magenta,
+            MessageView::Provider(_) => COLOR_SUCCESS,
+            MessageView::Hyard => COLOR_HYARD,
         }
     }
 
@@ -1977,7 +2904,8 @@ impl App {
         self.right_pane = match self.right_pane {
             RightPane::Events => RightPane::RawStream,
             RightPane::RawStream => RightPane::Artifacts,
-            RightPane::Artifacts => RightPane::Events,
+            RightPane::Artifacts => RightPane::Inbox,
+            RightPane::Inbox => RightPane::Events,
         };
         self.sync_status_after_ui_change();
         self.runtime.dirty = true;
@@ -2081,6 +3009,13 @@ impl App {
                 RightPane::Events => Color::DarkGray,
                 RightPane::RawStream => Color::Blue,
                 RightPane::Artifacts => Color::Blue,
+                RightPane::Inbox => {
+                    if self.unread_inbox_count() > 0 {
+                        Color::Yellow
+                    } else {
+                        Color::Blue
+                    }
+                }
             }
         }
     }
@@ -2101,6 +3036,13 @@ impl App {
                 "右侧{}面板有新内容 · F2 切换 / End 跳到底部",
                 self.right_pane.short_label()
             ));
+        }
+
+        let unread = self.unread_inbox_count();
+        if unread > 0 && !matches!(self.right_pane, RightPane::Inbox) {
+            hints.push(format!("收件箱有 {unread} 条新回执 · F2 切到右侧收件箱"));
+        } else if unread > 0 && matches!(self.right_pane, RightPane::Inbox) {
+            hints.push("收件箱支持 M 标已读 / X 归档".to_string());
         }
 
         hints
@@ -2392,6 +3334,38 @@ fn build_hyard_job_execution_spans(job: Option<&HyardJobSummary>) -> Vec<Span<'s
     }
 }
 
+fn build_inbox_status_spans(
+    unread: usize,
+    total: usize,
+    selected: Option<&InboxEntry>,
+) -> Vec<Span<'static>> {
+    let headline = if total == 0 {
+        "空".to_string()
+    } else if unread == 0 {
+        format!("{total} 条")
+    } else {
+        format!("{unread} 新 / {total} 条")
+    };
+    let selected_text = selected
+        .map(|entry| preview_chars(&entry.title, 22, "…"))
+        .unwrap_or_else(|| "-".to_string());
+    vec![
+        Span::styled(" inbox: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            headline,
+            Style::default()
+                .fg(if unread > 0 {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  当前: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(selected_text, Style::default().fg(Color::Cyan)),
+    ]
+}
+
 fn build_execution_spans(
     label: &'static str,
     execution: Option<&switchyard_provider_api::ExecutionTelemetry>,
@@ -2511,19 +3485,29 @@ fn collect_message_view_entries(view: &MessageView, runtime: &RuntimeState) -> V
             default_provider_mode_for_runtime(provider, runtime),
             runtime,
         ),
-        MessageView::Hyard => runtime
-            .hyard_jobs
-            .iter()
-            .enumerate()
-            .flat_map(|(index, job)| format_hyard_job_entries(job, index == 0 || job.is_active()))
-            .chain(
+        MessageView::Hyard => {
+            let mut entries = vec![
+                " [hyard] 后台工具：您可以并行运行多个任务，并在其执行期间继续本地工作。"
+                    .to_string(),
+            ];
+            entries.extend(
+                runtime
+                    .hyard_jobs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, job)| {
+                        format_hyard_job_entries(job, index == 0 || job.is_active())
+                    }),
+            );
+            entries.extend(
                 runtime
                     .event_log
                     .iter()
                     .filter(|line| is_hyard_event_text(line))
                     .cloned(),
-            )
-            .collect(),
+            );
+            entries
+        }
     }
 }
 
@@ -2531,7 +3515,9 @@ fn empty_message_view_text(view: &MessageView) -> String {
     match view {
         MessageView::Overview => " （还没有总览内容）".to_string(),
         MessageView::Provider(provider) => format!(" （{provider} 还没有过程输出）"),
-        MessageView::Hyard => " （还没有 HYARD 活动）".to_string(),
+        MessageView::Hyard => {
+            " （还没有 HYARD 活动：后台工具，可并行运行多个任务并继续本地工作）".to_string()
+        }
     }
 }
 
@@ -2710,6 +3696,22 @@ fn hyard_status_suffix(active: usize, waiting: usize, inferred: usize) -> String
     }
 }
 
+fn callback_delivery_suffix(delivered: usize) -> String {
+    if delivered == 0 {
+        String::new()
+    } else {
+        format!(" | callback:{delivered}已送达")
+    }
+}
+
+fn callback_follow_suffix(pending: usize) -> String {
+    if pending == 0 {
+        String::new()
+    } else {
+        format!(" | follow:{pending}待续")
+    }
+}
+
 async fn probe_core_host_surface(
     provider_name: &str,
     registry: &ProviderRegistry,
@@ -2743,6 +3745,7 @@ mod tests {
     use switchyard_provider_api::{
         ExecutionTelemetry, HostSurfaceKind, HostSurfaceProbe, PeerDescriptor,
     };
+    use switchyard_store::SessionInboxRepository;
 
     fn sample_execution() -> ExecutionTelemetry {
         ExecutionTelemetry {
@@ -2760,6 +3763,13 @@ mod tests {
             terminal_rows: Some(40),
             terminal_cols: Some(120),
         }
+    }
+
+    fn open_test_store() -> (tempfile::TempDir, StoreHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+        (dir, store)
     }
 
     #[test]
@@ -2869,16 +3879,22 @@ mod tests {
             .scroll_by(-3);
         app.focus = Focus::Transcript;
 
+        let (_dir, mut store) = open_test_store();
         let mut pending = None;
-        app.handle_key_idle(KeyCode::Char('3'), KeyModifiers::NONE, &mut pending);
+        app.handle_key_idle(
+            KeyCode::Char('3'),
+            KeyModifiers::NONE,
+            &mut pending,
+            &mut store,
+        );
 
         assert_eq!(app.message_view, peer_view);
         assert_eq!(app.current_message_scroll().offset, 11);
 
-        app.handle_key_running(KeyCode::Char('4'), KeyModifiers::NONE);
+        app.handle_key_running(KeyCode::Char('4'), KeyModifiers::NONE, &mut store);
         assert_eq!(app.message_view, MessageView::Hyard);
 
-        app.handle_key_running(KeyCode::Char('1'), KeyModifiers::NONE);
+        app.handle_key_running(KeyCode::Char('1'), KeyModifiers::NONE, &mut store);
         assert_eq!(app.message_view, MessageView::Overview);
         assert_eq!(app.current_message_scroll().offset, 12);
     }
@@ -2906,14 +3922,15 @@ mod tests {
         app.provider_mode_scroll_mut_for("claude", ProviderPaneMode::Timeline)
             .scroll_by(-2);
 
-        app.handle_key_running(KeyCode::Char('t'), KeyModifiers::NONE);
+        let (_dir, mut store) = open_test_store();
+        app.handle_key_running(KeyCode::Char('t'), KeyModifiers::NONE, &mut store);
         assert_eq!(
             app.current_provider_mode("claude"),
             ProviderPaneMode::Timeline
         );
         assert_eq!(app.current_message_scroll().offset, 8);
 
-        app.handle_key_running(KeyCode::Char('s'), KeyModifiers::NONE);
+        app.handle_key_running(KeyCode::Char('s'), KeyModifiers::NONE, &mut store);
         assert_eq!(
             app.current_provider_mode("claude"),
             ProviderPaneMode::Screen
@@ -2937,8 +3954,14 @@ mod tests {
         app.runtime.provider_view_order.push("claude".to_string());
         app.focus = Focus::Input;
 
+        let (_dir, mut store) = open_test_store();
         let mut pending = None;
-        app.handle_key_idle(KeyCode::Char('3'), KeyModifiers::NONE, &mut pending);
+        app.handle_key_idle(
+            KeyCode::Char('3'),
+            KeyModifiers::NONE,
+            &mut pending,
+            &mut store,
+        );
 
         assert_eq!(app.input, "3");
         assert_eq!(app.message_view, MessageView::Overview);
@@ -2950,12 +3973,13 @@ mod tests {
         app.update_idle_status();
         assert!(app.status.contains("focus:输入框"));
 
+        let (_dir, mut store) = open_test_store();
         let mut pending = None;
-        app.handle_key_idle(KeyCode::Tab, KeyModifiers::NONE, &mut pending);
+        app.handle_key_idle(KeyCode::Tab, KeyModifiers::NONE, &mut pending, &mut store);
         assert_eq!(app.focus, Focus::Transcript);
         assert!(app.status.contains("focus:主消息区"));
 
-        app.handle_key_idle(KeyCode::Tab, KeyModifiers::NONE, &mut pending);
+        app.handle_key_idle(KeyCode::Tab, KeyModifiers::NONE, &mut pending, &mut store);
         assert_eq!(app.focus, Focus::Sidebar);
         assert!(app.status.contains("focus:右侧面板"));
     }
@@ -3066,6 +4090,7 @@ mod tests {
 
         app.advance_right_pane();
         app.advance_right_pane();
+        app.advance_right_pane();
         assert_eq!(app.right_pane, RightPane::Events);
         assert_eq!(app.current_right_pane_scroll().offset, 14);
     }
@@ -3115,6 +4140,7 @@ mod tests {
             turn_id: core_turn_id,
             provider: "codex".to_string(),
             text: "planning".to_string(),
+            payload: None,
         });
         runtime.apply(&RuntimeEvent::DelegateRequested {
             core_turn_id,
@@ -3130,6 +4156,7 @@ mod tests {
             turn_id: peer_turn_id,
             provider: "claude".to_string(),
             text: "[assistant]".to_string(),
+            payload: None,
         });
         runtime.set_hyard_jobs(vec![HyardJobSummary {
             job_id: "job-12345678".to_string(),
@@ -3214,6 +4241,7 @@ mod tests {
             turn_id: Uuid::now_v7(),
             provider: "codex".to_string(),
             text: "timeline entry".to_string(),
+            payload: None,
         });
         runtime.apply(&RuntimeEvent::CoreTerminalOutput {
             turn_id: Uuid::now_v7(),
@@ -3282,6 +4310,511 @@ mod tests {
                 .map(|job| job.provider.as_str()),
             Some("codex")
         );
+    }
+
+    #[test]
+    fn restore_session_history_loads_user_turns_and_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let job_dir = dir.path().join(".switchyard").join("jobs");
+        fs::create_dir_all(&job_dir).unwrap();
+        let mut store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let mut user_turn = switchyard_session::Turn::new(
+            session.session_id,
+            "codex",
+            switchyard_session::TurnRole::Core,
+            "hello there",
+        );
+        user_turn.status = switchyard_session::TurnStatus::Completed;
+        user_turn.provider_response = Some("hi back".to_string());
+        store.append_turn(&user_turn).unwrap();
+
+        let delegate_turn = switchyard_session::Turn::new_delegate(
+            session.session_id,
+            "claude",
+            switchyard_session::TurnRole::Reviewer,
+            "review this",
+            "codex",
+        );
+        store.append_turn(&delegate_turn).unwrap();
+
+        let artifact = switchyard_session::Artifact::new(
+            user_turn.turn_id,
+            switchyard_session::ArtifactType::CommandOutput,
+            "stdout.txt",
+        );
+        store.save_artifact(&artifact).unwrap();
+
+        let mut app = App::with_store(
+            "codex".to_string(),
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            job_dir,
+        );
+        app.set_resume_session(session.session_id);
+        let loaded_session = app.initialize_session(&mut store).unwrap();
+
+        assert_eq!(loaded_session.session_id, session.session_id);
+        assert_eq!(
+            app.turns.len(),
+            1,
+            "delegate turns should not appear as user turns"
+        );
+        assert_eq!(app.turns[0].user_message, "hello there");
+        assert_eq!(app.turns[0].response.as_deref(), Some("hi back"));
+        assert_eq!(app.artifact_entries.len(), 1);
+        assert!(app.artifact_entries[0].turn_label.contains("hello there"));
+        assert_eq!(
+            app.artifact_entries[0].items,
+            vec!["stdout.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_existing_session_updates_active_core_when_provider_override_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let mut store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+
+        let session = Session::new("codex".to_string());
+        let session_id = session.session_id;
+        store.save_session(&session).unwrap();
+
+        let mut app = App::with_store(
+            "gemini".to_string(),
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            dir.path().join(".switchyard").join("jobs"),
+        );
+        app.set_resume_session(session_id);
+        let loaded = app.initialize_session(&mut store).unwrap();
+
+        assert_eq!(loaded.active_core, "gemini");
+        let persisted = store.load_session(session_id).unwrap().unwrap();
+        assert_eq!(persisted.active_core, "gemini");
+    }
+
+    #[test]
+    fn refresh_session_inbox_logs_callbacks_and_keeps_them_unread_until_actioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let job_dir = dir.path().join(".switchyard").join("jobs");
+        fs::create_dir_all(&job_dir).unwrap();
+        let mut store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let entry = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "gemini",
+            "Gemini background job completed",
+            "Gemini finished while you were idle.",
+        );
+        store.save_inbox_entry(&entry).unwrap();
+
+        let mut app = App::with_store(
+            "codex".to_string(),
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            job_dir,
+        );
+
+        app.refresh_session_inbox(&mut store, session.session_id);
+
+        assert!(
+            app.runtime
+                .event_log
+                .iter()
+                .any(|line| line.contains("Gemini background job completed"))
+        );
+        assert!(matches!(app.right_pane, RightPane::Inbox));
+        assert_eq!(app.selected_inbox, 0);
+        assert_eq!(app.unread_inbox_count(), 1);
+        assert_eq!(app.inbox_entries.len(), 1);
+        let entries = store.list_inbox_entries(session.session_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, InboxStatus::Unread);
+    }
+
+    #[test]
+    fn refresh_session_inbox_initial_load_keeps_counts_without_forcing_wake_or_reannounce() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let job_dir = dir.path().join(".switchyard").join("jobs");
+        fs::create_dir_all(&job_dir).unwrap();
+        let mut store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let entry = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "claude",
+            "Claude background job completed",
+            "Claude finished while you were idle.",
+        );
+        store.save_inbox_entry(&entry).unwrap();
+
+        let mut app = App::with_store(
+            "codex".to_string(),
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            job_dir,
+        );
+
+        app.refresh_session_inbox_initial(&mut store, session.session_id);
+
+        assert_eq!(app.unread_inbox_count(), 1);
+        assert_eq!(app.pending_callback_resume_count, 1);
+        assert!(matches!(app.right_pane, RightPane::Events));
+        assert!(
+            app.runtime.event_log.is_empty(),
+            "initial restore should not spam callback announcements before the resident consumer arms"
+        );
+
+        app.refresh_session_inbox(&mut store, session.session_id);
+        assert!(
+            app.runtime.event_log.is_empty(),
+            "same unread receipt should not be re-announced immediately after initial load"
+        );
+    }
+
+    #[test]
+    fn refresh_session_inbox_only_counts_resumable_receipts_for_auto_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let job_dir = dir.path().join(".switchyard").join("jobs");
+        fs::create_dir_all(&job_dir).unwrap();
+        let mut store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let completed = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "claude",
+            "Claude background job completed",
+            "Claude finished while you were idle.",
+        );
+        store.save_inbox_entry(&completed).unwrap();
+
+        let mut quiet = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "gemini",
+            "Gemini background job running",
+            "Gemini is still working.",
+        );
+        quiet.payload = serde_json::json!({
+            "job_status": "running",
+            "callback_delivery": "quiet",
+        });
+        store.save_inbox_entry(&quiet).unwrap();
+
+        let mut app = App::with_store(
+            "codex".to_string(),
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            job_dir,
+        );
+
+        app.refresh_session_inbox(&mut store, session.session_id);
+
+        assert_eq!(app.unread_inbox_count(), 2);
+        assert_eq!(app.resumable_inbox_count(), 1);
+        assert_eq!(app.pending_callback_resume_count, 1);
+    }
+
+    #[test]
+    fn refresh_session_inbox_suppresses_auto_resume_count_while_session_turn_lease_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let job_dir = dir.path().join(".switchyard").join("jobs");
+        fs::create_dir_all(&job_dir).unwrap();
+        let mut store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+
+        let mut session = Session::new("codex".to_string());
+        session.mark_turn_active(Uuid::now_v7(), "codex");
+        store.save_session(&session).unwrap();
+
+        let completed = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "claude",
+            "Claude background job completed",
+            "Claude finished while you were idle.",
+        );
+        store.save_inbox_entry(&completed).unwrap();
+
+        let mut app = App::with_store(
+            "codex".to_string(),
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            job_dir,
+        );
+
+        app.refresh_session_inbox(&mut store, session.session_id);
+
+        assert_eq!(app.unread_inbox_count(), 1);
+        assert_eq!(app.resumable_inbox_count(), 1);
+        assert_eq!(app.pending_callback_resume_count, 0);
+    }
+
+    #[test]
+    fn refresh_session_inbox_immediate_receipts_wake_sidebar_even_while_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let job_dir = dir.path().join(".switchyard").join("jobs");
+        fs::create_dir_all(&job_dir).unwrap();
+        let mut store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let mut entry = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "claude",
+            "Claude background job failed",
+            "Claude needs attention.",
+        );
+        entry.payload = serde_json::json!({ "job_status": "failed" });
+        store.save_inbox_entry(&entry).unwrap();
+
+        let mut app = App::with_store(
+            "codex".to_string(),
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            job_dir,
+        );
+        app.runtime.phase = Phase::CoreRunning;
+
+        app.refresh_session_inbox(&mut store, session.session_id);
+
+        assert!(matches!(app.right_pane, RightPane::Inbox));
+        assert_eq!(app.unread_inbox_count(), 1);
+    }
+
+    #[test]
+    fn mark_selected_inbox_entry_updates_status_in_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(".switchyard").join("sessions");
+        let job_dir = dir.path().join(".switchyard").join("jobs");
+        fs::create_dir_all(&job_dir).unwrap();
+        let mut store = StoreHandle::open(StoreBackend::Jsonl, store_path).unwrap();
+
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let entry = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "codex",
+            "Codex background job completed",
+            "Codex finished while you were idle.",
+        );
+        store.save_inbox_entry(&entry).unwrap();
+
+        let mut app = App::with_store(
+            "codex".to_string(),
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            job_dir,
+        );
+        app.refresh_session_inbox(&mut store, session.session_id);
+        app.mark_selected_inbox_entry(&mut store, false).unwrap();
+
+        let entries = store.list_inbox_entries(session.session_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, InboxStatus::Read);
+
+        app.mark_selected_inbox_entry(&mut store, true).unwrap();
+        let entries = store.list_inbox_entries(session.session_id).unwrap();
+        assert_eq!(entries[0].status, InboxStatus::Consumed);
+    }
+
+    #[test]
+    fn callback_consumer_signal_queues_auto_resume_when_idle() {
+        let mut app = App::new("codex".to_string(), PathBuf::from("."));
+        let mut pending_submit = None;
+
+        app.handle_callback_consumer_signal(
+            CallbackConsumerSignal::Ready(CallbackConsumerReady {
+                session_id: Uuid::now_v7(),
+                unread_count: 2,
+                unread_callback_count: 2,
+                entry_ids: vec![Uuid::now_v7(), Uuid::now_v7()],
+            }),
+            &mut pending_submit,
+            None,
+        );
+
+        assert_eq!(pending_submit.as_deref(), Some(CALLBACK_RESUME_MESSAGE));
+        assert_eq!(app.pending_callback_resume_count, 2);
+        assert!(matches!(app.right_pane, RightPane::Inbox));
+    }
+
+    #[test]
+    fn callback_consumer_signal_syncs_inbox_snapshot_when_store_is_available() {
+        let (_dir, mut store) = open_test_store();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let entry = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "claude",
+            "Claude background job completed",
+            "Claude finished while you were idle.",
+        );
+        store.save_inbox_entry(&entry).unwrap();
+
+        let mut app = App::new("codex".to_string(), PathBuf::from("."));
+        let mut pending_submit = None;
+        app.handle_callback_consumer_signal(
+            CallbackConsumerSignal::Ready(CallbackConsumerReady {
+                session_id: session.session_id,
+                unread_count: 1,
+                unread_callback_count: 1,
+                entry_ids: vec![entry.entry_id],
+            }),
+            &mut pending_submit,
+            Some(&mut store),
+        );
+
+        assert_eq!(app.inbox_entries.len(), 1);
+        assert_eq!(app.inbox_entries[0].entry_id, entry.entry_id);
+        assert_eq!(app.pending_callback_resume_count, 1);
+    }
+
+    #[test]
+    fn callback_consumer_signal_defers_auto_resume_while_busy() {
+        let mut app = App::new("codex".to_string(), PathBuf::from("."));
+        app.runtime.phase = Phase::CoreRunning;
+        let mut pending_submit = None;
+
+        app.handle_callback_consumer_signal(
+            CallbackConsumerSignal::Ready(CallbackConsumerReady {
+                session_id: Uuid::now_v7(),
+                unread_count: 1,
+                unread_callback_count: 1,
+                entry_ids: vec![Uuid::now_v7()],
+            }),
+            &mut pending_submit,
+            None,
+        );
+
+        assert!(pending_submit.is_none());
+        assert_eq!(app.pending_callback_resume_count, 1);
+        assert!(app.status.contains("follow:1待续"));
+    }
+
+    #[tokio::test]
+    async fn resident_callback_consumer_emits_ready_when_resumable_receipt_appears() {
+        let (dir, mut store) = open_test_store();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_resident_callback_consumer(
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            session.session_id,
+            tx,
+            cancel.clone(),
+        ));
+
+        let mut quiet = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "gemini",
+            "Gemini background job running",
+            "Gemini is still working.",
+        );
+        quiet.payload = serde_json::json!({
+            "job_status": "running",
+            "callback_delivery": "quiet",
+        });
+        store.save_inbox_entry(&quiet).unwrap();
+
+        let no_signal =
+            tokio::time::timeout(tokio::time::Duration::from_millis(250), rx.recv()).await;
+        assert!(
+            no_signal.is_err(),
+            "quiet receipts should not wake the consumer"
+        );
+
+        let completed = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "claude",
+            "Claude background job completed",
+            "Claude finished while you were idle.",
+        );
+        store.save_inbox_entry(&completed).unwrap();
+
+        let signal = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("callback consumer should wake")
+            .expect("signal payload");
+
+        let CallbackConsumerSignal::Ready(ready) = signal else {
+            panic!("expected ready signal");
+        };
+        assert_eq!(ready.session_id, session.session_id);
+        assert_eq!(ready.unread_callback_count, 1);
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resident_callback_consumer_suppresses_ready_while_session_has_active_turn_lease() {
+        let (dir, mut store) = open_test_store();
+        let mut session = Session::new("codex".to_string());
+        session.mark_turn_active(Uuid::now_v7(), "codex");
+        store.save_session(&session).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_resident_callback_consumer(
+            StoreBackend::Jsonl,
+            dir.path().join(".switchyard").join("sessions"),
+            session.session_id,
+            tx,
+            cancel.clone(),
+        ));
+
+        let completed = switchyard_session::InboxEntry::background_job_receipt(
+            session.session_id,
+            "claude",
+            "Claude background job completed",
+            "Claude finished while you were idle.",
+        );
+        store.save_inbox_entry(&completed).unwrap();
+
+        let no_signal =
+            tokio::time::timeout(tokio::time::Duration::from_millis(250), rx.recv()).await;
+        assert!(
+            no_signal.is_err(),
+            "active session lease should suppress callback wakeups"
+        );
+
+        session.clear_active_turn();
+        store.save_session(&session).unwrap();
+
+        let signal = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("callback consumer should wake after lease clears")
+            .expect("signal payload");
+
+        let CallbackConsumerSignal::Ready(ready) = signal else {
+            panic!("expected ready signal");
+        };
+        assert_eq!(ready.session_id, session.session_id);
+        assert_eq!(ready.unread_callback_count, 1);
+
+        cancel.cancel();
+        task.await.unwrap();
     }
 
     #[test]
@@ -3357,6 +4890,18 @@ mod tests {
         assert_eq!(event_log_color("[peer/claude] 已开始执行"), Color::Yellow);
         assert_eq!(event_log_color("[core/codex] 已开始处理"), Color::Cyan);
         assert_eq!(event_log_color("[core/codex] 失败：boom"), Color::Red);
+    }
+
+    #[test]
+    fn callback_delivery_suffix_only_shows_when_receipts_were_delivered() {
+        assert!(callback_delivery_suffix(0).is_empty());
+        assert_eq!(callback_delivery_suffix(2), " | callback:2已送达");
+    }
+
+    #[test]
+    fn callback_follow_suffix_only_shows_when_auto_resume_is_pending() {
+        assert!(callback_follow_suffix(0).is_empty());
+        assert_eq!(callback_follow_suffix(3), " | follow:3待续");
     }
 
     #[test]

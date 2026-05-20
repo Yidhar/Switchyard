@@ -17,6 +17,7 @@ pub async fn run_codex_turn(
     extra_args: &[String],
     input: &TurnInput,
     timeout_secs: u64,
+    env: Option<&std::collections::HashMap<String, String>>,
     cwd: Option<&std::path::Path>,
     event_tx: &mpsc::Sender<ProviderEvent>,
     cancel: CancellationToken,
@@ -40,6 +41,7 @@ pub async fn run_codex_turn(
         cwd,
         pty_registry_key: Some(turn_id),
         prefer_pty: false,
+        env,
     };
 
     let (line_tx, mut line_rx) = mpsc::channel::<StreamingOutputLine>(256);
@@ -58,6 +60,7 @@ pub async fn run_codex_turn(
     let protocol_done_consumer = protocol_done.clone();
     let consumer = tokio::spawn(async move {
         let mut assistant_message = String::new();
+        let mut has_protocol_json = false;
         while let Some(output_line) = line_rx.recv().await {
             let line = output_line.text;
             let protocol_line = line.trim_end_matches(['\r', '\n']);
@@ -75,6 +78,7 @@ pub async fn run_codex_turn(
                 continue;
             }
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(protocol_line) {
+                has_protocol_json = true;
                 let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if msg_type == "turn.completed" {
                     protocol_done_consumer.cancel();
@@ -84,15 +88,21 @@ pub async fn run_codex_turn(
                         .ok();
                     continue;
                 }
+                // {"type":"item.delta","delta":{"type":"agent_message_delta","text":"..."}}
+                if msg_type == "item.delta"
+                    && let Some(delta) = json.get("delta")
+                    && delta.get("type").and_then(|t| t.as_str()) == Some("agent_message_delta")
+                    && let Some(text) = delta.get("text").and_then(|t| t.as_str())
+                {
+                    assistant_message.push_str(text);
+                }
                 // {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
                 if msg_type == "item.completed"
                     && let Some(item) = json.get("item")
                     && item.get("type").and_then(|t| t.as_str()) == Some("agent_message")
                     && let Some(text) = item.get("text").and_then(|t| t.as_str())
+                    && assistant_message.is_empty()
                 {
-                    if !assistant_message.is_empty() {
-                        assistant_message.push('\n');
-                    }
                     assistant_message.push_str(text);
                 }
                 event_tx_clone
@@ -111,7 +121,7 @@ pub async fn run_codex_turn(
                     .ok();
             }
         }
-        assistant_message
+        (assistant_message, has_protocol_json)
     });
 
     let result = run_subprocess_streaming_until(
@@ -123,7 +133,7 @@ pub async fn run_codex_turn(
     )
     .await;
     drop(line_tx);
-    let assistant_message = consumer.await.unwrap_or_default();
+    let (assistant_message, has_protocol_json) = consumer.await.unwrap_or_default();
 
     let output = match result {
         Ok(o) => o,
@@ -137,7 +147,7 @@ pub async fn run_codex_turn(
         emit_completion_event(&output, turn_id, "codex", event_tx).await;
     }
 
-    let response_text = if assistant_message.is_empty() {
+    let response_text = if assistant_message.is_empty() && !has_protocol_json {
         output.stdout.trim().to_string()
     } else {
         assistant_message

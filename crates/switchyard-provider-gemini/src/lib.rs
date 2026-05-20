@@ -19,25 +19,27 @@ pub struct GeminiProvider {
     pub original_command: String,
     pub command: String,
     pub args: Vec<String>,
+    pub env: HashMap<String, String>,
     pub timeout_secs: u64,
     results: Arc<Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
 }
 
 impl GeminiProvider {
-    pub fn new(command: impl Into<String>, args: Vec<String>, timeout_secs: u64) -> Self {
+    pub fn new(command: impl Into<String>, args: Vec<String>, env: HashMap<String, String>, timeout_secs: u64) -> Self {
         let original_command = command.into();
         let command = resolve_command(&original_command);
         Self {
             original_command,
             command,
             args,
+            env,
             timeout_secs,
             results: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn from_config(cfg: &switchyard_config::ProviderConfig) -> Self {
-        Self::new(cfg.command.clone(), cfg.args.clone(), cfg.timeout_secs)
+        Self::new(cfg.command.clone(), cfg.args.clone(), cfg.env.clone(), cfg.timeout_secs)
     }
 }
 
@@ -64,6 +66,7 @@ impl Provider for GeminiProvider {
             &self.args,
             &input,
             timeout_secs,
+            Some(&self.env),
             Some(&policy.cwd),
             &event_tx,
             cancel,
@@ -83,5 +86,38 @@ impl Provider for GeminiProvider {
             .await
             .remove(&turn_id)
             .ok_or_else(|| ProviderError::ExecutionFailed(format!("no result for turn {turn_id}")))
+    }
+
+    fn as_persistent(&self) -> Option<&dyn PersistentProvider> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl PersistentProvider for GeminiProvider {
+    async fn start_persistent_instance(
+        &self,
+        envs: HashMap<String, String>,
+    ) -> Result<Box<dyn LiveInstance>, ProviderError> {
+        use std::process::Stdio;
+        use switchyard_provider_subprocess::{build_subprocess_invocation_plan, SubprocessLiveInstance};
+
+        let plan = build_subprocess_invocation_plan(&self.original_command, &self.command, &self.args);
+        let mut cmd = tokio::process::Command::new(&plan.command);
+        cmd.args(&plan.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+
+        let child = cmd.spawn().map_err(|e| {
+            ProviderError::ExecutionFailed(format!("Failed to spawn persistent Gemini CLI: {e}"))
+        })?;
+
+        let instance = SubprocessLiveInstance::new("gemini", child)?;
+        Ok(Box::new(instance))
     }
 }

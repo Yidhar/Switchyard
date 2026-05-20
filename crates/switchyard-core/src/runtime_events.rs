@@ -6,8 +6,13 @@
 use switchyard_provider_api::{ExecutionTelemetry, HyardJobObservation};
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data")]
 pub enum RuntimeEvent {
+    /// Unread callback receipts were injected into the next routed provider-facing turn.
+    CallbackReceiptsInjected { provider: String, count: usize },
     /// Core provider turn started.
     CoreTurnStarted { turn_id: Uuid, provider: String },
     /// Core provider execution command resolved.
@@ -21,6 +26,7 @@ pub enum RuntimeEvent {
         turn_id: Uuid,
         provider: String,
         text: String,
+        payload: Option<serde_json::Value>,
     },
     /// Raw terminal line mirrored from the core provider subprocess transport.
     CoreTerminalOutput {
@@ -49,6 +55,7 @@ pub enum RuntimeEvent {
         turn_id: Uuid,
         provider: String,
         text: String,
+        payload: Option<serde_json::Value>,
     },
     /// Raw terminal line mirrored from the peer provider subprocess transport.
     PeerTerminalOutput {

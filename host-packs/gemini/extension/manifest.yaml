@@ -52,3 +52,5 @@ notes:
   - Each command must return the JSON that `switchyard host` emits verbatim.
   - `delegate` and `await` may return `status: "wait_timeout"` while the job continues in background.
   - Models should use `status/result/await` with the same `job_id` instead of re-delegating.
+  - Treat HYARD as a background tool; continue other work while jobs run.
+  - Multiple independent HYARD jobs may be run in parallel.

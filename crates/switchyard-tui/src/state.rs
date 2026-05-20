@@ -267,6 +267,8 @@ pub struct RuntimeState {
     /// Provisional active jobs inferred from runtime events but not yet
     /// confirmed by bridge/store snapshots.
     pub inferred_hyard_job_count: usize,
+    /// Callback receipts that were injected into the active routed turn.
+    pub delivered_callback_receipt_count: usize,
     /// Whether the UI needs a redraw.
     pub dirty: bool,
     /// Elapsed time tracking.
@@ -310,6 +312,7 @@ impl RuntimeState {
             active_hyard_job_count: 0,
             waiting_hyard_job_count: 0,
             inferred_hyard_job_count: 0,
+            delivered_callback_receipt_count: 0,
             dirty: false,
             started_at: None,
         }
@@ -792,6 +795,17 @@ impl RuntimeState {
     pub fn apply(&mut self, event: &switchyard_core::RuntimeEvent) {
         use switchyard_core::RuntimeEvent;
         match event {
+            RuntimeEvent::CallbackReceiptsInjected { provider, count } => {
+                self.delivered_callback_receipt_count = *count;
+                self.ensure_provider_view(provider);
+                self.push_provider_view_line(
+                    provider,
+                    format!("[hyard/callback] 已送达 {count} 个后台回执到本轮上下文"),
+                );
+                self.push_event(format!(
+                    "[hyard/callback] 已向 {provider} 注入 {count} 个后台回执"
+                ));
+            }
             RuntimeEvent::CoreTurnStarted { turn_id, provider } => {
                 self.clear_live_hyard_jobs();
                 self.phase = Phase::CoreRunning;
@@ -1110,6 +1124,7 @@ impl RuntimeState {
                 provider, turn_id, ..
             } => {
                 self.phase = Phase::Idle;
+                self.delivered_callback_receipt_count = 0;
                 self.provider_turn_ids.remove(provider);
                 if self.current_turn_id == Some(*turn_id) {
                     self.current_turn_id = None;
@@ -1126,6 +1141,7 @@ impl RuntimeState {
                 error,
             } => {
                 self.phase = Phase::Idle;
+                self.delivered_callback_receipt_count = 0;
                 self.provider_turn_ids.remove(provider);
                 if self.current_turn_id == Some(*turn_id) {
                     self.current_turn_id = None;
@@ -1509,6 +1525,30 @@ mod tests {
         assert!(state.peer_probe_done);
     }
 
+    #[test]
+    fn callback_receipts_injected_sets_delivery_badge_and_logs_event() {
+        let mut state = new_state();
+
+        state.apply(&RuntimeEvent::CallbackReceiptsInjected {
+            provider: "codex".to_string(),
+            count: 2,
+        });
+
+        assert_eq!(state.delivered_callback_receipt_count, 2);
+        assert!(
+            state
+                .event_log
+                .iter()
+                .any(|line| line.contains("已向 codex 注入 2 个后台回执"))
+        );
+        assert!(
+            state
+                .provider_view_entries("codex")
+                .iter()
+                .any(|line| line.contains("已送达 2 个后台回执"))
+        );
+    }
+
     // ── CoreTurnStarted ──
 
     #[test]
@@ -1600,6 +1640,7 @@ mod tests {
             turn_id: Uuid::now_v7(),
             provider: "claude".to_string(),
             text: "hello world".to_string(),
+            payload: None,
         });
 
         assert_eq!(state.stream_lines.len(), 1);
@@ -1716,6 +1757,7 @@ mod tests {
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
             text: "inferred text".to_string(),
+            payload: None,
         });
 
         assert_eq!(state.active_hyard_job_count, 1);
@@ -1758,6 +1800,7 @@ mod tests {
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
             text: "peer output".to_string(),
+            payload: None,
         });
 
         assert!(state.stream_lines.iter().any(|l| l == "peer output"));
@@ -1910,6 +1953,7 @@ mod tests {
             turn_id: core_turn,
             provider: "claude".to_string(),
             text: "thinking...".to_string(),
+            payload: None,
         });
         assert_eq!(state.phase, Phase::CoreRunning);
 
@@ -1950,6 +1994,7 @@ mod tests {
             turn_id: peer_turn,
             provider: "gemini".to_string(),
             text: "looks good".to_string(),
+            payload: None,
         });
         assert_eq!(state.phase, Phase::PeerRunning);
 

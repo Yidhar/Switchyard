@@ -15,8 +15,8 @@ use switchyard_provider_api::{
     ArtifactBundle, CancellationToken, ContextBundle, ExecutionPolicy, PeerCatalog, PeerDescriptor,
     ProbeResult, Provider, ProviderError, ProviderEvent, ProviderRole, TurnInput, TurnResult,
 };
-use switchyard_session::Session;
-use switchyard_store::{JsonlStore, SessionRepository};
+use switchyard_session::{InboxEntry, InboxStatus, Session};
+use switchyard_store::{JsonlStore, SessionInboxRepository, SessionRepository, TurnRepository};
 
 fn temp_store() -> (JsonlStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -30,6 +30,91 @@ async fn drain_events(rx: &mut mpsc::Receiver<RuntimeEvent>) -> Vec<RuntimeEvent
         events.push(evt);
     }
     events
+}
+
+struct RecordingProvider {
+    provider_id: String,
+    response_text: String,
+    inputs: Arc<Mutex<Vec<String>>>,
+    results: Arc<Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
+}
+
+impl RecordingProvider {
+    fn new(provider_id: &str, response_text: &str) -> Self {
+        Self {
+            provider_id: provider_id.to_string(),
+            response_text: response_text.to_string(),
+            inputs: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for RecordingProvider {
+    async fn probe(&self) -> Result<ProbeResult, ProviderError> {
+        Ok(ProbeResult {
+            version: Some("1.0.0".to_string()),
+            available: true,
+            capabilities: Default::default(),
+            issues: vec![],
+            ..Default::default()
+        })
+    }
+
+    async fn start_turn(
+        &self,
+        turn_id: Uuid,
+        input: TurnInput,
+        _policy: ExecutionPolicy,
+        _context: ContextBundle,
+        event_tx: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<(), ProviderError> {
+        self.inputs.lock().await.push(input.user_message.clone());
+
+        event_tx
+            .send(ProviderEvent::turn_started(turn_id, &self.provider_id))
+            .await
+            .ok();
+        event_tx
+            .send(ProviderEvent::text_message(
+                turn_id,
+                &self.provider_id,
+                &self.response_text,
+            ))
+            .await
+            .ok();
+        event_tx
+            .send(ProviderEvent::turn_completed(turn_id, &self.provider_id))
+            .await
+            .ok();
+
+        self.results.lock().await.insert(
+            turn_id,
+            (
+                TurnResult {
+                    response_text: self.response_text.clone(),
+                    exit_code: Some(0),
+                    stderr: None,
+                    metadata: HashMap::new(),
+                },
+                ArtifactBundle { artifacts: vec![] },
+            ),
+        );
+        Ok(())
+    }
+
+    async fn finalize_turn(
+        &self,
+        turn_id: Uuid,
+    ) -> Result<(TurnResult, ArtifactBundle), ProviderError> {
+        self.results
+            .lock()
+            .await
+            .remove(&turn_id)
+            .ok_or(ProviderError::ExecutionFailed("no result".into()))
+    }
 }
 
 // ── Plain turn (no delegation) ──
@@ -50,6 +135,7 @@ async fn plain_turn_emits_core_started_and_completed() {
         &provider,
         &catalog,
         &|_| None,
+        None,
         "test".to_string(),
         PathBuf::from("."),
         None,
@@ -110,6 +196,7 @@ async fn plain_turn_failure_emits_turn_failed() {
         &provider,
         &catalog,
         &|_| None,
+        None,
         "test".to_string(),
         PathBuf::from("."),
         None,
@@ -146,6 +233,7 @@ async fn core_item_updated_emitted_for_streaming_text() {
         &provider,
         &catalog,
         &|_| None,
+        None,
         "stream test".to_string(),
         PathBuf::from("."),
         None,
@@ -166,6 +254,135 @@ async fn core_item_updated_emitted_for_streaming_text() {
         !item_updates.is_empty(),
         "should have at least one CoreItemUpdated"
     );
+}
+
+#[tokio::test]
+async fn unread_callback_receipts_are_injected_without_polluting_stored_user_turn() {
+    let (mut store, dir) = temp_store();
+    let mut session = Session::new("recorder".to_string());
+    store.save_session(&session).unwrap();
+
+    let job_id = Uuid::now_v7();
+    let mut entry = InboxEntry::background_job_receipt(
+        session.session_id,
+        "claude",
+        "Claude background job completed",
+        "Claude finished a review while you were idle.",
+    );
+    entry.job_id = Some(job_id);
+    entry.summary = Some("Found one follow-up item.".to_string());
+    entry.payload = serde_json::json!({ "job_status": "completed" });
+    store.save_inbox_entry(&entry).unwrap();
+
+    let provider = RecordingProvider::new("recorder", "acknowledged");
+    let captured_inputs = provider.inputs.clone();
+    let catalog = PeerCatalog::new();
+    let (tx, mut rx) = mpsc::channel::<RuntimeEvent>(64);
+
+    let output = run_routed_turn_observable(
+        &mut store,
+        &mut session,
+        &provider,
+        &catalog,
+        &|_| None,
+        None,
+        "please continue".to_string(),
+        dir.path().to_path_buf(),
+        None,
+        Some(&tx),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    drop(tx);
+    let events = drain_events(&mut rx).await;
+
+    assert_eq!(output.response.as_deref(), Some("acknowledged"));
+
+    let provider_inputs = captured_inputs.lock().await.clone();
+    assert_eq!(provider_inputs.len(), 1);
+    let provider_message = &provider_inputs[0];
+    assert!(provider_message.contains("please continue"));
+    assert!(provider_message.contains(&session.session_id.to_string()));
+    assert!(provider_message.contains("/hyard:delegate"));
+    assert!(provider_message.contains("--session"));
+    assert!(provider_message.contains("/hyard:follow"));
+    assert!(provider_message.contains("BACKGROUND COMPLETION NOTICES"));
+    assert!(provider_message.contains("runtime callback receipts"));
+    assert!(provider_message.contains(&job_id.to_string()));
+
+    let callback_idx = events
+        .iter()
+        .position(|e| matches!(e, RuntimeEvent::CallbackReceiptsInjected { count: 1, .. }))
+        .expect("callback injection event should be emitted");
+    let core_start_idx = events
+        .iter()
+        .position(|e| matches!(e, RuntimeEvent::CoreTurnStarted { .. }))
+        .expect("core turn should start");
+    assert!(
+        callback_idx < core_start_idx,
+        "callback injection should be announced before the core turn starts"
+    );
+
+    let turns = store.list_turns(session.session_id).unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].user_message, "please continue");
+    assert!(
+        !turns[0]
+            .user_message
+            .contains("BACKGROUND COMPLETION NOTICES")
+    );
+
+    let inbox = store.list_inbox_entries(session.session_id).unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].status, InboxStatus::Consumed);
+}
+
+#[tokio::test]
+async fn callback_receipts_are_rolled_back_to_unread_when_finalization_fails() {
+    let (mut store, _dir) = temp_store();
+    let mut session = Session::new("delegator".to_string());
+    store.save_session(&session).unwrap();
+
+    let mut entry = InboxEntry::background_job_receipt(
+        session.session_id,
+        "claude",
+        "Claude background job completed",
+        "Claude finished while you were idle.",
+    );
+    entry.payload = serde_json::json!({ "job_status": "completed" });
+    store.save_inbox_entry(&entry).unwrap();
+
+    let core = FinalizationFailProvider::new("reviewer");
+    let catalog = make_catalog("reviewer");
+    let (tx, _rx) = mpsc::channel::<RuntimeEvent>(64);
+
+    let output = run_routed_turn_observable(
+        &mut store,
+        &mut session,
+        &core,
+        &catalog,
+        &|name| {
+            if name == "reviewer" {
+                Some(Box::new(FakeProvider::success("Looks good.")))
+            } else {
+                None
+            }
+        },
+        None,
+        "resume after callback".to_string(),
+        PathBuf::from("."),
+        None,
+        Some(&tx),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("router should surface the failed turn without consuming callback receipts");
+    assert!(output.delegated);
+
+    let inbox = store.list_inbox_entries(session.session_id).unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].status, InboxStatus::Unread);
 }
 
 // ── Delegation flow ──
@@ -262,6 +479,116 @@ impl Provider for DelegatingProvider {
     }
 }
 
+/// Provider that delegates on the first turn and fails during finalization.
+struct FinalizationFailProvider {
+    results: Arc<Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
+    delegate_to: String,
+}
+
+impl FinalizationFailProvider {
+    fn new(delegate_to: &str) -> Self {
+        Self {
+            results: Arc::new(Mutex::new(HashMap::new())),
+            delegate_to: delegate_to.to_string(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for FinalizationFailProvider {
+    async fn probe(&self) -> Result<ProbeResult, ProviderError> {
+        Ok(ProbeResult {
+            version: Some("1.0.0".to_string()),
+            available: true,
+            capabilities: Default::default(),
+            issues: vec![],
+            ..Default::default()
+        })
+    }
+
+    async fn start_turn(
+        &self,
+        turn_id: Uuid,
+        input: TurnInput,
+        _policy: ExecutionPolicy,
+        _context: ContextBundle,
+        event_tx: mpsc::Sender<ProviderEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<(), ProviderError> {
+        event_tx
+            .send(ProviderEvent::turn_started(turn_id, "delegator"))
+            .await
+            .ok();
+
+        if input.user_message.contains("delegate_result") {
+            let error = "finalization failed";
+            event_tx
+                .send(ProviderEvent::turn_failed(turn_id, "delegator", error))
+                .await
+                .ok();
+
+            self.results.lock().await.insert(
+                turn_id,
+                (
+                    TurnResult {
+                        response_text: String::new(),
+                        exit_code: Some(1),
+                        stderr: Some(error.to_string()),
+                        metadata: HashMap::new(),
+                    },
+                    ArtifactBundle { artifacts: vec![] },
+                ),
+            );
+            return Ok(());
+        }
+
+        let response = format!(
+            "Delegating.\n\n\
+             <<<SWITCHYARD_JSON_BEGIN>>>\n\
+             {{\"type\":\"delegate\",\"requests\":[{{\
+               \"id\":\"t1\",\"provider\":\"{}\",\"role\":\"reviewer\",\
+               \"task\":\"Review code\",\"write_access\":false,\"timeout_sec\":60\
+             }}]}}\n\
+             <<<SWITCHYARD_JSON_END>>>",
+            self.delegate_to
+        );
+
+        event_tx
+            .send(ProviderEvent::text_message(turn_id, "delegator", &response))
+            .await
+            .ok();
+        event_tx
+            .send(ProviderEvent::turn_completed(turn_id, "delegator"))
+            .await
+            .ok();
+
+        self.results.lock().await.insert(
+            turn_id,
+            (
+                TurnResult {
+                    response_text: response,
+                    exit_code: Some(0),
+                    stderr: None,
+                    metadata: HashMap::new(),
+                },
+                ArtifactBundle { artifacts: vec![] },
+            ),
+        );
+        Ok(())
+    }
+
+    async fn finalize_turn(
+        &self,
+        turn_id: Uuid,
+    ) -> Result<(TurnResult, ArtifactBundle), ProviderError> {
+        self.results
+            .lock()
+            .await
+            .remove(&turn_id)
+            .ok_or(ProviderError::ExecutionFailed("no result".into()))
+    }
+}
+
 fn make_catalog(peer_name: &str) -> PeerCatalog {
     let mut catalog = PeerCatalog::new();
     catalog.add(PeerDescriptor {
@@ -297,6 +624,7 @@ async fn delegate_emits_delegate_requested_and_completed() {
                 None
             }
         },
+        None,
         "review auth".to_string(),
         PathBuf::from("."),
         None,
@@ -317,7 +645,7 @@ async fn delegate_emits_delegate_requested_and_completed() {
         .find(|e| matches!(e, RuntimeEvent::DelegateRequested { .. }));
     assert!(delegate_req.is_some(), "missing DelegateRequested");
     if let Some(RuntimeEvent::DelegateRequested { peer, .. }) = delegate_req {
-        assert_eq!(peer, "reviewer");
+        assert_eq!(peer, "t1");
     }
 
     // Must have DelegateCompleted
@@ -363,6 +691,7 @@ async fn delegate_emits_peer_turn_started_and_item_updated() {
                 None
             }
         },
+        None,
         "do work".to_string(),
         PathBuf::from("."),
         None,
@@ -416,6 +745,7 @@ async fn delegate_emits_finalization_started_with_real_turn_id() {
                 None
             }
         },
+        None,
         "review".to_string(),
         PathBuf::from("."),
         None,
@@ -466,6 +796,7 @@ async fn full_delegation_event_order() {
                 None
             }
         },
+        None,
         "task".to_string(),
         PathBuf::from("."),
         None,
@@ -487,6 +818,7 @@ async fn full_delegation_event_order() {
     let names: Vec<&str> = events
         .iter()
         .map(|e| match e {
+            RuntimeEvent::CallbackReceiptsInjected { .. } => "CallbackReceiptsInjected",
             RuntimeEvent::CoreTurnStarted { .. } => "CoreTurnStarted",
             RuntimeEvent::CoreExecutionTelemetry { .. } => "CoreExecutionTelemetry",
             RuntimeEvent::CoreItemUpdated { .. } => "CoreItemUpdated",

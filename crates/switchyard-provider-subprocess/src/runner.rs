@@ -33,6 +33,7 @@ pub struct SubprocessConfig<'a> {
     /// official CLIs switch into interactive TTY rendering under PTY and stop
     /// emitting machine-readable protocol lines.
     pub prefer_pty: bool,
+    pub env: Option<&'a std::collections::HashMap<String, String>>,
 }
 
 /// Result of a completed subprocess execution.
@@ -57,6 +58,34 @@ pub struct StreamingOutputLine {
 }
 
 type SharedMasterPty = Arc<Mutex<Box<dyn MasterPty + Send>>>;
+
+fn log_debug_stdio(direction: &str, command: &str, line: &str) {
+    if std::env::var("SWITCHYARD_DEBUG_STDIO").unwrap_or_default() == "1" {
+        let path = if std::path::Path::new(".switchyard").is_dir() {
+            std::path::PathBuf::from(".switchyard").join("debug_stdio.log")
+        } else {
+            std::path::PathBuf::from("debug_stdio.log")
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let log_line = format!(
+                "[{}] [{}] {}: {}\n",
+                timestamp,
+                command,
+                direction,
+                line.trim_end_matches(['\r', '\n'])
+            );
+            let _ = file.write_all(log_line.as_bytes());
+        }
+    }
+}
 
 fn pty_registry() -> &'static Mutex<HashMap<Uuid, SharedMasterPty>> {
     static REGISTRY: OnceLock<Mutex<HashMap<Uuid, SharedMasterPty>>> = OnceLock::new();
@@ -233,6 +262,7 @@ async fn run_subprocess_streaming_until_pipe(
     // keeps stdout open during cleanup.
     let stdout_handle = child.stdout.take();
     let line_tx_clone = line_tx.clone();
+    let cmd_name = config.command.to_string();
     let mut stdout_task = tokio::spawn(async move {
         let mut full_bytes = Vec::new();
         if let Some(stdout) = stdout_handle {
@@ -246,6 +276,7 @@ async fn run_subprocess_streaming_until_pipe(
                         full_bytes.extend_from_slice(&buf[..read]);
                         pending.extend_from_slice(&buf[..read]);
                         for segment in take_terminal_segments(&mut pending) {
+                            log_debug_stdio("STDOUT", &cmd_name, &segment);
                             line_tx_clone
                                 .send(StreamingOutputLine {
                                     text: segment,
@@ -259,6 +290,7 @@ async fn run_subprocess_streaming_until_pipe(
                 }
             }
             if let Some(segment) = flush_terminal_tail(&mut pending) {
+                log_debug_stdio("STDOUT", &cmd_name, &segment);
                 line_tx_clone
                     .send(StreamingOutputLine {
                         text: segment,
@@ -401,6 +433,11 @@ async fn try_run_subprocess_streaming_until_pty(
     if let Some(cwd) = config.cwd {
         cmd.cwd(cwd);
     }
+    if let Some(envs) = config.env {
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+    }
 
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(child) => child,
@@ -411,6 +448,7 @@ async fn try_run_subprocess_streaming_until_pty(
     let master = Arc::new(Mutex::new(pair.master));
 
     if let Some(data) = config.stdin_data {
+        log_debug_stdio("STDIN", config.command, data);
         let mut writer = master
             .lock()
             .map_err(|_| SubprocessError::ProcessFailed("pty master poisoned".to_string()))?
@@ -437,6 +475,7 @@ async fn try_run_subprocess_streaming_until_pty(
 
     let line_tx_clone = line_tx.clone();
     let (stdout_done_tx, stdout_done_rx) = std_mpsc::channel::<String>();
+    let cmd_name = config.command.to_string();
     thread::spawn(move || {
         let mut reader = reader;
         let mut full_bytes = Vec::new();
@@ -449,6 +488,7 @@ async fn try_run_subprocess_streaming_until_pty(
                     full_bytes.extend_from_slice(&buf[..read]);
                     pending.extend_from_slice(&buf[..read]);
                     for segment in take_terminal_segments(&mut pending) {
+                        log_debug_stdio("STDOUT", &cmd_name, &segment);
                         let _ = line_tx_clone.blocking_send(StreamingOutputLine {
                             text: segment,
                             transport: "pty".to_string(),
@@ -459,6 +499,7 @@ async fn try_run_subprocess_streaming_until_pty(
             }
         }
         if let Some(segment) = flush_terminal_tail(&mut pending) {
+            log_debug_stdio("STDOUT", &cmd_name, &segment);
             let _ = line_tx_clone.blocking_send(StreamingOutputLine {
                 text: segment,
                 transport: "pty".to_string(),
@@ -618,6 +659,10 @@ async fn spawn_and_setup(
         cmd.current_dir(cwd);
     }
 
+    if let Some(envs) = config.env {
+        cmd.envs(envs);
+    }
+
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             SubprocessError::NotFound(command.to_string())
@@ -628,6 +673,7 @@ async fn spawn_and_setup(
 
     // Write stdin then close
     if let Some(data) = config.stdin_data {
+        log_debug_stdio("STDIN", config.command, data);
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(data.as_bytes())
@@ -642,13 +688,19 @@ async fn spawn_and_setup(
     // Drain stderr concurrently to prevent pipe buffer deadlock
     let stderr_task = {
         let handle = child.stderr.take();
+        let cmd_name = config.command.to_string();
         tokio::spawn(async move {
             if let Some(mut h) = handle {
                 let mut buf = String::new();
                 tokio::io::AsyncReadExt::read_to_string(&mut h, &mut buf)
                     .await
                     .ok();
-                if buf.is_empty() { None } else { Some(buf) }
+                if buf.is_empty() {
+                    None
+                } else {
+                    log_debug_stdio("STDERR", &cmd_name, &buf);
+                    Some(buf)
+                }
             } else {
                 None
             }
@@ -905,6 +957,7 @@ mod tests {
             cwd: None,
             pty_registry_key: None,
             prefer_pty: true,
+            env: None,
         };
 
         assert!(!should_use_pty(&config));
@@ -921,6 +974,7 @@ mod tests {
             cwd: None,
             pty_registry_key: None,
             prefer_pty: true,
+            env: None,
         };
 
         assert!(should_use_pty(&config));

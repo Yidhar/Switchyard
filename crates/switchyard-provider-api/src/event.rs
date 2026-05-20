@@ -212,6 +212,19 @@ pub fn extract_display_text(payload: &serde_json::Value) -> Option<String> {
     {
         return Some(t.to_string());
     }
+    // Path 6: Delta text (Codex item.delta or Claude content_block_delta)
+    if let Some(delta) = payload.get("delta") {
+        if let Some(t) = delta.get("text").and_then(|v| v.as_str())
+            && !t.is_empty()
+        {
+            return Some(t.to_string());
+        }
+        if let Some(t) = delta.get("delta").and_then(|d2| d2.get("text")).and_then(|v| v.as_str())
+            && !t.is_empty()
+        {
+            return Some(t.to_string());
+        }
+    }
     None
 }
 
@@ -594,7 +607,7 @@ fn summarize_hyard_job_json(json: &serde_json::Value, action: Option<&str>) -> O
                 .and_then(|s| s.as_str())
                 .unwrap_or("running");
             format!(
-                "[hyard] {provider} {action_label}仍在后台运行 (job {short_job} / {runtime_status})；本次等待超时，可继续 status/result/await"
+                "[hyard] {provider} {action_label}仍在后台运行 (job {short_job} / {runtime_status})；本次等待超时，可继续 status/result/await，并先处理其他工作"
             )
         }
         "completed" => format!("[hyard] {provider} {action_label}已完成 (job {short_job})"),
@@ -819,6 +832,7 @@ mod tests {
         assert!(summary.contains("Claude"));
         assert!(summary.contains("等待超时"));
         assert!(summary.contains("019d5709"));
+        assert!(summary.contains("先处理其他工作"));
     }
 
     #[test]

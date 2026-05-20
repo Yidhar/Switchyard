@@ -5,8 +5,13 @@ pub mod registry;
 pub mod router;
 pub mod runtime_events;
 pub mod turn_runner;
+pub mod instance;
+pub mod ipc;
+pub mod proxy;
 
 pub use error::CoreError;
+pub use instance::InstancePool;
+pub use proxy::PersistentProviderProxy;
 pub use event_mapper::map_provider_event;
 pub use fake_provider::FakeProvider;
 pub use registry::{ProviderRegistry, build_peer_catalog, build_peer_catalog_probed};

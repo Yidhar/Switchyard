@@ -89,6 +89,7 @@ pub async fn run_ipc_server(pool: Arc<InstancePool>, pipe_name: &str, cancel: Ca
     loop {
         let server = ServerOptions::new()
             .first_pipe_instance(first)
+            .reject_remote_clients(true)
             .create(pipe_name)?;
         first = false;
 
@@ -174,7 +175,7 @@ async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result
             let task = req.task.clone();
             let turn_id = Uuid::now_v7();
 
-            let inst_lock = match pool.get_live_instance(&provider) {
+            let inst_lock = match pool.checkout_instance(&provider) {
                 Some(inst) => inst,
                 None => {
                     let err_resp = IpcResponse {
@@ -210,6 +211,7 @@ async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result
             let mut inner_rx = match runner_task.await? {
                 Ok(rx) => rx,
                 Err(e) => {
+                    pool.release_instance(&provider, inst_lock);
                     let fail_resp = IpcResponse {
                         status: "failed".to_string(),
                         event: None,
@@ -241,6 +243,8 @@ async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result
                 resp_str.push('\n');
                 writer.write_all(resp_str.as_bytes()).await?;
             }
+
+            pool.release_instance(&provider, inst_lock);
 
             let success_resp = IpcResponse {
                 status: "success".to_string(),

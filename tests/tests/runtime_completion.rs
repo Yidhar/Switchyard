@@ -29,6 +29,7 @@ async fn drain_events(rx: &mut mpsc::Receiver<RuntimeEvent>) -> Vec<RuntimeEvent
 
 fn event_name(e: &RuntimeEvent) -> &'static str {
     match e {
+        RuntimeEvent::CallbackReceiptsInjected { .. } => "CallbackReceiptsInjected",
         RuntimeEvent::CoreTurnStarted { .. } => "CoreTurnStarted",
         RuntimeEvent::CoreExecutionTelemetry { .. } => "CoreExecutionTelemetry",
         RuntimeEvent::CoreItemUpdated { .. } => "CoreItemUpdated",

@@ -28,7 +28,7 @@ Start-Sleep -Seconds 3
 # 3. Start Tauri App in the foreground
 Write-Host "[3/3] Launching Tauri App wrapper..." -ForegroundColor Yellow
 Push-Location $GuiDir
-npx --package @tauri-apps/cli tauri dev
+npx --package @tauri-apps/cli tauri dev --no-watch
 Pop-Location
 
 # 4. Clean up background Vite server when Tauri exits

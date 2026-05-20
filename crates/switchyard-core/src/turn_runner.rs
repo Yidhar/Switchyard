@@ -1,6 +1,7 @@
 //! Minimal single-turn runner.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -17,6 +18,8 @@ use switchyard_store::JsonlStore;
 
 use crate::error::CoreError;
 use crate::event_mapper::map_provider_event;
+
+const ACTIVE_TURN_HEARTBEAT_SECS: u64 = 5;
 
 /// Whether this turn is a normal core turn or a finalization turn (after delegate).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,15 +103,56 @@ pub async fn run_turn_phased(
     phase: TurnPhase,
     cancel: switchyard_provider_api::CancellationToken,
 ) -> Result<TurnOutput, CoreError> {
+    run_turn_phased_with_messages(
+        store,
+        session,
+        provider,
+        user_message.clone(),
+        user_message,
+        cwd,
+        artifact_dir,
+        runtime_tx,
+        phase,
+        cancel,
+    )
+    .await
+}
+
+/// Full turn execution with distinct stored and provider-facing user messages.
+///
+/// This lets the router inject internal prompt context for the provider without
+/// polluting the persisted user turn that appears in session history.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_turn_phased_with_messages(
+    store: &mut (impl CanonicalStore + ?Sized),
+    session: &mut Session,
+    provider: &dyn Provider,
+    stored_user_message: String,
+    provider_user_message: String,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    runtime_tx: Option<&mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    phase: TurnPhase,
+    cancel: switchyard_provider_api::CancellationToken,
+) -> Result<TurnOutput, CoreError> {
     // 1. Create Turn
-    let turn = Turn::new(
-        session.session_id,
-        &session.active_core,
-        TurnRole::Core,
-        &user_message,
-    );
+    let turn = match phase {
+        TurnPhase::Normal => Turn::new(
+            session.session_id,
+            &session.active_core,
+            TurnRole::Core,
+            &stored_user_message,
+        ),
+        TurnPhase::Finalization => Turn::new_system(
+            session.session_id,
+            &session.active_core,
+            &stored_user_message,
+        ),
+    };
     let turn_id = turn.turn_id;
     store.append_turn(&turn)?;
+    session.mark_turn_active(turn_id, session.active_core.clone());
+    store.save_session(session)?;
 
     if let Some(tx) = runtime_tx {
         let event = match phase {
@@ -163,7 +207,7 @@ pub async fn run_turn_phased(
 
     let rendered_context = switchyard_provider_subprocess::render_context_bundle(&context);
     let input = TurnInput {
-        user_message,
+        user_message: provider_user_message,
         system_prompt: if rendered_context.is_empty() {
             None
         } else {
@@ -178,6 +222,7 @@ pub async fn run_turn_phased(
 
     let mut failed = false;
     let mut output_completed = false;
+    let mut accumulated_response = String::new();
     let provider_result;
 
     async fn drain_event(
@@ -232,6 +277,7 @@ pub async fn run_turn_phased(
                     turn_id: pe.turn_id,
                     provider: pe.provider.clone(),
                     text,
+                    payload: Some(pe.payload.clone()),
                 });
             }
         }
@@ -243,6 +289,9 @@ pub async fn run_turn_phased(
     // Concurrent select: provider execution + event drain + cancellation
     tokio::pin!(provider_fut);
     let mut cancelled = false;
+    let mut active_turn_heartbeat =
+        tokio::time::interval(Duration::from_secs(ACTIVE_TURN_HEARTBEAT_SECS));
+    active_turn_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             res = &mut provider_fut => {
@@ -254,37 +303,52 @@ pub async fn run_turn_phased(
                 failed = true;
             }
             Some(pe) = event_rx.recv() => {
+                update_accumulated_response(&mut accumulated_response, &pe);
                 drain_event(&pe, &mut failed, &mut output_completed, runtime_tx, store).await?;
+            }
+            _ = active_turn_heartbeat.tick() => {
+                if session.active_turn_id == Some(turn_id) {
+                    session.bump_active_turn_lease();
+                    store.save_session(session)?;
+                }
             }
         }
     }
 
     // Drain remaining events after provider completes
     while let Some(pe) = event_rx.recv().await {
+        update_accumulated_response(&mut accumulated_response, &pe);
         drain_event(&pe, &mut failed, &mut output_completed, runtime_tx, store).await?;
     }
 
-    provider_result?;
-
-    // If cancelled, skip expensive finalize/archive — mark as failed and return.
-    if cancel.is_cancelled() {
-        let mut cancelled_turn = turn;
-        cancelled_turn.status = TurnStatus::Failed;
-        cancelled_turn.error_message = Some("cancelled".to_string());
-        cancelled_turn.completed_at = Some(chrono::Utc::now());
-        store.append_turn(&cancelled_turn)?;
+    if provider_result.is_err() || cancel.is_cancelled() {
+        let err_msg = match &provider_result {
+            Err(e) => e.to_string(),
+            Ok(_) => "cancelled".to_string(),
+        };
+        let mut failed_turn = turn;
+        failed_turn.status = TurnStatus::Failed;
+        failed_turn.error_message = Some(err_msg.clone());
+        failed_turn.completed_at = Some(chrono::Utc::now());
+        let cleaned_response = clean_system_status_lines(&accumulated_response);
+        if !cleaned_response.trim().is_empty() {
+            failed_turn.provider_response = Some(cleaned_response);
+        }
+        store.append_turn(&failed_turn)?;
+        session.clear_active_turn();
+        store.save_session(session)?;
         if let Some(tx) = runtime_tx {
             tx.send(crate::runtime_events::RuntimeEvent::TurnFailed {
                 turn_id,
                 provider: session.active_core.clone(),
-                error: "cancelled".to_string(),
+                error: err_msg,
             })
             .await
             .ok();
         }
         return Ok(TurnOutput {
             turn_id,
-            response: None,
+            response: failed_turn.provider_response,
         });
     }
 
@@ -299,7 +363,14 @@ pub async fn run_turn_phased(
     }
 
     // 4. Finalize turn
-    let (result, artifact_bundle) = provider.finalize_turn(turn_id).await?;
+    let (result, artifact_bundle) = match provider.finalize_turn(turn_id).await {
+        Ok(result) => result,
+        Err(err) => {
+            session.clear_active_turn();
+            store.save_session(session)?;
+            return Err(err.into());
+        }
+    };
 
     // Store provider artifacts
     for entry in &artifact_bundle.artifacts {
@@ -357,7 +428,8 @@ pub async fn run_turn_phased(
 
     // 5. Update Turn in store
     let mut updated_turn = turn;
-    updated_turn.provider_response = Some(result.response_text.clone());
+    let cleaned_response = clean_system_status_lines(&result.response_text);
+    updated_turn.provider_response = Some(cleaned_response);
     if failed || result.exit_code.is_some_and(|c| c != 0) {
         updated_turn.status = TurnStatus::Failed;
         updated_turn.error_message = result
@@ -377,7 +449,7 @@ pub async fn run_turn_phased(
     updated_turn.completed_at = Some(chrono::Utc::now());
     store.append_turn(&updated_turn)?;
 
-    session.updated_at = chrono::Utc::now();
+    session.clear_active_turn();
     store.save_session(session)?;
 
     if let Some(tx) = runtime_tx {
@@ -404,6 +476,101 @@ pub async fn run_turn_phased(
         turn_id,
         response: updated_turn.provider_response,
     })
+}
+
+fn is_system_status_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.starts_with('[') {
+        let prefixes = [
+            "[会话]", "[回合]", "[系统]", "[系统反馈]", "[助手]", "[结果]", "[限额]",
+            "[思考]", "[工具]", "[文件]", "[Diff]", "[待办]", "[委托]",
+            "[错误]", "[执行]", "[exec]", "[HTTP]", "[STDIO]", "[hyard]", "[error]", "[命令]"
+        ];
+        if prefixes.iter().any(|prefix| trimmed.starts_with(prefix)) {
+            return true;
+        }
+        if let Some(end_idx) = trimmed.find(']') {
+            let inside = &trimmed[1..end_idx];
+            if !inside.is_empty() && inside.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ':' || c == '/') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn clean_system_status_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.lines()
+        .filter(|line| !is_system_status_line(line))
+        .collect();
+    lines.join("\n")
+}
+
+fn update_accumulated_response(accumulated: &mut String, pe: &switchyard_provider_api::ProviderEvent) {
+    let payload = &pe.payload;
+
+    // 1. Check if it's a text message (plain text)
+    if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
+        if !is_system_status_line(t) {
+            accumulated.push_str(t);
+        }
+        return;
+    }
+
+    // 2. Check for delta updates (Codex/Claude delta)
+    if let Some(delta) = payload.get("delta") {
+        if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+            accumulated.push_str(t);
+            return;
+        }
+        if let Some(t) = delta.get("delta").and_then(|d2| d2.get("text")).and_then(|v| v.as_str()) {
+            accumulated.push_str(t);
+            return;
+        }
+    }
+
+    // 3. Check for Gemini content
+    if let Some(t) = payload.get("content").and_then(|v| v.as_str()) {
+        let is_delta = payload.get("delta").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_delta {
+            accumulated.push_str(t);
+        } else {
+            *accumulated = t.to_string();
+        }
+        return;
+    }
+
+    // 4. Check for Codex item.completed
+    if let Some(t) = payload
+        .get("item")
+        .and_then(|i| i.get("text"))
+        .and_then(|v| v.as_str())
+    {
+        *accumulated = t.to_string();
+        return;
+    }
+
+    // 5. Check for Claude result
+    if let Some(t) = payload.get("result").and_then(|v| v.as_str()) {
+        *accumulated = t.to_string();
+        return;
+    }
+
+    // 6. Check for Claude assistant content
+    if let Some(blocks) = payload
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(t) = block.get("text").and_then(|v| v.as_str())
+            {
+                *accumulated = t.to_string();
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +611,9 @@ mod tests {
         let turns = store.list_turns(session.session_id).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].status, TurnStatus::Completed);
+        let persisted_session = store.load_session(session.session_id).unwrap().unwrap();
+        assert!(persisted_session.active_turn_id.is_none());
+        assert!(persisted_session.active_turn_lease_expires_at.is_none());
 
         let artifacts = store.list_artifacts(turn_id).unwrap();
         assert_eq!(artifacts.len(), 1);
@@ -472,6 +642,8 @@ mod tests {
 
         let turns = store.list_turns(session.session_id).unwrap();
         assert_eq!(turns.last().unwrap().status, TurnStatus::Failed);
+        let persisted_session = store.load_session(session.session_id).unwrap().unwrap();
+        assert!(persisted_session.active_turn_id.is_none());
     }
 
     #[tokio::test]
@@ -701,5 +873,19 @@ mod tests {
             events[1].event_type,
             switchyard_session::EventType::TurnCompleted
         );
+    }
+
+    #[test]
+    fn test_system_status_line_filtering() {
+        assert!(is_system_status_line("[命令] 开始执行: \"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command ..."));
+        assert!(is_system_status_line("[exec] running task"));
+        assert!(is_system_status_line("[HTTP] GET /status"));
+        assert!(is_system_status_line("[system:info] memory level high"));
+        assert!(!is_system_status_line("Normal assistant message text"));
+        assert!(!is_system_status_line("This has [命令] in the middle"));
+
+        let mixed_text = "Hello\n[命令] Executing shell\nWorld\n[系统反馈] Done";
+        let cleaned = clean_system_status_lines(mixed_text);
+        assert_eq!(cleaned, "Hello\nWorld");
     }
 }

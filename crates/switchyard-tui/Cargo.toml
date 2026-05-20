@@ -19,6 +19,7 @@ switchyard-provider-codex = { workspace = true }
 switchyard-provider-claude = { workspace = true }
 switchyard-provider-gemini = { workspace = true }
 switchyard-provider-subprocess = { workspace = true }
+clap = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }

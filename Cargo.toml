@@ -17,6 +17,8 @@ members = [
     "crates/switchyard-provider-codex",
     "crates/switchyard-provider-claude",
     "crates/switchyard-provider-gemini",
+    "crates/switchyard-gui",
+    "tests",
 ]
 
 [workspace.package]

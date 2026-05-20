@@ -1,41 +1,48 @@
-//! Live smoke test for Claude provider.
+//! Live smoke test for Codex provider.
 //!
-//! Skipped by default. Set SWITCHYARD_TEST_CLAUDE=1 to enable.
+//! Skipped by default. Set SWITCHYARD_TEST_CODEX=1 to enable.
+//! Requires `codex` to be installed and authenticated.
 
 use switchyard_provider_api::Provider;
-use switchyard_provider_claude::ClaudeProvider;
+use switchyard_provider_codex::CodexProvider;
 
 fn should_run() -> bool {
-    std::env::var("SWITCHYARD_TEST_CLAUDE").is_ok_and(|v| v == "1")
+    std::env::var("SWITCHYARD_TEST_CODEX").is_ok_and(|v| v == "1")
 }
 
 #[tokio::test]
-async fn claude_probe_detects_installation() {
+async fn codex_probe_detects_installation() {
     if !should_run() {
-        eprintln!("skipping: set SWITCHYARD_TEST_CLAUDE=1 to enable");
+        eprintln!("skipping: set SWITCHYARD_TEST_CODEX=1 to enable");
         return;
     }
 
-    let provider = ClaudeProvider::new("claude", vec![], 30);
+    let provider = CodexProvider::new("codex", vec![], std::collections::HashMap::new(), 30);
     match provider.probe().await {
         Ok(result) => {
             assert!(result.available);
-            println!("claude version: {:?}", result.version);
+            println!("codex version: {:?}", result.version);
+            println!("capabilities: {:?}", result.capabilities);
+            for issue in &result.issues {
+                println!("issue: {issue}");
+            }
         }
         Err(e) => {
-            println!("probe failed (expected if not installed): {e}");
+            // NotInstalled is acceptable in CI
+            println!("probe failed (expected if codex not installed): {e}");
         }
     }
 }
 
 #[tokio::test]
-async fn claude_minimal_turn() {
+async fn codex_minimal_turn() {
     if !should_run() {
-        eprintln!("skipping: set SWITCHYARD_TEST_CLAUDE=1 to enable");
+        eprintln!("skipping: set SWITCHYARD_TEST_CODEX=1 to enable");
         return;
     }
 
-    let provider = ClaudeProvider::new("claude", vec![], 120);
+    let provider = CodexProvider::new("codex", vec![], std::collections::HashMap::new(), 60);
+
     let turn_id = uuid::Uuid::now_v7();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
@@ -44,7 +51,7 @@ async fn claude_minimal_turn() {
         system_prompt: None,
     };
     let policy = switchyard_provider_api::ExecutionPolicy {
-        timeout_secs: 120,
+        timeout_secs: 60,
         write_access: false,
         cwd: std::env::current_dir().unwrap(),
         allowed_paths: vec![],
@@ -68,9 +75,13 @@ async fn claude_minimal_turn() {
         .await
     {
         Ok(()) => {
+            let mut events = Vec::new();
             while let Ok(e) = rx.try_recv() {
-                println!("event: {:?} {}", e.event_type, e.provider);
+                events.push(e);
             }
+            println!("received {} events", events.len());
+            assert!(!events.is_empty(), "should receive at least 1 event");
+
             let (result, _) = provider.finalize_turn(turn_id).await.unwrap();
             println!("response: {}", result.response_text);
             assert!(!result.response_text.is_empty());

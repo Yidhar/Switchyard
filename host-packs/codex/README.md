@@ -2,7 +2,7 @@
 
 ## Installation
 
-1. Ensure `switchyard` CLI is on PATH.
+1. Ensure `switchyard` CLI is on PATH. If it is missing, the install script can create a short-command shim for you.
 2. Add the agent instructions to your Codex config:
    ```
    cp host-packs/codex/AGENTS.md .codex/AGENTS.md
@@ -27,10 +27,11 @@ scripts/uninstall-hyard-codex.ps1
 ```
 
 The install script copies the instructions and skill files into `.codex`. It
-also resolves the Switchyard binary from PATH first, then falls back to a
-local `target/debug` or `target/release` build when available. The skill is
-installed under `.codex/skills/hyard/SKILL.md`, with a legacy flat-file path
-still accepted by probe logic for compatibility.
+prefers `switchyard` from PATH. If it is missing, the script can install a
+short-command `switchyard.cmd` shim into a user PATH directory; otherwise it
+falls back to a local `target/debug` or `target/release` build when available.
+The skill is installed under `.codex/skills/hyard/SKILL.md`, with a legacy
+flat-file path still accepted by probe logic for compatibility.
 
 ## Commands
 
@@ -41,11 +42,17 @@ Important behavior:
 
 - `switchyard host delegate` may return `wait_timeout`.
 - `wait_timeout` is not failure; continue with `status/result/await`.
+- Treat HYARD as a **background tool**: complex LLM jobs may take longer than a short wait window.
+- Prefer the default short wait (or `--wait-sec 1`) when launching background work.
+- While the peer job runs, continue other useful local work instead of idling on the wait.
+- Do not call `await` immediately after `delegate` unless your next step is truly blocked on the peer result.
+- You may run multiple independent HYARD jobs in parallel when their tasks do not overlap.
 - Keep using the same `job_id` until the job settles.
+- Do not re-delegate the same task when you already have a `job_id`.
 
 ## Debugging
 
 ```bash
 switchyard host list
-switchyard host delegate --provider claude --task "Review this code" --wait-sec 5
+switchyard host delegate --provider claude --task "Review this code" --wait-sec 1
 ```

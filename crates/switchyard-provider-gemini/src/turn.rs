@@ -41,6 +41,7 @@ pub async fn run_gemini_turn(
     extra_args: &[String],
     input: &TurnInput,
     timeout_secs: u64,
+    env: Option<&std::collections::HashMap<String, String>>,
     cwd: Option<&std::path::Path>,
     event_tx: &mpsc::Sender<ProviderEvent>,
     cancel: CancellationToken,
@@ -61,6 +62,7 @@ pub async fn run_gemini_turn(
         cwd,
         pty_registry_key: Some(turn_id),
         prefer_pty: false,
+        env,
     };
 
     let (line_tx, mut line_rx) = mpsc::channel::<StreamingOutputLine>(256);

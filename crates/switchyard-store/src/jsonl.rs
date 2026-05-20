@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::{
-    ArtifactStore, EventLog, SessionCatalog, SessionEventRepository, SessionRepository, StoreError,
-    TurnRepository,
+    ArtifactStore, EventLog, SessionCatalog, SessionEventRepository, SessionInboxRepository,
+    SessionRepository, StoreError, TurnRepository,
 };
-use switchyard_session::{Artifact, Event, Session, Turn};
+use switchyard_session::{Artifact, Event, InboxEntry, Session, Turn};
 
 /// File-based store using one directory per session.
 ///
@@ -21,6 +21,7 @@ use switchyard_session::{Artifact, Event, Session, Turn};
 ///     turns.jsonl
 ///     events.jsonl
 ///     artifacts.jsonl
+///     inbox.jsonl
 /// ```
 ///
 /// # Thread safety
@@ -167,6 +168,15 @@ impl SessionRepository for JsonlStore {
         let session: Session = serde_json::from_str(&content)?;
         Ok(Some(session))
     }
+
+    fn delete_session(&mut self, session_id: Uuid) -> Result<(), StoreError> {
+        let dir = self.session_dir(session_id);
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        self.index.borrow_mut().map.retain(|_, &mut sid| sid != session_id);
+        Ok(())
+    }
 }
 
 impl TurnRepository for JsonlStore {
@@ -201,6 +211,19 @@ impl SessionCatalog for JsonlStore {
 impl SessionEventRepository for JsonlStore {
     fn list_session_events(&self, session_id: Uuid) -> Result<Vec<Event>, StoreError> {
         JsonlStore::list_session_events(self, session_id)
+    }
+}
+
+impl SessionInboxRepository for JsonlStore {
+    fn save_inbox_entry(&mut self, entry: &InboxEntry) -> Result<(), StoreError> {
+        let dir = self.ensure_session_dir(entry.session_id)?;
+        append_jsonl(&dir.join("inbox.jsonl"), entry)
+    }
+
+    fn list_inbox_entries(&self, session_id: Uuid) -> Result<Vec<InboxEntry>, StoreError> {
+        let path = self.session_dir(session_id).join("inbox.jsonl");
+        let raw: Vec<InboxEntry> = read_jsonl(&path)?;
+        Ok(collapse_inbox_entries(raw))
     }
 }
 
@@ -246,6 +269,26 @@ fn collapse_turns(raw: Vec<Turn>) -> Vec<Turn> {
             result.push(turn);
         }
     }
+    result
+}
+
+fn collapse_inbox_entries(raw: Vec<InboxEntry>) -> Vec<InboxEntry> {
+    let mut seen = HashMap::<Uuid, usize>::new();
+    let mut result: Vec<InboxEntry> = Vec::new();
+    for entry in raw {
+        if let Some(&idx) = seen.get(&entry.entry_id) {
+            result[idx] = entry;
+        } else {
+            seen.insert(entry.entry_id, result.len());
+            result.push(entry);
+        }
+    }
+    result.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.entry_id.cmp(&right.entry_id))
+    });
     result
 }
 
@@ -297,6 +340,19 @@ mod tests {
         let loaded = store.load_session(id).unwrap().unwrap();
         assert_eq!(loaded.session_id, id);
         assert_eq!(loaded.active_core, "codex");
+    }
+
+    #[test]
+    fn session_delete() {
+        let (mut store, _dir) = temp_store();
+        let session = Session::new("codex".to_string());
+        let id = session.session_id;
+
+        store.save_session(&session).unwrap();
+        assert!(store.load_session(id).unwrap().is_some());
+
+        store.delete_session(id).unwrap();
+        assert!(store.load_session(id).unwrap().is_none());
     }
 
     #[test]
@@ -609,5 +665,34 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].status, TurnStatus::Completed);
         assert_eq!(turns[0].provider_response.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn inbox_entries_append_and_update() {
+        let (mut store, _dir) = temp_store();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let mut entry = InboxEntry::background_job_receipt(
+            session.session_id,
+            "claude",
+            "Claude background job completed",
+            "Claude finished review while you were idle.",
+        );
+        let entry_id = entry.entry_id;
+        store.save_inbox_entry(&entry).unwrap();
+
+        let inbox = store.list_inbox_entries(session.session_id).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].entry_id, entry_id);
+        assert!(inbox[0].is_unread());
+
+        entry.mark_read();
+        store.save_inbox_entry(&entry).unwrap();
+
+        let inbox = store.list_inbox_entries(session.session_id).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].status, switchyard_session::InboxStatus::Read);
+        assert_eq!(inbox[0].provider.as_deref(), Some("claude"));
     }
 }

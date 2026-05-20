@@ -15,6 +15,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Force UTF-8 encoding for external processes
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
 $script:RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $script:Report = [ordered]@{
     smoke_protocol   = "hyard_smoke_v1"

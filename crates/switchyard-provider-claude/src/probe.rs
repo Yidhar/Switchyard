@@ -17,6 +17,7 @@ pub async fn run_probe(command: &str) -> Result<ProbeResult, ProviderError> {
         cwd: None,
         pty_registry_key: None,
         prefer_pty: false,
+        env: None,
     };
 
     let output = match run_subprocess(&config).await {

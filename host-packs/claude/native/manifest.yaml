@@ -44,4 +44,6 @@ notes:
     by the bridge back to Claude.
   - `delegate` and `await` may return `status: "wait_timeout"` while the job keeps running in background.
   - Hosts should teach the model to use `status/result/await` with the same `job_id` instead of re-delegating.
+  - Treat HYARD as a background tool; continue other work while peer jobs run.
+  - Multiple independent HYARD jobs may be run in parallel.
   - Job IDs are UUID strings produced by the bridge.

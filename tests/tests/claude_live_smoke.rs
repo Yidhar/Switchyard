@@ -1,26 +1,26 @@
-//! Live smoke test for Gemini provider.
+//! Live smoke test for Claude provider.
 //!
-//! Skipped by default. Set SWITCHYARD_TEST_GEMINI=1 to enable.
+//! Skipped by default. Set SWITCHYARD_TEST_CLAUDE=1 to enable.
 
 use switchyard_provider_api::Provider;
-use switchyard_provider_gemini::GeminiProvider;
+use switchyard_provider_claude::ClaudeProvider;
 
 fn should_run() -> bool {
-    std::env::var("SWITCHYARD_TEST_GEMINI").is_ok_and(|v| v == "1")
+    std::env::var("SWITCHYARD_TEST_CLAUDE").is_ok_and(|v| v == "1")
 }
 
 #[tokio::test]
-async fn gemini_probe_detects_installation() {
+async fn claude_probe_detects_installation() {
     if !should_run() {
-        eprintln!("skipping: set SWITCHYARD_TEST_GEMINI=1 to enable");
+        eprintln!("skipping: set SWITCHYARD_TEST_CLAUDE=1 to enable");
         return;
     }
 
-    let provider = GeminiProvider::new("gemini", vec![], 30);
+    let provider = ClaudeProvider::new("claude", vec![], std::collections::HashMap::new(), 30);
     match provider.probe().await {
         Ok(result) => {
             assert!(result.available);
-            println!("gemini version: {:?}", result.version);
+            println!("claude version: {:?}", result.version);
         }
         Err(e) => {
             println!("probe failed (expected if not installed): {e}");
@@ -29,13 +29,13 @@ async fn gemini_probe_detects_installation() {
 }
 
 #[tokio::test]
-async fn gemini_minimal_turn() {
+async fn claude_minimal_turn() {
     if !should_run() {
-        eprintln!("skipping: set SWITCHYARD_TEST_GEMINI=1 to enable");
+        eprintln!("skipping: set SWITCHYARD_TEST_CLAUDE=1 to enable");
         return;
     }
 
-    let provider = GeminiProvider::new("gemini", vec![], 120);
+    let provider = ClaudeProvider::new("claude", vec![], std::collections::HashMap::new(), 120);
     let turn_id = uuid::Uuid::now_v7();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 

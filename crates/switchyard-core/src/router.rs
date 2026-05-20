@@ -14,9 +14,9 @@ use uuid::Uuid;
 use switchyard_config::SwitchyardConfig;
 use switchyard_provider_api::{
     DelegateRequest, PeerCatalog, Provider, extract_sentinel_blocks, render_delegate_result_block,
-    strip_sentinel_blocks,
+    strip_sentinel_blocks, LiveInstanceRegistry,
 };
-use switchyard_session::Session;
+use switchyard_session::{InboxDeliveryMode, InboxEntry, Session, TurnStatus};
 use switchyard_store::CanonicalStore;
 
 use crate::error::CoreError;
@@ -82,6 +82,15 @@ fn build_hyard_continuation_hint(cwd: &Path) -> Option<String> {
     build_hyard_continuation_hint_from_dir(&config.job_dir(cwd))
 }
 
+fn build_hyard_session_hint(session_id: Uuid) -> String {
+    format!(
+        "HYARD live-session hint:\n\
+         - Current Switchyard session id: {session_id}\n\
+         - If you launch background HYARD work, pass `--session {session_id}` to `/hyard:delegate` so callback receipts return to this live session inbox.\n\
+         - Reuse the same session id with `/hyard:watch --session {session_id} ...`, `/hyard:inbox --session {session_id} ...`, `/hyard:resume --session {session_id} --callbacks`, or the single-call watcher `/hyard:follow --session {session_id} ...`."
+    )
+}
+
 fn build_hyard_continuation_hint_from_dir(job_dir: &Path) -> Option<String> {
     let mut jobs = list_job_summaries(job_dir, MAX_CONTINUATION_HINT_JOBS * 3)
         .into_iter()
@@ -128,18 +137,147 @@ fn build_hyard_continuation_hint_from_dir(job_dir: &Path) -> Option<String> {
         lines.push(detail);
     }
     lines.push(
+        "Treat HYARD as a background tool: complex LLM jobs can outlast a short wait window, and a running job_id is still useful work in flight."
+            .to_string(),
+    );
+    lines.push(
         "If a previous HYARD bridge call returned wait_timeout, that is not a failure; the same job_id is still running in background."
             .to_string(),
     );
     lines.push(
-        "Prefer /hyard:status <job-id>, /hyard:result <job-id>, or /hyard:await <job-id> <timeout-sec> before starting a fresh delegate."
+        "Prefer /hyard:status <job-id>, /hyard:result <job-id>, or /hyard:await <job-id> --timeout-sec <n> before starting a fresh delegate."
             .to_string(),
     );
     lines.push(
-        "Do not restart the same delegate from scratch unless you intentionally want parallel duplicate work."
+        "Do not call /hyard:await immediately after /hyard:delegate unless the very next step is blocked on that peer result."
+            .to_string(),
+    );
+    lines.push(
+        "You may run multiple independent HYARD jobs in parallel when their tasks do not overlap. Continue other useful work while they are in flight."
+            .to_string(),
+    );
+    lines.push(
+        "Do not restart the same delegate from scratch when you already have a job_id.".to_string(),
+    );
+    Some(lines.join("\n"))
+}
+
+fn collect_callback_receipts_for_injection(
+    store: &(impl CanonicalStore + ?Sized),
+    session_id: Uuid,
+) -> Result<Vec<InboxEntry>, CoreError> {
+    let mut entries = store
+        .list_inbox_entries(session_id)?
+        .into_iter()
+        .filter(|entry| {
+            entry.is_unread() && !matches!(entry.delivery_mode(), InboxDeliveryMode::Quiet)
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| {
+        callback_delivery_rank(right.delivery_mode())
+            .cmp(&callback_delivery_rank(left.delivery_mode()))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.entry_id.cmp(&right.entry_id))
+    });
+
+    Ok(entries)
+}
+
+fn callback_delivery_rank(mode: InboxDeliveryMode) -> u8 {
+    match mode {
+        InboxDeliveryMode::Immediate => 2,
+        InboxDeliveryMode::Checkpoint => 1,
+        InboxDeliveryMode::Quiet => 0,
+        _ => 0,
+    }
+}
+
+fn consume_callback_receipts(
+    store: &mut (impl CanonicalStore + ?Sized),
+    receipts: &mut [InboxEntry],
+) -> Result<(), CoreError> {
+    for entry in receipts {
+        entry.mark_consumed();
+        store.save_inbox_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn load_turn_status(
+    store: &(impl CanonicalStore + ?Sized),
+    session_id: Uuid,
+    turn_id: Uuid,
+) -> Result<TurnStatus, CoreError> {
+    store
+        .list_turns(session_id)?
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .map(|turn| turn.status)
+        .ok_or_else(|| CoreError::Runner(format!("turn '{turn_id}' not found after execution")))
+}
+
+fn build_callback_receipt_hint(entries: &[InboxEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        "BACKGROUND COMPLETION NOTICES:".to_string(),
+        "These are runtime callback receipts from background HYARD jobs that finished since your last turn.".to_string(),
+        "Treat them as background completion context, not as a new user request.".to_string(),
+    ];
+
+    for entry in entries {
+        let mut detail = format!("- [{}] kind={}", entry.delivery_mode(), entry.kind);
+
+        if let Some(provider) = entry.provider.as_deref() {
+            detail.push_str(&format!(" provider={provider}"));
+        }
+        if let Some(job_id) = entry.job_id {
+            detail.push_str(&format!(" job_id={job_id}"));
+        }
+        if let Some(job_status) = entry
+            .payload
+            .get("job_status")
+            .and_then(|value| value.as_str())
+        {
+            detail.push_str(&format!(" status={job_status}"));
+        }
+        if !entry.title.trim().is_empty() {
+            detail.push_str(&format!(
+                " title={}",
+                preview_collapsed(&entry.title, 80, "…")
+            ));
+        }
+        lines.push(detail);
+
+        if let Some(preview) = entry
+            .summary
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| (!entry.message.trim().is_empty()).then_some(entry.message.as_str()))
+        {
+            lines.push(format!("  note: {}", preview_collapsed(preview, 120, "…")));
+        }
+    }
+
+    lines.push(
+        "Reuse the referenced job_id with /hyard:result or /hyard:status before launching the same delegate again."
             .to_string(),
     );
     Some(lines.join("\n"))
+}
+
+fn combine_hint_blocks<'a>(blocks: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    let blocks = blocks
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>();
+
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
 fn is_active_hyard_job_status(status: &str) -> bool {
@@ -164,12 +302,14 @@ fn compact_hyard_detail(text: &str) -> Option<String> {
 ///
 /// This is the top-level entry point for CLI and TUI. It replaces direct
 /// calls to `run_turn()` when orchestration is enabled.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_routed_turn<S: CanonicalStore + ?Sized>(
     store: &mut S,
     session: &mut Session,
     core_provider: &dyn Provider,
     peer_catalog: &PeerCatalog,
-    resolve_peer: &dyn Fn(&str) -> Option<Box<dyn Provider>>,
+    resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
+    registry: Option<&dyn LiveInstanceRegistry>,
     user_message: String,
     cwd: PathBuf,
 ) -> Result<RoutedTurnOutput, CoreError> {
@@ -179,6 +319,7 @@ pub async fn run_routed_turn<S: CanonicalStore + ?Sized>(
         core_provider,
         peer_catalog,
         resolve_peer,
+        registry,
         user_message,
         cwd,
         None,
@@ -193,7 +334,8 @@ pub async fn run_routed_turn_with_archive(
     session: &mut Session,
     core_provider: &dyn Provider,
     peer_catalog: &PeerCatalog,
-    resolve_peer: &dyn Fn(&str) -> Option<Box<dyn Provider>>,
+    resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
+    registry: Option<&dyn LiveInstanceRegistry>,
     user_message: String,
     cwd: PathBuf,
     artifact_dir: Option<&std::path::Path>,
@@ -204,6 +346,7 @@ pub async fn run_routed_turn_with_archive(
         core_provider,
         peer_catalog,
         resolve_peer,
+        registry,
         user_message,
         cwd,
         artifact_dir,
@@ -221,7 +364,8 @@ pub async fn run_routed_turn_observable(
     session: &mut Session,
     core_provider: &dyn Provider,
     peer_catalog: &PeerCatalog,
-    resolve_peer: &dyn Fn(&str) -> Option<Box<dyn Provider>>,
+    resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
+    registry: Option<&dyn LiveInstanceRegistry>,
     user_message: String,
     cwd: PathBuf,
     artifact_dir: Option<&std::path::Path>,
@@ -232,11 +376,19 @@ pub async fn run_routed_turn_observable(
     let mut delegated = false;
     let mut inject_context: Option<String> = None;
     let continuation_hint = build_hyard_continuation_hint(&cwd);
+    let session_hint = build_hyard_session_hint(session.session_id);
+    let mut callback_receipts = collect_callback_receipts_for_injection(store, session.session_id)?;
+    let callback_hint = build_callback_receipt_hint(&callback_receipts);
+    let initial_hint = combine_hint_blocks([
+        Some(session_hint.as_str()),
+        continuation_hint.as_deref(),
+        callback_hint.as_deref(),
+    ]);
 
     for iteration in 0..MAX_ROUTER_LOOPS {
         let message = if iteration == 0 {
             // First iteration: user message + peer catalog + optional HYARD continuity state.
-            build_initial_router_message(&user_message, peer_catalog, continuation_hint.as_deref())
+            build_initial_router_message(&user_message, peer_catalog, initial_hint.as_deref())
         } else if let Some(ref ctx) = inject_context {
             // Finalization: original task + delegate result + explicit instruction
             build_finalization_router_message(&user_message, ctx, continuation_hint.as_deref())
@@ -255,21 +407,74 @@ pub async fn run_routed_turn_observable(
             return Err(CoreError::Runner("cancelled by user".to_string()));
         }
 
-        let output = crate::turn_runner::run_turn_phased(
-            store,
-            session,
-            core_provider,
-            message,
-            cwd.clone(),
-            artifact_dir,
-            runtime_tx,
-            phase,
-            cancel.clone(),
-        )
-        .await?;
+        if iteration == 0 && !callback_receipts.is_empty()
+            && let Some(tx) = runtime_tx
+        {
+            tx.send(
+                crate::runtime_events::RuntimeEvent::CallbackReceiptsInjected {
+                    provider: session.active_core.clone(),
+                    count: callback_receipts.len(),
+                },
+            )
+            .await
+            .ok();
+        }
+
+        let output = if iteration == 0 {
+            crate::turn_runner::run_turn_phased_with_messages(
+                store,
+                session,
+                core_provider,
+                user_message.clone(),
+                message,
+                cwd.clone(),
+                artifact_dir,
+                runtime_tx,
+                phase,
+                cancel.clone(),
+            )
+            .await
+        } else {
+            crate::turn_runner::run_turn_phased(
+                store,
+                session,
+                core_provider,
+                message,
+                cwd.clone(),
+                artifact_dir,
+                runtime_tx,
+                phase,
+                cancel.clone(),
+            )
+            .await
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(err) => return Err(err),
+        };
         let response_text = output.response.clone().unwrap_or_default();
         let core_turn_id = output.turn_id;
         last_output = Some(output);
+        let turn_status = load_turn_status(store, session.session_id, core_turn_id)?;
+
+        if matches!(turn_status, TurnStatus::Failed | TurnStatus::Cancelled) {
+            let clean_response = last_output.as_ref().and_then(|output| {
+                output.response.clone().map(|response| {
+                    let stripped = strip_sentinel_blocks(&response);
+                    if stripped.is_empty() {
+                        response
+                    } else {
+                        stripped
+                    }
+                })
+            });
+
+            return Ok(RoutedTurnOutput {
+                turn_id: core_turn_id,
+                response: clean_response,
+                delegated,
+            });
+        }
 
         // Check for sentinel delegate block in response
         let sentinel_blocks = extract_sentinel_blocks(&response_text);
@@ -287,39 +492,64 @@ pub async fn run_routed_turn_observable(
                 break;
             }
 
-            // V1: take the first task only (ignore extras)
-            let task = &request.requests[0];
-
             if let Some(tx) = runtime_tx {
-                tx.send(crate::runtime_events::RuntimeEvent::DelegateRequested {
-                    core_turn_id,
-                    peer: task.provider.clone(),
-                    role: task.role.to_string(),
-                    task_summary: preview_chars(&task.task, 80, "…"),
-                })
-                .await
-                .ok();
+                for task in &request.requests {
+                    tx.send(crate::runtime_events::RuntimeEvent::DelegateRequested {
+                        core_turn_id,
+                        peer: task.id.clone(),
+                        role: task.role.to_string(),
+                        task_summary: preview_chars(&task.task, 80, "…"),
+                    })
+                    .await
+                    .ok();
+                }
             }
 
-            let peer = match resolve_peer(&task.provider) {
-                Some(p) => p,
-                None => {
-                    // Peer not available — inject error and let core handle it
+            if let Some(r) = registry {
+                let config = SwitchyardConfig::resolve(&cwd).unwrap_or_default();
+                for task in &request.requests {
+                    if !r.has_live_instance(&task.provider) {
+                        if let Some(peer_p) = resolve_peer(&task.provider) {
+                            if let Some(persistent) = peer_p.as_persistent() {
+                                let env = config
+                                    .providers
+                                    .get(&task.provider)
+                                    .map(|c| c.env.clone())
+                                    .unwrap_or_default();
+                                if let Ok(inst) = persistent.start_persistent_instance(env).await {
+                                    r.register_instance(&task.provider, inst);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut all_resolved = true;
+            for task in &request.requests {
+                let has_registry_instance = registry
+                    .map(|r| r.has_live_instance(&task.provider))
+                    .unwrap_or(false);
+                let peer = resolve_peer(&task.provider);
+                if peer.is_none() && !has_registry_instance {
                     inject_context = Some(format!(
                         "Delegate to '{}' failed: provider not available.",
                         task.provider
                     ));
-                    continue;
+                    all_resolved = false;
+                    break;
                 }
-            };
+            }
+            if !all_resolved {
+                continue;
+            }
 
             // Build observer to forward peer events as RuntimeEvents
-            let peer_name = task.provider.clone();
             let observer: Option<Box<switchyard_orchestrator::PeerEventObserver>> =
                 runtime_tx.map(|tx| {
                     let tx = tx.clone();
-                    let peer = peer_name.clone();
                     Box::new(move |pe: &switchyard_provider_api::ProviderEvent| {
+                        let peer = pe.provider.clone();
                         let event = if let Some(execution) =
                             switchyard_provider_api::extract_execution_telemetry(&pe.payload)
                         {
@@ -361,6 +591,7 @@ pub async fn run_routed_turn_observable(
                                             turn_id: pe.turn_id,
                                             provider: peer.clone(),
                                             text,
+                                            payload: Some(pe.payload.clone()),
                                         }
                                     })
                                 }
@@ -386,7 +617,8 @@ pub async fn run_routed_turn_observable(
                 session,
                 store,
                 peer_catalog,
-                peer.as_ref(),
+                resolve_peer,
+                registry,
                 core_turn_id,
                 obs_ref,
                 cancel.clone(),
@@ -395,37 +627,42 @@ pub async fn run_routed_turn_observable(
             {
                 Ok(response) => {
                     delegated = true;
-                    let summary = response.results.first().and_then(|r| r.summary.clone());
-                    let status = response
-                        .results
-                        .first()
-                        .map(|r| r.status.to_string())
-                        .unwrap_or_default();
                     if let Some(tx) = runtime_tx {
-                        tx.send(crate::runtime_events::RuntimeEvent::DelegateCompleted {
-                            core_turn_id,
-                            peer: task.provider.clone(),
-                            status,
-                            summary: summary.clone(),
-                        })
-                        .await
-                        .ok();
+                        for result in &response.results {
+                            let status = result.status.to_string();
+                            tx.send(crate::runtime_events::RuntimeEvent::DelegateCompleted {
+                                core_turn_id,
+                                peer: result.id.clone(),
+                                status,
+                                summary: result.summary.clone(),
+                            })
+                            .await
+                            .ok();
+                        }
                     }
                     let result_block = render_delegate_result_block(&response.results);
                     inject_context = Some(result_block);
                 }
                 Err(e) => {
                     if let Some(tx) = runtime_tx {
-                        tx.send(crate::runtime_events::RuntimeEvent::DelegateCompleted {
-                            core_turn_id,
-                            peer: task.provider.clone(),
-                            status: "failed".to_string(),
-                            summary: Some(e.to_string()),
-                        })
-                        .await
-                        .ok();
+                        for task in &request.requests {
+                            tx.send(crate::runtime_events::RuntimeEvent::DelegateCompleted {
+                                core_turn_id,
+                                peer: task.id.clone(),
+                                status: "failed".to_string(),
+                                summary: Some(e.to_string()),
+                            })
+                            .await
+                            .ok();
+                        }
                     }
-                    inject_context = Some(format!("Delegate to '{}' failed: {e}", task.provider));
+                    let failed_peers = request
+                        .requests
+                        .iter()
+                        .map(|t| t.provider.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    inject_context = Some(format!("Delegate to '{}' failed: {e}", failed_peers));
                 }
             }
         } else {
@@ -434,7 +671,16 @@ pub async fn run_routed_turn_observable(
         }
     }
 
-    let output = last_output.ok_or_else(|| CoreError::Runner("no turn executed".to_string()))?;
+    let output = match last_output {
+        Some(output) => output,
+        None => return Err(CoreError::Runner("no turn executed".to_string())),
+    };
+
+    if !callback_receipts.is_empty()
+        && let Err(err) = consume_callback_receipts(store, &mut callback_receipts)
+    {
+        eprintln!("warning: failed to persist consumed callback receipts: {err}");
+    }
 
     // Strip sentinel blocks from the final response so users see clean prose.
     let clean_response = output.response.map(|r| {
@@ -494,6 +740,8 @@ mod tests {
         let hint = build_hyard_continuation_hint_from_dir(job_dir).unwrap();
         assert!(hint.contains("HYARD continuation hint"));
         assert!(hint.contains("wait_timeout"));
+        assert!(hint.contains("background tool"));
+        assert!(hint.contains("multiple independent HYARD jobs"));
         assert!(hint.contains("00000000-0000-0000-0000-000000000003"));
         assert!(!hint.contains("00000000-0000-0000-0000-000000000001"));
 
@@ -531,5 +779,27 @@ mod tests {
         assert!(truncated.starts_with("这是一次通过"));
         assert!(truncated.ends_with('…'));
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn callback_receipt_hint_marks_runtime_callback_context() {
+        let session_id = Uuid::now_v7();
+        let job_id = Uuid::now_v7();
+        let mut entry = InboxEntry::background_job_receipt(
+            session_id,
+            "claude",
+            "Claude background job completed",
+            "Claude finished a review while you were idle.",
+        );
+        entry.job_id = Some(job_id);
+        entry.summary = Some("Found one follow-up item.".to_string());
+        entry.payload = serde_json::json!({ "job_status": "completed" });
+
+        let hint = build_callback_receipt_hint(&[entry]).expect("callback hint");
+        assert!(hint.contains("BACKGROUND COMPLETION NOTICES"));
+        assert!(hint.contains("runtime callback receipts"));
+        assert!(hint.contains("not as a new user request"));
+        assert!(hint.contains(&job_id.to_string()));
+        assert!(hint.contains("Reuse the referenced job_id"));
     }
 }

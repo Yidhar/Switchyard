@@ -1,4 +1,25 @@
-/target
+# Build and dependency directories
+/target/
+/target-*/
+node_modules/
+dist/
+**/node_modules/
+**/dist/
+**/target/
+
+# Application data and runtime state
+.switchyard/
+**/.switchyard/
 **/*.rs.bk
-/docs
-.switchyard
+**/*.db
+**/*.db-journal
+**/*.sqlite
+**/*.sqlite-journal
+
+# System and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.local
+.env

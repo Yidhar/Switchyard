@@ -17,6 +17,7 @@ pub async fn run_claude_turn(
     extra_args: &[String],
     input: &TurnInput,
     timeout_secs: u64,
+    env: Option<&std::collections::HashMap<String, String>>,
     cwd: Option<&std::path::Path>,
     event_tx: &mpsc::Sender<ProviderEvent>,
     cancel: CancellationToken,
@@ -45,6 +46,7 @@ pub async fn run_claude_turn(
         cwd,
         pty_registry_key: Some(turn_id),
         prefer_pty: false,
+        env,
     };
 
     let (line_tx, mut line_rx) = mpsc::channel::<StreamingOutputLine>(256);
@@ -80,9 +82,19 @@ pub async fn run_claude_turn(
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(protocol_line) {
                 let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match msg_type {
+                    "content_block_delta" => {
+                        if let Some(delta) = json.get("delta")
+                            && delta.get("type").and_then(|t| t.as_str()) == Some("text_delta")
+                            && let Some(text) = delta.get("text").and_then(|t| t.as_str())
+                        {
+                            assistant_message.push_str(text);
+                        }
+                    }
                     // {"type":"result","result":"hello switchyard",...}
                     "result" => {
-                        if let Some(text) = json.get("result").and_then(|r| r.as_str()) {
+                        if let Some(text) = json.get("result").and_then(|r| r.as_str())
+                            && assistant_message.is_empty()
+                        {
                             assistant_message = text.to_string();
                         }
                     }
@@ -96,6 +108,7 @@ pub async fn run_claude_turn(
                             for block in content {
                                 if block.get("type").and_then(|t| t.as_str()) == Some("text")
                                     && let Some(text) = block.get("text").and_then(|t| t.as_str())
+                                    && assistant_message.is_empty()
                                 {
                                     assistant_message = text.to_string();
                                 }

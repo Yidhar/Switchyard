@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{capability::ProviderCapability, host_surface::HostSurfaceProbe, role::ProviderRole};
 
+const MAX_INJECTED_CHANGED_FILES: usize = 8;
+
 /// Prompt injection mode: determines how delegation instructions are rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMode {
@@ -115,27 +117,35 @@ impl PeerCatalog {
                         .to_string(),
                 );
                 lines.push(
-                    "If the bridge returns status=\"wait_timeout\", that is NOT a failure: the peer job continues running in background."
+                    "Treat HYARD as a background tool: launch peer work, then keep doing local work."
                         .to_string(),
                 );
                 lines.push(
-                    "The bridge writes one compact JSON object to stdout; read it verbatim and extract at least status, job_id, message, and next_actions."
+                    "If status=\"wait_timeout\", that is NOT a failure; the same job_id is still running in background."
                         .to_string(),
                 );
                 lines.push(
-                    "After wait_timeout, inspect or continue the same job with /hyard:status <job-id>, /hyard:result <job-id>, /hyard:await <job-id> <timeout-sec>, or /hyard:cancel <job-id>."
+                    "Use the compact bridge JSON verbatim and extract at least status, job_id, message, and next_actions."
                         .to_string(),
                 );
                 lines.push(
-                    "Do not re-delegate the same task from scratch when you already have a job_id."
+                    "Prefer the default short wait or --wait-sec 1-5 for true background launches; use longer waits only when foreground waiting is intentional."
                         .to_string(),
                 );
                 lines.push(
-                    "If status/result/await says the job is still active, keep using the same job_id until you get a terminal state or enough progress to report."
+                    "After wait_timeout, reuse the same job_id with /hyard:status, /hyard:result, /hyard:await, or /hyard:cancel."
                         .to_string(),
                 );
                 lines.push(
-                    "Use shorter wait windows (10-30s) for quick tasks and larger ones (30-120s+) for research or multi-step work."
+                    "Do NOT call /hyard:await immediately after /hyard:delegate unless the very next step is blocked on that result."
+                        .to_string(),
+                );
+                lines.push(
+                    "At a natural checkpoint, you may inspect the same job_id; do not re-delegate the same task from scratch."
+                        .to_string(),
+                );
+                lines.push(
+                    "You may run multiple independent HYARD jobs in parallel when their tasks do not overlap."
                         .to_string(),
                 );
             }
@@ -154,8 +164,37 @@ impl Default for PeerCatalog {
 
 /// Render a DelegateResponse as a text block for injection into the core's next turn.
 pub fn render_delegate_result_block(results: &[crate::delegate::DelegateTaskResult]) -> String {
-    let response = crate::delegate::DelegateResponse::new(results.to_vec());
-    let json = serde_json::to_string_pretty(&response).unwrap_or_default();
+    let compact_results = results
+        .iter()
+        .map(|result| {
+            let changed_files: Vec<String> = result
+                .changed_files
+                .iter()
+                .take(MAX_INJECTED_CHANGED_FILES)
+                .map(|path| path.display().to_string())
+                .collect();
+            serde_json::json!({
+                "id": result.id,
+                "provider": result.provider,
+                "status": result.status,
+                "summary": result.summary,
+                "changed_files": changed_files,
+                "changed_file_count": result.changed_files.len(),
+                "artifact_count": result.artifacts.len(),
+                "artifacts_omitted": !result.artifacts.is_empty(),
+                "error": result.error,
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let response = serde_json::json!({
+        "type": "delegate_result",
+        "compact": true,
+        "results": compact_results,
+    });
+    let json = serde_json::to_string(&response).unwrap_or_default();
     format!(
         "<<<SWITCHYARD_JSON_BEGIN>>>\n{}\n<<<SWITCHYARD_JSON_END>>>",
         json
@@ -185,7 +224,10 @@ mod tests {
         assert!(prompt.contains("/hyard:delegate"));
         assert!(prompt.contains("wait_timeout"));
         assert!(prompt.contains("/hyard:await"));
-        assert!(prompt.contains("Do not re-delegate the same task"));
+        assert!(prompt.contains("background tool"));
+        assert!(prompt.contains("keep doing local work"));
+        assert!(prompt.contains("multiple independent HYARD jobs in parallel"));
+        assert!(prompt.contains("do not re-delegate the same task"));
         assert!(prompt.contains("status, job_id, message, and next_actions"));
     }
 
@@ -195,5 +237,33 @@ mod tests {
         assert!(prompt.contains("\"timeout_sec\":900"));
         assert!(prompt.contains("600-1800 seconds"));
         assert!(prompt.contains("Do NOT invoke provider CLIs directly."));
+    }
+
+    #[test]
+    fn delegate_result_block_is_compact_and_omits_full_artifacts() {
+        let rendered = render_delegate_result_block(&[crate::delegate::DelegateTaskResult {
+            id: "t1".to_string(),
+            provider: "claude".to_string(),
+            status: crate::delegate::DelegateStatus::Success,
+            summary: Some("done".to_string()),
+            changed_files: (0..10)
+                .map(|idx| std::path::PathBuf::from(format!("src/file_{idx}.rs")))
+                .collect(),
+            artifacts: vec![std::collections::HashMap::from([(
+                "kind".to_string(),
+                serde_json::json!("full_payload_should_not_be_injected"),
+            )])],
+            error: None,
+            exit_code: Some(0),
+            duration_ms: Some(123),
+        }]);
+
+        assert!(rendered.contains("\"type\":\"delegate_result\""));
+        assert!(rendered.contains("\"compact\":true"));
+        assert!(rendered.contains("\"artifact_count\":1"));
+        assert!(rendered.contains("\"artifacts_omitted\":true"));
+        assert!(rendered.contains("\"changed_file_count\":10"));
+        assert!(!rendered.contains("full_payload_should_not_be_injected"));
+        assert!(!rendered.contains("\n  \"results\""));
     }
 }

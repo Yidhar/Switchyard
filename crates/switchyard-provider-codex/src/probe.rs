@@ -17,6 +17,7 @@ pub async fn run_probe(command: &str) -> Result<ProbeResult, ProviderError> {
         cwd: None,
         pty_registry_key: None,
         prefer_pty: false,
+        env: None,
     };
 
     let output = match run_subprocess(&config).await {
@@ -68,6 +69,7 @@ pub async fn run_probe(command: &str) -> Result<ProbeResult, ProviderError> {
         cwd: None,
         pty_registry_key: None,
         prefer_pty: false,
+        env: None,
     };
     if let Ok(help_output) = run_subprocess(&help_config).await {
         let help = &help_output.stdout;
@@ -145,6 +147,7 @@ async fn detect_feature_notes(command: &str) -> Vec<String> {
         cwd: None,
         pty_registry_key: None,
         prefer_pty: false,
+        env: None,
     };
 
     let Ok(output) = run_subprocess(&config).await else {

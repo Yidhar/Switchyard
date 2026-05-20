@@ -10,6 +10,9 @@ fn session_roundtrip() {
     assert_eq!(back.active_core, "codex");
     assert_eq!(back.mode, SessionMode::Interactive);
     assert!(back.enabled_peers.is_empty());
+    assert!(back.active_turn_id.is_none());
+    assert!(back.active_turn_provider.is_none());
+    assert!(back.active_turn_lease_expires_at.is_none());
 }
 
 #[test]
@@ -26,6 +29,103 @@ fn session_with_peers_and_bindings() {
     assert_eq!(back.enabled_peers.len(), 2);
     assert_eq!(back.native_bindings["claude"], "sess_abc123");
     assert_eq!(back.summary.as_deref(), Some("working on auth module"));
+    assert!(back.active_turn_id.is_none());
+}
+
+#[test]
+fn session_active_turn_roundtrip_and_helpers() {
+    let mut session = Session::new("codex".to_string());
+    let turn_id = Uuid::now_v7();
+    session.mark_turn_active(turn_id, "codex");
+
+    assert_eq!(session.active_turn_id, Some(turn_id));
+    assert_eq!(session.active_turn_provider.as_deref(), Some("codex"));
+    assert!(session.active_turn_lease_expires_at.is_some());
+    assert!(session.active_turn_is_live());
+
+    let json = serde_json::to_string(&session).unwrap();
+    let back: Session = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.active_turn_id, Some(turn_id));
+    assert_eq!(back.active_turn_provider.as_deref(), Some("codex"));
+
+    let mut cleared = back;
+    cleared.clear_active_turn();
+    assert!(cleared.active_turn_id.is_none());
+    assert!(cleared.active_turn_provider.is_none());
+    assert!(cleared.active_turn_lease_expires_at.is_none());
+}
+
+#[test]
+fn inbox_entry_roundtrip() {
+    let session_id = Uuid::now_v7();
+    let mut entry = InboxEntry::background_job_receipt(
+        session_id,
+        "claude",
+        "Claude background job completed",
+        "Claude finished a background review while you were idle.",
+    );
+    entry.summary = Some("Looks good overall; watch provider override persistence.".to_string());
+    entry.job_id = Some(Uuid::now_v7());
+    entry.turn_id = Some(Uuid::now_v7());
+    entry.payload = serde_json::json!({
+        "job_status": "completed",
+        "result_ready": true,
+        "artifact_count": 2
+    });
+
+    let json = serde_json::to_string(&entry).unwrap();
+    let back: InboxEntry = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.session_id, session_id);
+    assert_eq!(back.kind, InboxItemKind::BackgroundJobReceipt);
+    assert_eq!(back.status, InboxStatus::Unread);
+    assert_eq!(back.provider.as_deref(), Some("claude"));
+    assert_eq!(
+        back.summary.as_deref(),
+        Some("Looks good overall; watch provider override persistence.")
+    );
+    assert_eq!(back.payload["job_status"], "completed");
+}
+
+#[test]
+fn inbox_entry_mark_read_and_consumed() {
+    let session_id = Uuid::now_v7();
+    let mut entry = InboxEntry::new(
+        session_id,
+        InboxItemKind::BackgroundJobReceipt,
+        "done",
+        "message",
+    );
+
+    entry.mark_read();
+    assert_eq!(entry.status, InboxStatus::Read);
+    assert!(entry.read_at.is_some());
+    assert!(entry.consumed_at.is_none());
+
+    entry.mark_consumed();
+    assert_eq!(entry.status, InboxStatus::Consumed);
+    assert!(entry.read_at.is_some());
+    assert!(entry.consumed_at.is_some());
+}
+
+#[test]
+fn inbox_entry_delivery_mode_defaults_from_job_status() {
+    let session_id = Uuid::now_v7();
+    let mut completed =
+        InboxEntry::background_job_receipt(session_id, "claude", "completed", "done");
+    completed.payload = serde_json::json!({ "job_status": "completed" });
+    assert_eq!(completed.delivery_mode(), InboxDeliveryMode::Checkpoint);
+
+    let mut failed =
+        InboxEntry::background_job_receipt(session_id, "claude", "failed", "needs review");
+    failed.payload = serde_json::json!({ "job_status": "failed" });
+    assert_eq!(failed.delivery_mode(), InboxDeliveryMode::Immediate);
+
+    let mut overridden = InboxEntry::background_job_receipt(session_id, "claude", "quiet", "defer");
+    overridden.payload = serde_json::json!({
+        "job_status": "completed",
+        "callback_delivery": "quiet"
+    });
+    assert_eq!(overridden.delivery_mode(), InboxDeliveryMode::Quiet);
 }
 
 #[test]

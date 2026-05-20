@@ -7,4 +7,8 @@ pub enum ConfigError {
 
     #[error("config parse error: {0}")]
     Parse(#[from] toml::de::Error),
+
+    #[error("config serialization error: {0}")]
+    Serialize(#[from] toml::ser::Error),
 }
+

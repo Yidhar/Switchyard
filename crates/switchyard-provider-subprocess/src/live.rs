@@ -84,10 +84,10 @@ impl LiveInstance for SubprocessLiveInstance {
                 }
 
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(event_type) = json.get("event_type").and_then(|t| t.as_str()) {
-                        if event_type == "turn.completed" || event_type == "turn.failed" {
-                            break;
-                        }
+                    if let Some(event_type) = json.get("event_type").and_then(|t| t.as_str())
+                        && (event_type == "turn.completed" || event_type == "turn.failed")
+                    {
+                        break;
                     }
                     let pe = ProviderEvent::new(turn_id, EventType::ItemUpdated, &provider_name, json);
                     if event_tx.send(pe).await.is_err() {
@@ -126,5 +126,12 @@ impl LiveInstance for SubprocessLiveInstance {
             .await
             .map_err(|e| ProviderError::ExecutionFailed(e.to_string()))?;
         Ok(())
+    }
+
+    fn is_healthy(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            _ => false,
+        }
     }
 }

@@ -22,7 +22,7 @@ pub use event::{
 pub use host_surface::{HostSurfaceKind, HostSurfaceProbe};
 pub use identity::{ProbeResult, ProviderIdentity};
 pub use peer::{PeerCatalog, PeerDescriptor, PromptMode, render_delegate_result_block};
-pub use provider::Provider;
+pub use provider::{Provider, PersistentProvider, LiveInstance, LiveInstanceRegistry};
 pub use role::ProviderRole;
 pub use sentinel::{extract_sentinel_blocks, parse_sentinel_json, strip_sentinel_blocks};
 pub use tokio_util::sync::CancellationToken;

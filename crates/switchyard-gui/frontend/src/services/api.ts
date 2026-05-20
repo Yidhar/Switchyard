@@ -1,0 +1,42 @@
+import { invoke } from '@tauri-apps/api/core';
+import type { Session, Turn, SwitchyardConfig, ProviderStatus } from '../types';
+
+export const listSessions = (): Promise<Session[]> => {
+  return invoke<Session[]>('list_sessions');
+};
+
+export const getSessionTurns = (sessionId: string): Promise<Turn[]> => {
+  return invoke<Turn[]>('get_session_turns', { sessionId });
+};
+
+export const getSessionEvents = (sessionId: string): Promise<any[]> => {
+  return invoke<any[]>('get_session_events', { sessionId });
+};
+
+export const createSession = (provider: string): Promise<Session> => {
+  return invoke<Session>('create_session', { provider });
+};
+
+export const listProviderStatus = (): Promise<ProviderStatus[]> => {
+  return invoke<ProviderStatus[]>('list_provider_status');
+};
+
+export const loadConfig = (): Promise<SwitchyardConfig> => {
+  return invoke<SwitchyardConfig>('load_config');
+};
+
+export const saveConfig = (config: SwitchyardConfig): Promise<void> => {
+  return invoke<void>('save_config', { config });
+};
+
+export const runTurn = (sessionId: string, message: string, provider?: string): Promise<string> => {
+  return invoke<string>('run_turn', { sessionId, message, provider });
+};
+
+export const cancelTurn = (): Promise<void> => {
+  return invoke<void>('cancel_turn');
+};
+
+export const updateSessionPeers = (sessionId: string, enabledPeers: string[]): Promise<void> => {
+  return invoke<void>('update_session_peers', { sessionId, enabledPeers });
+};

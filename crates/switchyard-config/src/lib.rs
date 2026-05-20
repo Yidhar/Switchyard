@@ -83,6 +83,7 @@ pub struct StoreConfig {
 #[serde(rename_all = "lowercase")]
 pub enum StoreBackendConfig {
     #[default]
+    Auto,
     Jsonl,
     Sqlite,
 }
@@ -138,6 +139,13 @@ impl SwitchyardConfig {
         Ok(Self::default())
     }
 
+    /// Write the current configuration back to the specified path in TOML format.
+    pub fn write_to(&self, path: &Path) -> Result<(), ConfigError> {
+        let toml_str = toml::to_string_pretty(self)?;
+        std::fs::write(path, toml_str)?;
+        Ok(())
+    }
+
     /// Walk from `start_dir` up to filesystem root, looking for `switchyard.toml`.
     fn find_config_file(start_dir: &Path) -> Option<PathBuf> {
         let mut dir = start_dir.to_path_buf();
@@ -162,8 +170,9 @@ impl SwitchyardConfig {
     }
 
     /// Selected canonical store backend.
-    pub fn store_backend(&self) -> StoreBackend {
+    pub fn store_backend(&self, project_root: &Path) -> StoreBackend {
         match self.store.backend {
+            StoreBackendConfig::Auto => self.auto_store_backend(project_root),
             StoreBackendConfig::Jsonl => StoreBackend::Jsonl,
             StoreBackendConfig::Sqlite => StoreBackend::Sqlite,
         }
@@ -175,7 +184,7 @@ impl SwitchyardConfig {
         match &self.store.path {
             Some(path) if path.is_absolute() => path.clone(),
             Some(path) => project_root.join(path),
-            None => match self.store_backend() {
+            None => match self.store_backend(project_root) {
                 StoreBackend::Jsonl => self.session_dir(project_root),
                 StoreBackend::Sqlite => project_root.join(DOT_DIR).join("store.sqlite3"),
             },
@@ -247,6 +256,49 @@ impl SwitchyardConfig {
 
         issues
     }
+
+    fn auto_store_backend(&self, project_root: &Path) -> StoreBackend {
+        if let Some(configured_path) = self.store.path.as_ref() {
+            let resolved_path = if configured_path.is_absolute() {
+                configured_path.clone()
+            } else {
+                project_root.join(configured_path)
+            };
+            return infer_backend_from_path_hint(&resolved_path);
+        }
+
+        let sqlite_default = project_root.join(DOT_DIR).join("store.sqlite3");
+        let jsonl_default = self.session_dir(project_root);
+
+        if sqlite_default.is_file() {
+            StoreBackend::Sqlite
+        } else if jsonl_default.exists() {
+            StoreBackend::Jsonl
+        } else {
+            StoreBackend::Sqlite
+        }
+    }
+}
+
+fn infer_backend_from_path_hint(path: &Path) -> StoreBackend {
+    if path.is_dir() {
+        return StoreBackend::Jsonl;
+    }
+
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    if lower.ends_with("/sessions") || lower.ends_with("\\sessions") {
+        return StoreBackend::Jsonl;
+    }
+
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("sqlite") | Some("sqlite3") | Some("db") | Some("db3") => StoreBackend::Sqlite,
+        _ => StoreBackend::Sqlite,
+    }
 }
 
 impl FromStr for SwitchyardConfig {
@@ -272,8 +324,11 @@ mod tests {
         let cfg = SwitchyardConfig::default();
         assert_eq!(cfg.core.default_provider, "codex");
         assert!(cfg.core.default_peers.is_empty());
-        assert_eq!(cfg.store.backend, StoreBackendConfig::Jsonl);
-        assert_eq!(cfg.store_backend(), StoreBackend::Jsonl);
+        assert_eq!(cfg.store.backend, StoreBackendConfig::Auto);
+        assert_eq!(
+            cfg.store_backend(Path::new("/project")),
+            StoreBackend::Sqlite
+        );
         assert!(cfg.ui.show_diff);
         assert!(cfg.ui.show_artifacts);
     }
@@ -348,7 +403,8 @@ show_artifacts = false
 
     #[test]
     fn store_path_defaults_to_session_dir_for_jsonl() {
-        let cfg = SwitchyardConfig::default();
+        let mut cfg = SwitchyardConfig::default();
+        cfg.store.backend = StoreBackendConfig::Jsonl;
         let path = cfg.store_path(Path::new("/project"));
         assert_eq!(path, PathBuf::from("/project/.switchyard/sessions"));
     }
@@ -382,6 +438,27 @@ show_artifacts = false
     fn resolve_returns_default_when_no_file() {
         let cfg = SwitchyardConfig::resolve(Path::new("/nonexistent/path/unlikely")).unwrap();
         assert_eq!(cfg.core.default_provider, "codex");
+    }
+
+    #[test]
+    fn auto_store_backend_prefers_legacy_jsonl_when_sessions_dir_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = SwitchyardConfig::default();
+        std::fs::create_dir_all(cfg.session_dir(temp.path())).unwrap();
+        assert_eq!(cfg.store_backend(temp.path()), StoreBackend::Jsonl);
+        assert_eq!(cfg.store_path(temp.path()), cfg.session_dir(temp.path()));
+    }
+
+    #[test]
+    fn auto_store_backend_prefers_sqlite_when_sqlite_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = SwitchyardConfig::default();
+        let sqlite_path = cfg.store_path(temp.path());
+        std::fs::create_dir_all(sqlite_path.parent().unwrap()).unwrap();
+        std::fs::write(&sqlite_path, b"sqlite-placeholder").unwrap();
+        std::fs::create_dir_all(cfg.session_dir(temp.path())).unwrap();
+        assert_eq!(cfg.store_backend(temp.path()), StoreBackend::Sqlite);
+        assert_eq!(cfg.store_path(temp.path()), sqlite_path);
     }
 
     #[test]

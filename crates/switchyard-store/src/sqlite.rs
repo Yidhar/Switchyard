@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -6,10 +7,10 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
-    ArtifactStore, EventLog, SessionCatalog, SessionEventRepository, SessionRepository, StoreError,
-    TurnRepository,
+    ArtifactStore, EventLog, SessionCatalog, SessionEventRepository, SessionInboxRepository,
+    SessionRepository, StoreError, TurnRepository,
 };
-use switchyard_session::{Artifact, Event, Session, Turn};
+use switchyard_session::{Artifact, Event, InboxEntry, Session, Turn};
 
 pub const SQLITE_SCHEMA_VERSION: i64 = 1;
 const INITIAL_MIGRATION_DESCRIPTION: &str = "initial schema";
@@ -69,6 +70,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_artifacts_turn_sequence
     ON artifacts(turn_id, sequence_id);
 
+CREATE TABLE IF NOT EXISTS session_inbox (
+    entry_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_inbox_session_updated
+    ON session_inbox(session_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS store_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -96,6 +109,12 @@ pub struct SqliteSchemaInfo {
     pub migrations: Vec<SqliteMigrationRecord>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SqliteHealthInfo {
+    pub integrity_errors: Vec<String>,
+    pub foreign_key_issues: Vec<String>,
+}
+
 pub struct SqliteStore {
     conn: Connection,
 }
@@ -109,8 +128,14 @@ impl SqliteStore {
         }
 
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        
         let store = Self { conn };
-        store.initialize_schema()?;
+        if user_version < SQLITE_SCHEMA_VERSION {
+            store.initialize_schema()?;
+        }
         Ok(store)
     }
 
@@ -200,6 +225,45 @@ impl SqliteStore {
         })
     }
 
+    pub fn health_info(&self) -> Result<SqliteHealthInfo, StoreError> {
+        Ok(SqliteHealthInfo {
+            integrity_errors: self.integrity_errors()?,
+            foreign_key_issues: self.foreign_key_issues()?,
+        })
+    }
+
+    fn integrity_errors(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        if results.len() == 1 && results[0] == "ok" {
+            Ok(Vec::new())
+        } else {
+            Ok(results)
+        }
+    }
+
+    fn foreign_key_issues(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare("PRAGMA foreign_key_check")?;
+        let rows = stmt.query_map([], |row| {
+            let table = row.get::<_, String>(0)?;
+            let rowid = row.get::<_, i64>(1)?;
+            let parent = row.get::<_, String>(2)?;
+            let fkid = row.get::<_, i64>(3)?;
+            Ok(format!(
+                "table={table} rowid={rowid} parent={parent} fkid={fkid}"
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     fn resolve_turn(&self, turn_id: Uuid) -> Result<Uuid, StoreError> {
         let session_id = self
             .conn
@@ -256,6 +320,19 @@ impl SessionRepository for SqliteStore {
         json.map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(StoreError::from)
+    }
+
+    fn delete_session(&mut self, session_id: Uuid) -> Result<(), StoreError> {
+        let sid = session_id.to_string();
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM sessions WHERE session_id = ?1", params![sid])?;
+        tx.execute("DELETE FROM turn_index WHERE session_id = ?1", params![sid])?;
+        tx.execute("DELETE FROM turns_log WHERE session_id = ?1", params![sid])?;
+        tx.execute("DELETE FROM events WHERE session_id = ?1", params![sid])?;
+        tx.execute("DELETE FROM artifacts WHERE session_id = ?1", params![sid])?;
+        tx.execute("DELETE FROM session_inbox WHERE session_id = ?1", params![sid])?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -407,6 +484,48 @@ impl SessionEventRepository for SqliteStore {
     }
 }
 
+impl SessionInboxRepository for SqliteStore {
+    fn save_inbox_entry(&mut self, entry: &InboxEntry) -> Result<(), StoreError> {
+        let json = serde_json::to_string(entry)?;
+        self.conn.execute(
+            r#"
+            INSERT INTO session_inbox (entry_id, session_id, created_at, updated_at, status, data)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(entry_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                status = excluded.status,
+                data = excluded.data
+            "#,
+            params![
+                entry.entry_id.to_string(),
+                entry.session_id.to_string(),
+                entry.created_at.to_rfc3339(),
+                entry.updated_at.to_rfc3339(),
+                entry.status.to_string(),
+                json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_inbox_entries(&self, session_id: Uuid) -> Result<Vec<InboxEntry>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT data FROM session_inbox WHERE session_id = ?1 ORDER BY updated_at DESC, entry_id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let json = row?;
+            entries.push(serde_json::from_str::<InboxEntry>(&json)?);
+        }
+        Ok(entries)
+    }
+}
+
 fn collapse_turns(raw: Vec<Turn>) -> Vec<Turn> {
     let mut seen = std::collections::HashMap::<Uuid, usize>::new();
     let mut result: Vec<Turn> = Vec::new();
@@ -525,5 +644,59 @@ mod tests {
         assert!(schema.created_at.is_some());
         assert_eq!(schema.migrations.len(), 1);
         assert_eq!(schema.migrations[0].version, SQLITE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn health_info_reports_clean_store() {
+        let (path, _dir) = temp_db_path();
+        let store = SqliteStore::new(path).unwrap();
+
+        let health = store.health_info().unwrap();
+        assert!(health.integrity_errors.is_empty());
+        assert!(health.foreign_key_issues.is_empty());
+    }
+
+    #[test]
+    fn inbox_entries_append_and_update() {
+        let (path, _dir) = temp_db_path();
+        let mut store = SqliteStore::new(path).unwrap();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let mut entry = InboxEntry::background_job_receipt(
+            session.session_id,
+            "gemini",
+            "Gemini background job completed",
+            "Gemini finished a UI draft while you were idle.",
+        );
+        let entry_id = entry.entry_id;
+        store.save_inbox_entry(&entry).unwrap();
+
+        let inbox = store.list_inbox_entries(session.session_id).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].entry_id, entry_id);
+        assert!(inbox[0].is_unread());
+
+        entry.mark_read();
+        store.save_inbox_entry(&entry).unwrap();
+
+        let inbox = store.list_inbox_entries(session.session_id).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].status, switchyard_session::InboxStatus::Read);
+        assert_eq!(inbox[0].provider.as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn session_delete() {
+        let (path, _dir) = temp_db_path();
+        let mut store = SqliteStore::new(path).unwrap();
+        let session = Session::new("codex".to_string());
+        let id = session.session_id;
+
+        store.save_session(&session).unwrap();
+        assert!(store.load_session(id).unwrap().is_some());
+
+        store.delete_session(id).unwrap();
+        assert!(store.load_session(id).unwrap().is_none());
     }
 }

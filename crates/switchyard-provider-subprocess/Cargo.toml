@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 switchyard-provider-api = { workspace = true }
+async-trait = { workspace = true }
 switchyard-text = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

@@ -68,6 +68,7 @@ async fn try_version_flag(cmd: &str, flag: &str) -> Option<String> {
         cwd: None,
         pty_registry_key: None,
         prefer_pty: false,
+        env: None,
     };
     match crate::runner::run_subprocess(&config).await {
         Ok(output) if output.exit_code == Some(0) => first_nonempty_line(&output.stdout),
@@ -86,6 +87,7 @@ async fn try_node_version_flag(js_path: &str, flag: &str) -> Option<String> {
         cwd: None,
         pty_registry_key: None,
         prefer_pty: false,
+        env: None,
     };
     match crate::runner::run_subprocess(&config).await {
         Ok(output) if output.exit_code == Some(0) => first_nonempty_line(&output.stdout),

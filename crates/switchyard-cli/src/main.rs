@@ -16,6 +16,10 @@ use switchyard_provider_gemini::GeminiProvider;
 use switchyard_provider_subprocess::{find_on_path, probe_version};
 use switchyard_session::Session;
 use switchyard_store::{SessionRepository, StoreHandle};
+use switchyard_tui::{
+    app::App,
+    launch::{resolve_resume_session, resolve_work_dir},
+};
 
 use crate::store_cmd::StoreAction;
 
@@ -39,6 +43,24 @@ enum Commands {
         message: String,
 
         /// Working directory.
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+    },
+    /// Launch the interactive TUI.
+    Tui {
+        /// Provider to preselect (default: from config's core.default_provider or resumed session).
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Resume one existing session by full id or unique UUID prefix.
+        #[arg(long, conflicts_with = "resume_latest")]
+        session: Option<String>,
+
+        /// Resume the most recently updated session.
+        #[arg(long, conflicts_with = "session")]
+        resume_latest: bool,
+
+        /// Working directory used for config/store resolution and routed turns.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },
@@ -66,12 +88,17 @@ enum HostAction {
     /// List available providers with probe status.
     List,
     /// Delegate a task to a peer provider (leaf execution, no further delegation).
+    /// This is a background tool; it may return wait_timeout while the same job continues.
+    /// Continue other work, then follow up with status/result/await using the same job_id.
     Delegate {
         #[arg(long)]
         provider: String,
         #[arg(long)]
         task: String,
-        /// Time to wait for completion before returning `wait_timeout`.
+        /// Route the eventual callback receipt into this session id or unique UUID prefix.
+        #[arg(long)]
+        session: Option<String>,
+        /// Seconds to wait for completion before returning `wait_timeout`.
         #[arg(long, default_value_t = host::DEFAULT_WAIT_SECS)]
         wait_sec: u64,
     },
@@ -81,6 +108,7 @@ enum HostAction {
         job_id: String,
     },
     /// Wait again on an existing async job without restarting it.
+    /// This may also return wait_timeout while the same job keeps running.
     Await {
         #[arg(long)]
         job_id: String,
@@ -97,6 +125,76 @@ enum HostAction {
         #[arg(long)]
         job_id: String,
     },
+    /// Read callback receipts from a session inbox (defaults to latest session).
+    Inbox {
+        /// Session id or unique UUID prefix. Defaults to the latest session when omitted.
+        #[arg(long, conflicts_with = "resume_latest")]
+        session: Option<String>,
+        /// Explicitly target the most recently updated session.
+        #[arg(long, conflicts_with = "session")]
+        resume_latest: bool,
+        /// Include read/consumed items instead of unread receipts only.
+        #[arg(long)]
+        all: bool,
+        /// Mark returned unread items as read after listing them.
+        #[arg(long, conflicts_with = "consume")]
+        mark_read: bool,
+        /// Mark returned items as consumed after listing them.
+        #[arg(long, conflicts_with = "mark_read")]
+        consume: bool,
+    },
+    /// Wait for callback receipts from the current/latest session and return when one arrives.
+    Watch {
+        /// Session id or unique UUID prefix. Defaults to the latest session when omitted.
+        #[arg(long, conflicts_with = "resume_latest")]
+        session: Option<String>,
+        /// Explicitly target the most recently updated session.
+        #[arg(long, conflicts_with = "session")]
+        resume_latest: bool,
+        /// Seconds to wait for a new/pending callback receipt before returning wait_timeout.
+        #[arg(long, default_value_t = 180)]
+        timeout_sec: u64,
+        /// Mark returned unread items as read after they are delivered.
+        #[arg(long, conflicts_with = "consume")]
+        mark_read: bool,
+        /// Mark returned items as consumed after they are delivered.
+        #[arg(long, conflicts_with = "mark_read")]
+        consume: bool,
+    },
+    /// Resume an existing session non-interactively, optionally driven by unread callback receipts.
+    Resume {
+        /// Session id or unique UUID prefix. Defaults to the latest session when omitted.
+        #[arg(long, conflicts_with = "resume_latest")]
+        session: Option<String>,
+        /// Explicitly target the most recently updated session.
+        #[arg(long, conflicts_with = "session")]
+        resume_latest: bool,
+        /// Resume with an explicit user message.
+        #[arg(
+            long,
+            conflicts_with = "callbacks",
+            required_unless_present = "callbacks"
+        )]
+        message: Option<String>,
+        /// Resume only when unread non-quiet callback receipts are pending; otherwise return noop.
+        #[arg(long, conflicts_with = "message", required_unless_present = "message")]
+        callbacks: bool,
+    },
+    /// Wait for unread non-quiet callback receipts and automatically resume the same session.
+    Follow {
+        /// Session id or unique UUID prefix. Defaults to the latest session when omitted.
+        #[arg(long, conflicts_with = "resume_latest")]
+        session: Option<String>,
+        /// Explicitly target the most recently updated session.
+        #[arg(long, conflicts_with = "session")]
+        resume_latest: bool,
+        /// Seconds to wait for unread resumable callback receipts before returning wait_timeout.
+        #[arg(long, default_value_t = 180)]
+        timeout_sec: u64,
+        /// Stay resident and keep re-arming watch->resume cycles until the process is stopped.
+        #[arg(long)]
+        forever: bool,
+    },
     /// Internal async job worker. Not part of the public HYARD surface.
     #[command(hide = true)]
     Worker {
@@ -108,41 +206,100 @@ enum HostAction {
 }
 
 /// Build the provider registry with all known adapters.
-fn build_registry() -> ProviderRegistry {
+fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
 
-    registry.register(
-        "codex",
-        Box::new(|cfg| {
-            let p: Box<dyn Provider> = match cfg {
-                Some(c) => Box::new(CodexProvider::from_config(c)),
-                None => Box::new(CodexProvider::new("codex", vec![], 900)),
-            };
-            p
-        }),
-    );
+    // Register all configured providers dynamically!
+    for (name, prov_cfg) in &config.providers {
+        let backend = prov_cfg.backend.as_deref().unwrap_or_else(|| {
+            if name.contains("codex") {
+                "codex"
+            } else if name.contains("claude") {
+                "claude"
+            } else if name.contains("gemini") {
+                "gemini"
+            } else {
+                ""
+            }
+        });
+        match backend {
+            "codex" => {
+                registry.register(
+                    name.clone(),
+                    Box::new(|cfg| {
+                        let p: Box<dyn Provider> = match cfg {
+                            Some(c) => Box::new(CodexProvider::from_config(c)),
+                            None => Box::new(CodexProvider::new("codex", vec![], std::collections::HashMap::new(), 900)),
+                        };
+                        p
+                    }),
+                );
+            }
+            "claude" => {
+                registry.register(
+                    name.clone(),
+                    Box::new(|cfg| {
+                        let p: Box<dyn Provider> = match cfg {
+                            Some(c) => Box::new(ClaudeProvider::from_config(c)),
+                            None => Box::new(ClaudeProvider::new("claude", vec![], std::collections::HashMap::new(), 900)),
+                        };
+                        p
+                    }),
+                );
+            }
+            "gemini" => {
+                registry.register(
+                    name.clone(),
+                    Box::new(|cfg| {
+                        let p: Box<dyn Provider> = match cfg {
+                            Some(c) => Box::new(GeminiProvider::from_config(c)),
+                            None => Box::new(GeminiProvider::new("gemini", vec![], std::collections::HashMap::new(), 900)),
+                        };
+                        p
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
 
-    registry.register(
-        "claude",
-        Box::new(|cfg| {
-            let p: Box<dyn Provider> = match cfg {
-                Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                None => Box::new(ClaudeProvider::new("claude", vec![], 900)),
-            };
-            p
-        }),
-    );
-
-    registry.register(
-        "gemini",
-        Box::new(|cfg| {
-            let p: Box<dyn Provider> = match cfg {
-                Some(c) => Box::new(GeminiProvider::from_config(c)),
-                None => Box::new(GeminiProvider::new("gemini", vec![], 900)),
-            };
-            p
-        }),
-    );
+    // Always ensure the default three are registered even if not in config
+    if !registry.has("codex") {
+        registry.register(
+            "codex",
+            Box::new(|cfg| {
+                let p: Box<dyn Provider> = match cfg {
+                    Some(c) => Box::new(CodexProvider::from_config(c)),
+                    None => Box::new(CodexProvider::new("codex", vec![], std::collections::HashMap::new(), 900)),
+                };
+                p
+            }),
+        );
+    }
+    if !registry.has("claude") {
+        registry.register(
+            "claude",
+            Box::new(|cfg| {
+                let p: Box<dyn Provider> = match cfg {
+                    Some(c) => Box::new(ClaudeProvider::from_config(c)),
+                    None => Box::new(ClaudeProvider::new("claude", vec![], std::collections::HashMap::new(), 900)),
+                };
+                p
+            }),
+        );
+    }
+    if !registry.has("gemini") {
+        registry.register(
+            "gemini",
+            Box::new(|cfg| {
+                let p: Box<dyn Provider> = match cfg {
+                    Some(c) => Box::new(GeminiProvider::from_config(c)),
+                    None => Box::new(GeminiProvider::new("gemini", vec![], std::collections::HashMap::new(), 900)),
+                };
+                p
+            }),
+        );
+    }
 
     registry
 }
@@ -177,7 +334,7 @@ async fn main() {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = SwitchyardConfig::resolve(&cwd).unwrap_or_default();
-    let registry = build_registry();
+    let registry = build_registry(&config);
 
     match cli.command {
         Commands::Run {
@@ -192,7 +349,7 @@ async fn main() {
                 eprintln!("config warning: {issue}");
             }
 
-            let mut store = StoreHandle::open(config.store_backend(), config.store_path(&cwd))
+            let mut store = StoreHandle::open(config.store_backend(&cwd), config.store_path(&cwd))
                 .unwrap_or_else(|e| {
                     eprintln!("failed to open store: {e}");
                     process::exit(1);
@@ -222,6 +379,7 @@ async fn main() {
                 provider_impl.as_ref(),
                 &peer_catalog,
                 &|name| registry.create(name, config.providers.get(name)),
+                None,
                 message,
                 work_dir,
                 Some(&artifact_dir),
@@ -237,6 +395,60 @@ async fn main() {
                     eprintln!("turn failed: {e}");
                     process::exit(1);
                 }
+            }
+        }
+        Commands::Tui {
+            provider,
+            session,
+            resume_latest,
+            cwd: work_dir,
+        } => {
+            let tui_cwd = resolve_work_dir(&cwd, &work_dir);
+            let config = SwitchyardConfig::resolve(&tui_cwd).unwrap_or_default();
+            let store_backend = config.store_backend(&tui_cwd);
+            let store_path = config.store_path(&tui_cwd);
+            let job_dir = config.job_dir(&tui_cwd);
+            let mut resume_session = None;
+            let provider_override = provider.clone();
+            let mut provider_name =
+                provider.unwrap_or_else(|| config.core.default_provider.clone());
+
+            if session.is_some() || resume_latest {
+                let store =
+                    StoreHandle::open(store_backend, store_path.clone()).unwrap_or_else(|e| {
+                        eprintln!("failed to open store: {e}");
+                        process::exit(1);
+                    });
+                let selected = resolve_resume_session(&store, session.as_deref(), resume_latest)
+                    .unwrap_or_else(|err| {
+                        eprintln!("{err}");
+                        process::exit(1);
+                    });
+                resume_session = selected;
+
+                if provider_override.is_none()
+                    && let Some(session_id) = selected
+                    && let Ok(Some(existing)) = store.load_session(session_id)
+                {
+                    provider_name = existing.active_core;
+                }
+            }
+
+            if let Err(err) = std::env::set_current_dir(&tui_cwd) {
+                eprintln!(
+                    "failed to switch working directory to '{}': {err}",
+                    tui_cwd.display()
+                );
+                process::exit(1);
+            }
+
+            let mut app = App::with_store(provider_name, store_backend, store_path, job_dir);
+            if let Some(session_id) = resume_session {
+                app.set_resume_session(session_id);
+            }
+            if let Err(err) = app.run(&registry, &config).await {
+                eprintln!("fatal: {err}");
+                process::exit(1);
             }
         }
         Commands::Check { json } => {
@@ -436,10 +648,19 @@ async fn main() {
             HostAction::Delegate {
                 provider,
                 task,
+                session,
                 wait_sec,
             } => {
-                host::host_delegate_with_wait(&registry, &config, &provider, &task, &cwd, wait_sec)
-                    .await;
+                host::host_delegate_with_wait(
+                    &registry,
+                    &config,
+                    &provider,
+                    &task,
+                    &cwd,
+                    wait_sec,
+                    session.as_deref(),
+                )
+                .await;
             }
             HostAction::Status { job_id } => {
                 host::host_status(&config, &job_id, &cwd).await;
@@ -455,6 +676,76 @@ async fn main() {
             }
             HostAction::Cancel { job_id } => {
                 host::host_cancel(&config, &job_id, &cwd).await;
+            }
+            HostAction::Inbox {
+                session,
+                resume_latest,
+                all,
+                mark_read,
+                consume,
+            } => {
+                host::host_inbox(
+                    &config,
+                    session.as_deref(),
+                    resume_latest,
+                    all,
+                    mark_read,
+                    consume,
+                    &cwd,
+                )
+                .await;
+            }
+            HostAction::Watch {
+                session,
+                resume_latest,
+                timeout_sec,
+                mark_read,
+                consume,
+            } => {
+                host::host_watch(
+                    &config,
+                    session.as_deref(),
+                    resume_latest,
+                    timeout_sec,
+                    mark_read,
+                    consume,
+                    &cwd,
+                )
+                .await;
+            }
+            HostAction::Resume {
+                session,
+                resume_latest,
+                message,
+                callbacks,
+            } => {
+                host::host_resume(
+                    &registry,
+                    &config,
+                    session.as_deref(),
+                    resume_latest,
+                    message.as_deref(),
+                    callbacks,
+                    &cwd,
+                )
+                .await;
+            }
+            HostAction::Follow {
+                session,
+                resume_latest,
+                timeout_sec,
+                forever,
+            } => {
+                host::host_follow(
+                    &registry,
+                    &config,
+                    session.as_deref(),
+                    resume_latest,
+                    timeout_sec,
+                    forever,
+                    &cwd,
+                )
+                .await;
             }
             HostAction::Worker { job_id } => {
                 host::host_worker(&registry, &config, &job_id, &cwd).await;

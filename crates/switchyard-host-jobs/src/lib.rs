@@ -63,6 +63,8 @@ pub struct HostJobState {
     pub task: String,
     pub cwd: PathBuf,
     pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub callback_session_id: Option<Uuid>,
     pub turn_id: Option<Uuid>,
     pub status: HostJobStatus,
     pub created_at: DateTime<Utc>,
@@ -80,6 +82,10 @@ pub struct HostJobState {
     pub result_ready: bool,
     pub result_summary: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub callback_inbox_id: Option<Uuid>,
+    #[serde(default)]
+    pub callback_emitted_at: Option<DateTime<Utc>>,
 }
 
 impl HostJobState {
@@ -91,6 +97,7 @@ impl HostJobState {
             task: task.into(),
             cwd,
             session_id: None,
+            callback_session_id: None,
             turn_id: None,
             status: HostJobStatus::Queued,
             created_at: now,
@@ -107,6 +114,8 @@ impl HostJobState {
             result_ready: false,
             result_summary: None,
             error: None,
+            callback_inbox_id: None,
+            callback_emitted_at: None,
         }
     }
 
@@ -120,11 +129,14 @@ impl HostJobState {
     }
 
     pub fn to_bridge_json(&self) -> serde_json::Value {
+        let callback_session_id = self.callback_session_id.or(self.session_id);
         serde_json::json!({
             "job_id": self.job_id.to_string(),
             "status": self.status.to_string(),
             "provider": self.provider,
-            "session_id": self.session_id.map(|id| id.to_string()),
+            "session_id": callback_session_id.map(|id| id.to_string()),
+            "worker_session_id": self.session_id.map(|id| id.to_string()),
+            "callback_session_id": self.callback_session_id.map(|id| id.to_string()),
             "turn_id": self.turn_id.map(|id| id.to_string()),
             "last_event": self.last_event,
             "last_output_preview": self.last_output_preview,
@@ -138,12 +150,15 @@ impl HostJobState {
     }
 
     pub fn to_wait_timeout_json(&self) -> serde_json::Value {
+        let callback_session_id = self.callback_session_id.or(self.session_id);
         serde_json::json!({
             "job_id": self.job_id.to_string(),
             "status": "wait_timeout",
             "job_status": self.status.to_string(),
             "provider": self.provider,
-            "session_id": self.session_id.map(|id| id.to_string()),
+            "session_id": callback_session_id.map(|id| id.to_string()),
+            "worker_session_id": self.session_id.map(|id| id.to_string()),
+            "callback_session_id": self.callback_session_id.map(|id| id.to_string()),
             "turn_id": self.turn_id.map(|id| id.to_string()),
             "last_event": self.last_event,
             "last_output_preview": self.last_output_preview,

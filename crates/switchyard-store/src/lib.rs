@@ -2,12 +2,14 @@ pub mod error;
 pub mod jsonl;
 pub mod sqlite;
 
-use switchyard_session::{Artifact, Event, Session, Turn};
+use switchyard_session::{Artifact, Event, InboxEntry, Session, Turn};
 use uuid::Uuid;
 
 pub use error::StoreError;
 pub use jsonl::JsonlStore;
-pub use sqlite::{SQLITE_SCHEMA_VERSION, SqliteMigrationRecord, SqliteSchemaInfo, SqliteStore};
+pub use sqlite::{
+    SQLITE_SCHEMA_VERSION, SqliteHealthInfo, SqliteMigrationRecord, SqliteSchemaInfo, SqliteStore,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreBackend {
@@ -18,6 +20,7 @@ pub enum StoreBackend {
 pub trait SessionRepository {
     fn save_session(&mut self, session: &Session) -> Result<(), StoreError>;
     fn load_session(&self, session_id: Uuid) -> Result<Option<Session>, StoreError>;
+    fn delete_session(&mut self, session_id: Uuid) -> Result<(), StoreError>;
 }
 
 pub trait TurnRepository {
@@ -43,6 +46,11 @@ pub trait SessionEventRepository {
     fn list_session_events(&self, session_id: Uuid) -> Result<Vec<Event>, StoreError>;
 }
 
+pub trait SessionInboxRepository {
+    fn save_inbox_entry(&mut self, entry: &InboxEntry) -> Result<(), StoreError>;
+    fn list_inbox_entries(&self, session_id: Uuid) -> Result<Vec<InboxEntry>, StoreError>;
+}
+
 pub trait CanonicalStore:
     SessionRepository
     + TurnRepository
@@ -50,6 +58,7 @@ pub trait CanonicalStore:
     + ArtifactStore
     + SessionCatalog
     + SessionEventRepository
+    + SessionInboxRepository
 {
 }
 
@@ -60,6 +69,7 @@ impl<T> CanonicalStore for T where
         + ArtifactStore
         + SessionCatalog
         + SessionEventRepository
+        + SessionInboxRepository
 {
 }
 
@@ -97,6 +107,13 @@ impl StoreHandle {
             Self::Sqlite(store) => store.schema_info().map(Some),
         }
     }
+
+    pub fn sqlite_health_info(&self) -> Result<Option<SqliteHealthInfo>, StoreError> {
+        match self {
+            Self::Jsonl(_) => Ok(None),
+            Self::Sqlite(store) => store.health_info().map(Some),
+        }
+    }
 }
 
 impl SessionRepository for StoreHandle {
@@ -111,6 +128,13 @@ impl SessionRepository for StoreHandle {
         match self {
             Self::Jsonl(store) => store.load_session(session_id),
             Self::Sqlite(store) => store.load_session(session_id),
+        }
+    }
+
+    fn delete_session(&mut self, session_id: Uuid) -> Result<(), StoreError> {
+        match self {
+            Self::Jsonl(store) => store.delete_session(session_id),
+            Self::Sqlite(store) => store.delete_session(session_id),
         }
     }
 }
@@ -177,6 +201,22 @@ impl SessionEventRepository for StoreHandle {
         match self {
             Self::Jsonl(store) => store.list_session_events(session_id),
             Self::Sqlite(store) => store.list_session_events(session_id),
+        }
+    }
+}
+
+impl SessionInboxRepository for StoreHandle {
+    fn save_inbox_entry(&mut self, entry: &InboxEntry) -> Result<(), StoreError> {
+        match self {
+            Self::Jsonl(store) => store.save_inbox_entry(entry),
+            Self::Sqlite(store) => store.save_inbox_entry(entry),
+        }
+    }
+
+    fn list_inbox_entries(&self, session_id: Uuid) -> Result<Vec<InboxEntry>, StoreError> {
+        match self {
+            Self::Jsonl(store) => store.list_inbox_entries(session_id),
+            Self::Sqlite(store) => store.list_inbox_entries(session_id),
         }
     }
 }
