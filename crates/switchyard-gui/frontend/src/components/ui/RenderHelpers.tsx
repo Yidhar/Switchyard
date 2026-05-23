@@ -3,12 +3,13 @@ import { Terminal } from 'lucide-react';
 import type { Turn } from '../../types';
 import { ToolCard } from './ToolCard';
 
-/// Heuristic: does this inline-code content look enough like a file
-/// path that the Canvas should offer to open it?
-/// We accept anything containing a slash AND a known code extension,
-/// or a bare filename like `auth.ts` whose extension is recognised.
-/// Strings with whitespace / parens / semicolons are rejected to avoid
-/// turning code fragments (like `if (x)`) into "click to open".
+/// Heuristic: does this text look enough like a file path that the Canvas
+/// should offer to open it?
+///
+/// Keep this intentionally conservative. Chat text often contains CJK prose
+/// with slashes ("工作区/HEAD", "你/上一轮"), command names, or option strings;
+/// those must not become blue file chips. A reference is considered openable
+/// only when the final segment is a known source/config/document file name.
 const CODE_EXTENSIONS = [
   'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
   'rs', 'py', 'go', 'java', 'kt', 'kts',
@@ -21,8 +22,28 @@ const CODE_EXTENSIONS = [
   'sql', 'xml', 'graphql',
 ];
 
+const EXTENSIONLESS_FILE_NAMES = new Set([
+  'dockerfile',
+  'makefile',
+  'justfile',
+  'license',
+  'notice',
+  'copying',
+]);
+
+const DOTFILE_NAMES = new Set([
+  '.env',
+  '.gitignore',
+  '.gitattributes',
+  '.dockerignore',
+  '.editorconfig',
+  '.npmrc',
+  '.prettierrc',
+  '.eslintrc',
+]);
+
 const FILE_REFERENCE_LEADING_PUNCT_RE = /^[<([{"'“‘]+/;
-const FILE_REFERENCE_TRAILING_PUNCT_RE = /[>\])}"'“”‘’.,;:!?]+$/;
+const FILE_REFERENCE_TRAILING_PUNCT_RE = /[>\])}"'“”‘’.,;:!?，。；：！？、]+$/;
 
 export function normalizeFileReferenceForOpen(raw: string): string {
   return raw
@@ -34,18 +55,38 @@ export function normalizeFileReferenceForOpen(raw: string): string {
     .replace(/:\d+(?::\d+)?$/, '');
 }
 
+function fileReferenceBasename(path: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  const segments = normalized.split('/').filter(Boolean);
+  return segments[segments.length - 1] || normalized;
+}
+
+function fileReferenceExtension(path: string): string {
+  const basename = fileReferenceBasename(path);
+  const dotIdx = basename.lastIndexOf('.');
+  if (dotIdx <= 0 || dotIdx >= basename.length - 1) return '';
+  return basename.slice(dotIdx + 1).toLowerCase();
+}
+
 export function looksLikeFilePath(s: string): boolean {
   const normalized = normalizeFileReferenceForOpen(s);
   if (!normalized || normalized.length < 3 || normalized.length > 260) return false;
   if (/^https?:\/\//i.test(normalized)) return false;
-  if (/[\s(){}[\];,]/.test(normalized)) return false;
-  const hasSlash = normalized.includes('/') || normalized.includes('\\');
-  const dotIdx = normalized.lastIndexOf('.');
-  const ext = dotIdx > 0 && dotIdx < normalized.length - 1
-    ? normalized.slice(dotIdx + 1).toLowerCase()
-    : '';
+  if (normalized.includes('://')) return false;
+  if (normalized.endsWith('/') || normalized.endsWith('\\')) return false;
+  if (/[\s(){}[\];,，；]/.test(normalized)) return false;
+
+  const basename = fileReferenceBasename(normalized);
+  const lowerBasename = basename.toLowerCase();
+  if (!basename || basename === '.' || basename === '..') return false;
+
+  if (DOTFILE_NAMES.has(lowerBasename) || EXTENSIONLESS_FILE_NAMES.has(lowerBasename)) {
+    return true;
+  }
+
+  const ext = fileReferenceExtension(normalized);
   const knownExt = !!ext && CODE_EXTENSIONS.includes(ext);
-  return hasSlash || knownExt;
+  return knownExt;
 }
 
 function renderFileReference(
@@ -363,7 +404,9 @@ export function renderMessageBody(
                 </div>
               )}
               <pre style={{ margin: 0 }}>
-                <code>{codeContent.trim()}</code>
+                <code>
+                  {renderPlainTextWithFileReferences(codeContent.trim(), `code-${idx}`, onOpenFile)}
+                </code>
               </pre>
             </div>
           );
