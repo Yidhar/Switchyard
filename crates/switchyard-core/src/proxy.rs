@@ -157,7 +157,110 @@ impl Provider for PersistentProviderProxy {
     }
 }
 
+fn payload_item_type(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("item_type")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            payload
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|params| params.get("item_type"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|params| params.get("item"))
+                .and_then(|item| item.get("type"))
+                .and_then(|value| value.as_str())
+        })
+}
+
+fn is_non_assistant_activity_item(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "tool_use"
+            | "tool_call"
+            | "function_call"
+            | "custom_tool_call"
+            | "mcp_tool_call"
+            | "local_shell_call"
+            | "tool_result"
+            | "tool_response"
+            | "function_call_output"
+            | "custom_tool_call_output"
+            | "mcp_tool_call_output"
+            | "local_shell_call_output"
+            | "command_execution"
+            | "file_change"
+            | "diff_ready"
+            | "todo_list"
+            | "approval_request"
+            | "approval_decision"
+            | "server_request"
+            | "terminal_output"
+            | "execution_telemetry"
+            | "reasoning"
+    )
+}
+
+fn non_empty_payload_str(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn content_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = non_empty_payload_str(value) {
+        return Some(text);
+    }
+    if let Some(blocks) = value.as_array() {
+        let joined = blocks
+            .iter()
+            .filter_map(|block| {
+                non_empty_payload_str(block)
+                    .or_else(|| block.get("text").and_then(non_empty_payload_str))
+                    .or_else(|| block.get("content").and_then(content_text))
+            })
+            .collect::<String>();
+        return (!joined.is_empty()).then_some(joined);
+    }
+    if value.is_object() {
+        return value
+            .get("text")
+            .and_then(non_empty_payload_str)
+            .or_else(|| value.get("content").and_then(content_text));
+    }
+    None
+}
+
+fn delta_text(value: &serde_json::Value) -> Option<String> {
+    non_empty_payload_str(value)
+        .or_else(|| value.get("text").and_then(non_empty_payload_str))
+        .or_else(|| value.get("content").and_then(content_text))
+        .or_else(|| value.get("delta").and_then(delta_text))
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(content_text)
+        })
+}
+
 fn accumulate_response_text_from_event(response_text: &mut String, payload: &serde_json::Value) {
+    if let Some(item_type) = payload_item_type(payload)
+        && is_non_assistant_activity_item(item_type)
+    {
+        return;
+    }
+
     // Plain Switchyard text_message events are deltas emitted by live
     // instances (Codex item/agentMessage/delta, Claude content_block_delta, or
     // plain subprocess lines). Append them.
@@ -170,16 +273,8 @@ fn accumulate_response_text_from_event(response_text: &mut String, payload: &ser
     // adapters that forward native provider JSON instead of normalizing to
     // text_message first.
     if let Some(delta) = payload.get("delta") {
-        if let Some(text) = delta.get("text").and_then(|value| value.as_str()) {
-            response_text.push_str(text);
-            return;
-        }
-        if let Some(text) = delta
-            .get("delta")
-            .and_then(|inner| inner.get("text"))
-            .and_then(|value| value.as_str())
-        {
-            response_text.push_str(text);
+        if let Some(text) = delta_text(delta) {
+            response_text.push_str(&text);
             return;
         }
     }
@@ -199,13 +294,13 @@ fn accumulate_response_text_from_event(response_text: &mut String, payload: &ser
     // Gemini stream-json uses {type:"message", role:"assistant",
     // content:"...", delta:true} for increments and delta:false/absent for a
     // consolidated replacement.
-    if let Some(text) = payload.get("content").and_then(|value| value.as_str()) {
+    if let Some(text) = payload.get("content").and_then(content_text) {
         if payload
             .get("delta")
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
         {
-            response_text.push_str(text);
+            response_text.push_str(&text);
         } else {
             *response_text = text.to_string();
         }
@@ -223,6 +318,23 @@ fn accumulate_response_text_from_event(response_text: &mut String, payload: &ser
         *response_text = text.to_string();
         return;
     }
+    if let Some(text) = payload
+        .get("item")
+        .and_then(|item| item.get("content"))
+        .and_then(content_text)
+    {
+        *response_text = text;
+        return;
+    }
+    if let Some(text) = payload
+        .get("item")
+        .and_then(|item| item.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(content_text)
+    {
+        *response_text = text;
+        return;
+    }
 
     // Claude's result can be a final consolidated body. Replace instead of
     // append so deltas + final result do not duplicate.
@@ -234,19 +346,12 @@ fn accumulate_response_text_from_event(response_text: &mut String, payload: &ser
     // Claude consolidated assistant message content. Persistent Claude usually
     // drops these after streaming deltas, but keep the proxy robust for
     // providers that pass the shape through.
-    if let Some(blocks) = payload
+    if let Some(joined) = payload
         .get("message")
         .and_then(|message| message.get("content"))
-        .and_then(|content| content.as_array())
+        .and_then(content_text)
     {
-        let joined = blocks
-            .iter()
-            .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
-            .collect::<String>();
-        if !joined.is_empty() {
-            *response_text = joined;
-        }
+        *response_text = joined;
     }
 }
 
@@ -348,5 +453,61 @@ mod tests {
         );
 
         assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn codex_delta_string_and_nested_content_blocks_accumulate() {
+        let mut text = String::new();
+
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "method": "item/agentMessage/delta",
+                "params": { "delta": "hel" }
+            }),
+        );
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "item.delta",
+                "delta": { "type": "agent_message_delta", "text": "lo" }
+            }),
+        );
+
+        assert_eq!(text, "hello");
+
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "content": [
+                        { "type": "text", "text": "final " },
+                        { "type": "text", "text": "body" }
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(text, "final body");
+    }
+
+    #[test]
+    fn tool_result_content_does_not_replace_assistant_response() {
+        let mut text = String::from("assistant body");
+
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "tool_result",
+                    "content": "stdout that should stay in the tool card"
+                }
+            }),
+        );
+
+        assert_eq!(text, "assistant body");
     }
 }

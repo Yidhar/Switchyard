@@ -211,6 +211,105 @@ function hasMeaningfulRuntimeValue(value: any): boolean {
   return false;
 }
 
+function runtimeContentText(value: any): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value.length > 0 ? value : null;
+  if (Array.isArray(value)) {
+    const joined = value
+      .map((block) => runtimeContentText(block))
+      .filter((text): text is string => Boolean(text))
+      .join('');
+    return joined.length > 0 ? joined : null;
+  }
+  if (typeof value === 'object') {
+    if (typeof value.text === 'string' && value.text.length > 0) return value.text;
+    if (value.content !== undefined) return runtimeContentText(value.content);
+  }
+  return null;
+}
+
+function runtimeDeltaText(value: any): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value.length > 0 ? value : null;
+  if (typeof value !== 'object') return null;
+  if (typeof value.text === 'string' && value.text.length > 0) return value.text;
+  const content = runtimeContentText(value.content);
+  if (content) return content;
+  const nested = runtimeDeltaText(value.delta);
+  if (nested) return nested;
+  return runtimeContentText(value.message?.content);
+}
+
+function runtimePayloadText(payload: any): string | null {
+  if (!payload) return null;
+  const item = runtimePayloadItem(payload);
+  const params = payload.params || {};
+
+  if (typeof payload.text === 'string' && payload.text.length > 0) return payload.text;
+  if (typeof params.text === 'string' && params.text.length > 0) return params.text;
+
+  const deltaText =
+    runtimeDeltaText(payload.delta) ||
+    runtimeDeltaText(params.delta) ||
+    runtimeDeltaText(item?.delta);
+  if (deltaText) return deltaText;
+
+  const contentText =
+    runtimeContentText(payload.content) ||
+    runtimeContentText(params.content) ||
+    runtimeContentText(item?.content);
+  if (contentText) return contentText;
+
+  if (typeof item?.text === 'string' && item.text.length > 0) return item.text;
+  if (typeof payload.item?.text === 'string' && payload.item.text.length > 0) return payload.item.text;
+  if (typeof payload.params?.item?.text === 'string' && payload.params.item.text.length > 0) return payload.params.item.text;
+  if (typeof payload.result === 'string' && payload.result.length > 0) return payload.result;
+  if (typeof params.result === 'string' && params.result.length > 0) return params.result;
+  if (typeof item?.result === 'string' && item.result.length > 0) return item.result;
+
+  return (
+    runtimeContentText(payload.message?.content) ||
+    runtimeContentText(params.message?.content) ||
+    runtimeContentText(item?.message?.content)
+  );
+}
+
+function runtimeProtocolKind(payload: any): string {
+  return String(payload?.method || payload?.params?.method || payload?.type || payload?.params?.type || '')
+    .toLowerCase()
+    .replace(/\//g, '.');
+}
+
+function runtimeDeltaKind(payload: any): string {
+  return String(payload?.delta?.type || payload?.params?.delta?.type || runtimePayloadItem(payload)?.delta?.type || '')
+    .toLowerCase()
+    .replace(/[\/_-]+/g, '.');
+}
+
+function isRuntimeTextishDelta(payload: any): boolean {
+  if (!runtimePayloadText(payload)) return false;
+  const protocol = runtimeProtocolKind(payload);
+  const deltaKind = runtimeDeltaKind(payload);
+  const deltaKindIsTextish =
+    deltaKind.includes('agent.message') ||
+    deltaKind.includes('assistant') ||
+    deltaKind.includes('message.delta') ||
+    deltaKind.includes('content.block.delta') ||
+    deltaKind.includes('text.delta') ||
+    deltaKind === 'text' ||
+    deltaKind === 'output.text';
+  return (
+    protocol.includes('agentmessage') ||
+    protocol.includes('agent.message') ||
+    protocol.includes('assistant') ||
+    protocol.includes('message.delta') ||
+    protocol.includes('content.delta') ||
+    protocol.includes('text.delta') ||
+    (protocol.includes('item.delta') && (!deltaKind || deltaKindIsTextish)) ||
+    deltaKindIsTextish
+  );
+}
+
 function appendRealtimeLines(current: string[] | undefined, incoming: string[]): string[] {
   const next = [...(current || []), ...incoming];
   if (next.length <= MAX_REALTIME_TERMINAL_LINES) return next;
@@ -252,13 +351,12 @@ function isAssistantTextRuntimePayload(payload: any): boolean {
     payload?.message?.role,
     payload?.params?.message?.role,
   )?.toLowerCase();
-  const protocol = String(payload?.method || payload?.params?.method || payload?.type || payload?.params?.type || '')
-    .toLowerCase()
-    .replace(/\//g, '.');
+  const protocol = runtimeProtocolKind(payload);
 
   if (itemType === 'agent_message' || itemType === 'assistant') return true;
   if (itemType === 'message') return role === 'assistant';
   if (protocol.includes('agentmessage') || protocol.includes('agent_message')) return true;
+  if (isRuntimeTextishDelta(payload)) return true;
   if (role === 'assistant') return true;
 
   // If the provider sent a completely generic textual payload (no recognized
@@ -266,15 +364,7 @@ function isAssistantTextRuntimePayload(payload: any): boolean {
   // present, keep tool/result/reasoning payloads out of the chat body and let
   // renderTurnEvents display them in Execution Details instead.
   if (!itemType && !protocol.startsWith('turn.') && !protocol.startsWith('thread.')) {
-    return Boolean(
-      payload?.text ||
-      payload?.content ||
-      payload?.delta?.text ||
-      payload?.delta?.delta?.text ||
-      payload?.message?.content ||
-      payload?.params?.text ||
-      payload?.params?.content,
-    );
+    return Boolean(runtimePayloadText(payload));
   }
 
   return false;
@@ -283,16 +373,15 @@ function isAssistantTextRuntimePayload(payload: any): boolean {
 function isRuntimeAssistantTextPayload(payload: any): boolean {
   if (!payload || !isAssistantTextRuntimePayload(payload)) return false;
   const itemType = runtimeItemType(payload);
-  const protocol = String(payload?.method || payload?.params?.method || payload?.type || payload?.params?.type || '')
-    .toLowerCase()
-    .replace(/\//g, '.');
+  const protocol = runtimeProtocolKind(payload);
   return (
     !itemType ||
     itemType === 'agent_message' ||
     itemType === 'assistant' ||
     itemType === 'message' ||
     protocol.includes('agentmessage') ||
-    protocol.includes('agent_message')
+    protocol.includes('agent_message') ||
+    isRuntimeTextishDelta(payload)
   );
 }
 
@@ -302,25 +391,7 @@ function hasProviderTextUpdate(text: any, payload: any): boolean {
     return isAssistantTextRuntimePayload(payload);
   }
   if (!payload || !isAssistantTextRuntimePayload(payload)) return false;
-  const item = runtimePayloadItem(payload);
-  const params = payload.params || {};
-  return [
-    payload.text,
-    payload.content,
-    payload.delta?.text,
-    payload.delta?.delta?.text,
-    params.text,
-    params.content,
-    params.delta?.text,
-    params.delta?.delta?.text,
-    item?.text,
-    item?.content,
-    payload.item?.text,
-    payload.params?.item?.text,
-    payload.message?.content,
-    params.message?.content,
-    item?.message?.content,
-  ].some(hasMeaningfulRuntimeValue);
+  return Boolean(runtimePayloadText(payload));
 }
 
 function isRuntimeReasoningEvent(data: any): boolean {
@@ -514,28 +585,23 @@ function applyProviderTextUpdate(prev: string, text: string, payload: any): stri
   if (directText !== null) {
     return isSystemStatusText(directText) ? prev : prev + directText;
   }
+  const paramsText = typeof params.text === 'string' ? params.text : null;
+  if (paramsText !== null) {
+    return isSystemStatusText(paramsText) ? prev : prev + paramsText;
+  }
 
   const deltaText =
-    typeof payload.delta?.text === 'string'
-      ? payload.delta.text
-      : typeof payload.delta?.delta?.text === 'string'
-        ? payload.delta.delta.text
-        : typeof params.delta?.text === 'string'
-          ? params.delta.text
-          : typeof params.delta?.delta?.text === 'string'
-            ? params.delta.delta.text
-        : null;
+    runtimeDeltaText(payload.delta) ||
+    runtimeDeltaText(params.delta) ||
+    runtimeDeltaText(item?.delta);
   if (deltaText !== null) return prev + deltaText;
 
-  const contentText = typeof payload.content === 'string'
-    ? payload.content
-    : typeof params.content === 'string'
-      ? params.content
-      : typeof item?.content === 'string'
-        ? item.content
-        : null;
+  const contentText =
+    runtimeContentText(payload.content) ||
+    runtimeContentText(params.content) ||
+    runtimeContentText(item?.content);
   if (contentText !== null) {
-    const protocol = String(payload.method || params.method || payload.type || params.type || '').toLowerCase();
+    const protocol = runtimeProtocolKind(payload);
     const isDelta = payload.delta === true || params.delta === true || item?.delta === true || protocol.includes('delta');
     return isDelta ? prev + contentText : contentText;
   }
@@ -547,14 +613,11 @@ function applyProviderTextUpdate(prev: string, text: string, payload: any): stri
   if (typeof payload.result === 'string') return payload.result;
   if (typeof params.result === 'string') return params.result;
 
-  const blocks = payload.message?.content || params.message?.content || item?.message?.content;
-  if (Array.isArray(blocks)) {
-    const joined = blocks
-      .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-      .map((block) => block.text)
-      .join('');
-    if (joined) return joined;
-  }
+  const messageText =
+    runtimeContentText(payload.message?.content) ||
+    runtimeContentText(params.message?.content) ||
+    runtimeContentText(item?.message?.content);
+  if (messageText) return messageText;
 
   return incomingText ? prev + incomingText : prev;
 }

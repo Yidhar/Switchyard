@@ -116,6 +116,119 @@ function renderPlainTextWithFileReferences(
   });
 }
 
+function renderInlineMarkdown(
+  text: string,
+  keyPrefix: string,
+  onOpenFile?: (path: string) => void,
+): React.ReactNode[] {
+  // Inline formatting only. Block-level markdown (headings/code fences) is
+  // handled by renderMarkdownTextPart so we can keep the existing lightweight
+  // renderer without pulling a full markdown dependency into the Tauri UI.
+  const inlineParts = text.split(/(`[^`\n]+`)/g);
+  const nodes: React.ReactNode[] = [];
+  inlineParts.forEach((subPart, subIdx) => {
+    if (subPart.startsWith('`') && subPart.endsWith('`')) {
+      const codeText = subPart.slice(1, -1);
+      // When the inline-code looks like a file path AND we have a Canvas
+      // open-file handler in scope, render it as a clickable link that opens a
+      // tab. Otherwise render the plain `<code>` element.
+      if (onOpenFile && looksLikeFilePath(codeText)) {
+        nodes.push(
+          renderFileReference(
+            codeText,
+            normalizeFileReferenceForOpen(codeText),
+            `${keyPrefix}-inline-code-${subIdx}`,
+            true,
+            onOpenFile,
+          ),
+        );
+        return;
+      }
+      nodes.push(<code key={`${keyPrefix}-inline-code-${subIdx}`}>{codeText}</code>);
+      return;
+    }
+
+    // Check for bold parts. Keep the existing intentionally-small markdown
+    // surface: headings, fenced code, inline code, bold, and file references.
+    const boldParts = subPart.split(/(\*\*[^*]+\*\*)/g);
+    boldParts.forEach((boldPart, boldIdx) => {
+      if (boldPart.startsWith('**') && boldPart.endsWith('**')) {
+        nodes.push(
+          <strong key={`${keyPrefix}-bold-${subIdx}-${boldIdx}`}>
+            {renderPlainTextWithFileReferences(
+              boldPart.slice(2, -2),
+              `${keyPrefix}-${subIdx}-${boldIdx}-strong`,
+              onOpenFile,
+            )}
+          </strong>,
+        );
+        return;
+      }
+      nodes.push(
+        <React.Fragment key={`${keyPrefix}-text-${subIdx}-${boldIdx}`}>
+          {renderPlainTextWithFileReferences(
+            boldPart,
+            `${keyPrefix}-${subIdx}-${boldIdx}`,
+            onOpenFile,
+          )}
+        </React.Fragment>,
+      );
+    });
+  });
+  return nodes;
+}
+
+function parseMarkdownHeading(line: string): { level: number; text: string } | null {
+  const match = line.match(/^(#{1,6})(.*)$/);
+  if (!match) return null;
+
+  const marker = match[1];
+  const rest = match[2] ?? '';
+  if (!rest.trim()) return null;
+
+  // Standard Markdown requires whitespace after the marker ("## Heading").
+  // The GUI also accepts the common CJK/no-space form the user called out
+  // ("##标题"). Avoid treating "#include" or "#123" as a heading by only
+  // allowing no-space headings for level 2+ or a non-ASCII first character.
+  if (/^[ \t]/.test(rest)) {
+    return { level: marker.length, text: rest.trimStart() };
+  }
+
+  const first = rest[0] ?? '';
+  const allowNoSpaceHeading = marker.length >= 2 || /[^\x00-\x7F]/.test(first);
+  return allowNoSpaceHeading ? { level: marker.length, text: rest } : null;
+}
+
+function renderMarkdownTextPart(
+  part: string,
+  keyPrefix: string,
+  onOpenFile?: (path: string) => void,
+): React.ReactNode[] {
+  const lines = part.split(/\r?\n/);
+  return lines.flatMap((line, lineIdx) => {
+    const heading = parseMarkdownHeading(line);
+    const key = `${keyPrefix}-line-${lineIdx}`;
+    const trailingNewline = lineIdx < lines.length - 1 ? '\n' : null;
+    if (heading) {
+      return [
+        React.createElement(
+          `h${heading.level}` as keyof React.JSX.IntrinsicElements,
+          { key, className: `message-heading message-heading-${heading.level}` },
+          renderInlineMarkdown(heading.text, `${key}-heading`, onOpenFile),
+        ),
+        // Block headings already occupy their own line; only preserve extra
+        // blank lines from the source, not the structural line break itself.
+      ];
+    }
+    return [
+      <React.Fragment key={key}>
+        {renderInlineMarkdown(line, key, onOpenFile)}
+        {trailingNewline}
+      </React.Fragment>,
+    ];
+  });
+}
+
 export function renderMessageBody(
   text: string | null,
   style?: React.CSSProperties,
@@ -254,54 +367,15 @@ export function renderMessageBody(
               </pre>
             </div>
           );
-        } else {
-          // Regular text block. Render with inline formatting (inline code, bold)
-          const inlineParts = part.split(/(`[^`\n]+`)/g);
-          return (
-            <span key={idx}>
-              {inlineParts.map((subPart, subIdx) => {
-                if (subPart.startsWith('`') && subPart.endsWith('`')) {
-                  const codeText = subPart.slice(1, -1);
-                  // When the inline-code looks like a file path AND we
-                  // have a Canvas open-file handler in scope, render it
-                  // as a clickable link that opens a tab. Otherwise
-                  // render the plain `<code>` element.
-                  if (onOpenFile && looksLikeFilePath(codeText)) {
-                    return renderFileReference(
-                      codeText,
-                      normalizeFileReferenceForOpen(codeText),
-                      subIdx,
-                      true,
-                      onOpenFile,
-                    );
-                  }
-                  return <code key={subIdx}>{codeText}</code>;
-                }
-
-                // Check for bold parts
-                const boldParts = subPart.split(/(\*\*[^*]+\*\*)/g);
-                return boldParts.map((boldPart, boldIdx) => {
-                  if (boldPart.startsWith('**') && boldPart.endsWith('**')) {
-                    return (
-                      <strong key={boldIdx}>
-                        {renderPlainTextWithFileReferences(
-                          boldPart.slice(2, -2),
-                          `${idx}-${subIdx}-${boldIdx}-strong`,
-                          onOpenFile,
-                        )}
-                      </strong>
-                    );
-                  }
-                  return renderPlainTextWithFileReferences(
-                    boldPart,
-                    `${idx}-${subIdx}-${boldIdx}`,
-                    onOpenFile,
-                  );
-                });
-              })}
-            </span>
-          );
         }
+
+        // Regular text block. Render a small markdown subset plus the existing
+        // inline code / bold / file reference affordances.
+        return (
+          <React.Fragment key={idx}>
+            {renderMarkdownTextPart(part, `part-${idx}`, onOpenFile)}
+          </React.Fragment>
+        );
       })}
       {delegateCard}
     </div>
@@ -582,6 +656,7 @@ function toolName(payload: any, item: any, type: string): string {
   if (type === 'todo_list') return 'Task Planning (Codex)';
   if (type === 'approval_request') return '权限确认请求';
   if (type === 'approval_decision') return '权限处理结果';
+  if (type === 'server_request') return 'Codex Server Request';
   if (type === 'reasoning') return 'Reasoning';
   if (type.includes('mcp')) {
     const server = asString(firstPresent(item?.server, payload?.server, item?.server_name, payload?.server_name));
@@ -781,6 +856,14 @@ export function renderTurnEvents(
         status: String(decisionTag || '').startsWith('deny') ? 'failed' : 'completed',
         output: decisionText || decisionTag || payload.decision,
         actions: [],
+      });
+    } else if (itemType === 'server_request') {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: firstPresent(payload.request, payload.params, item?.request, item?.params),
+        status: normalizeStatus(payload, item, e.event_type),
+        output: firstMeaningful(payload.summary, item?.summary, payload.result, item?.result, payload.response, payload.error),
       });
     } else if (CALL_ITEM_TYPES.has(itemType)) {
       mergeTool(toolCalls, {

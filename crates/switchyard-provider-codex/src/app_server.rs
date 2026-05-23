@@ -440,6 +440,24 @@ impl LiveInstance for CodexAppServerInstance {
                         .unwrap_or_else(|| Value::Object(Default::default()));
 
                     if !is_approval_method(&method) {
+                        let server_request_event = ProviderEvent::new(
+                            canonical_turn_id,
+                            EventType::ItemUpdated,
+                            "codex",
+                            json!({
+                                "item_type": "server_request",
+                                "method": method.clone(),
+                                "status": "completed",
+                                "rpc_id": req_id_val.clone(),
+                                "request": params.clone(),
+                                "summary": format!("Codex server request: {method}"),
+                                "resolved_at_ms": unix_epoch_millis(),
+                            }),
+                        );
+                        if event_tx.send(server_request_event).await.is_err() {
+                            return;
+                        }
+
                         let reply = json!({
                             "jsonrpc": "2.0",
                             "id": req_id_val,
@@ -595,13 +613,9 @@ impl LiveInstance for CodexAppServerInstance {
                 }
 
                 match method {
-                    "item/agentMessage/delta" => {
-                        let delta = frame
-                            .get("params")
-                            .and_then(|p| p.get("delta"))
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
-                        if !delta.is_empty()
+                    method if is_text_delta_method(method) => {
+                        let params = frame.get("params").unwrap_or(&Value::Null);
+                        if let Some(delta) = extract_codex_text_delta(method, params)
                             && event_tx
                                 .send(ProviderEvent::text_message(
                                     canonical_turn_id,
@@ -794,6 +808,160 @@ fn annotate_protocol_payload(payload: &mut Value, method: &str) {
         map.entry("type".to_string())
             .or_insert_with(|| Value::String(method.replace('/', ".")));
     }
+}
+
+fn is_text_delta_method(method: &str) -> bool {
+    let normalized = method.to_ascii_lowercase().replace(['/', '_', '-'], ".");
+    normalized.contains("agentmessage.delta")
+        || normalized.contains("agent.message.delta")
+        || normalized.contains("agent.message")
+        || normalized.contains("agent_message")
+        || normalized.contains("assistant.message.delta")
+        || normalized == "item.delta"
+        || normalized.ends_with(".text.delta")
+        || normalized.ends_with(".message.delta")
+        || normalized.ends_with(".content.delta")
+}
+
+fn is_textish_delta_kind(kind: Option<&str>) -> bool {
+    let Some(kind) = kind else {
+        return true;
+    };
+    let normalized = kind.to_ascii_lowercase().replace(['/', '_', '-'], ".");
+    normalized.contains("agent.message")
+        || normalized.contains("assistant")
+        || normalized.contains("message.delta")
+        || normalized.contains("content.block.delta")
+        || normalized.contains("text.delta")
+        || normalized == "text"
+        || normalized == "output.text"
+        || normalized == "agent.message.delta"
+}
+
+fn extract_codex_text_delta(method: &str, params: &Value) -> Option<String> {
+    let method_hint = method.to_ascii_lowercase();
+    if let Some(text) = params.get("delta").and_then(|delta| {
+        extract_codex_delta_text(
+            delta,
+            method_hint.contains("agentmessage")
+                || method_hint.contains("agent_message")
+                || method_hint.contains("assistant")
+                || method_hint.contains("message")
+                || method_hint.contains("content"),
+        )
+    }) {
+        return Some(text);
+    }
+
+    let item = params.get("item");
+    let item_type = item
+        .and_then(|item| item.get("type"))
+        .and_then(|value| value.as_str());
+    if matches!(item_type, Some("agent_message" | "assistant" | "message")) {
+        if let Some(text) = item
+            .and_then(|item| item.get("text"))
+            .and_then(non_empty_string)
+        {
+            return Some(text);
+        }
+        if let Some(text) = item
+            .and_then(|item| item.get("content"))
+            .and_then(content_text)
+        {
+            return Some(text);
+        }
+    }
+
+    let role = params
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .or_else(|| params.get("role"))
+        .and_then(|value| value.as_str());
+    if role == Some("assistant")
+        && let Some(text) = params
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .or_else(|| params.get("content"))
+            .and_then(content_text)
+    {
+        return Some(text);
+    }
+
+    None
+}
+
+fn extract_codex_delta_text(delta: &Value, method_has_text_hint: bool) -> Option<String> {
+    if let Some(text) = non_empty_string(delta) {
+        return Some(text);
+    }
+
+    let kind = delta.get("type").and_then(|value| value.as_str());
+    if !method_has_text_hint && !is_textish_delta_kind(kind) {
+        return None;
+    }
+
+    if let Some(text) = delta.get("text").and_then(non_empty_string) {
+        return Some(text);
+    }
+    if let Some(text) = delta.get("content").and_then(content_text) {
+        return Some(text);
+    }
+    if let Some(text) = delta
+        .get("delta")
+        .and_then(|inner| extract_codex_delta_text(inner, method_has_text_hint))
+    {
+        return Some(text);
+    }
+    if let Some(text) = delta
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(content_text)
+    {
+        return Some(text);
+    }
+    None
+}
+
+fn content_text(value: &Value) -> Option<String> {
+    if let Some(text) = non_empty_string(value) {
+        return Some(text);
+    }
+
+    if let Some(blocks) = value.as_array() {
+        let mut joined = String::new();
+        for block in blocks {
+            if let Some(text) = non_empty_string(block) {
+                joined.push_str(&text);
+                continue;
+            }
+            if let Some(text) = block.get("text").and_then(non_empty_string) {
+                joined.push_str(&text);
+                continue;
+            }
+            if let Some(text) = block.get("content").and_then(content_text) {
+                joined.push_str(&text);
+            }
+        }
+        return (!joined.is_empty()).then_some(joined);
+    }
+
+    if value.is_object() {
+        if let Some(text) = value.get("text").and_then(non_empty_string) {
+            return Some(text);
+        }
+        if let Some(text) = value.get("content").and_then(content_text) {
+            return Some(text);
+        }
+    }
+
+    None
+}
+
+fn non_empty_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
 }
 
 fn response_turn_id(frame: &Value) -> Option<&str> {
@@ -1209,6 +1377,50 @@ mod tests {
             payload.get("type").and_then(|v| v.as_str()),
             Some("custom.type")
         );
+    }
+
+    #[test]
+    fn text_delta_detection_handles_codex_shapes() {
+        assert!(is_text_delta_method("item/agentMessage/delta"));
+        assert!(is_text_delta_method("item.delta"));
+        assert!(is_text_delta_method("response/output_text/delta"));
+
+        let params = json!({
+            "delta": { "type": "agent_message_delta", "text": "hello" }
+        });
+        assert_eq!(
+            extract_codex_text_delta("item.delta", &params).as_deref(),
+            Some("hello")
+        );
+
+        let string_delta = json!({ "delta": " world" });
+        assert_eq!(
+            extract_codex_text_delta("item/agentMessage/delta", &string_delta).as_deref(),
+            Some(" world")
+        );
+
+        let content_blocks = json!({
+            "item": {
+                "type": "agent_message",
+                "content": [
+                    { "type": "text", "text": "foo" },
+                    { "type": "text", "text": "bar" }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_codex_text_delta("item/updated", &content_blocks).as_deref(),
+            Some("foobar")
+        );
+    }
+
+    #[test]
+    fn non_text_delta_is_not_extracted_without_method_hint() {
+        let params = json!({
+            "delta": { "type": "tool_output_delta", "text": "stdout" }
+        });
+
+        assert_eq!(extract_codex_text_delta("item.delta", &params), None);
     }
 
     #[test]

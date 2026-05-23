@@ -719,11 +719,114 @@ fn clean_system_status_lines(text: &str) -> String {
     lines.join("\n")
 }
 
+fn payload_item_type(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("item_type")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            payload
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|params| params.get("item_type"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|params| params.get("item"))
+                .and_then(|item| item.get("type"))
+                .and_then(|value| value.as_str())
+        })
+}
+
+fn is_non_assistant_activity_item(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "tool_use"
+            | "tool_call"
+            | "function_call"
+            | "custom_tool_call"
+            | "mcp_tool_call"
+            | "local_shell_call"
+            | "tool_result"
+            | "tool_response"
+            | "function_call_output"
+            | "custom_tool_call_output"
+            | "mcp_tool_call_output"
+            | "local_shell_call_output"
+            | "command_execution"
+            | "file_change"
+            | "diff_ready"
+            | "todo_list"
+            | "approval_request"
+            | "approval_decision"
+            | "server_request"
+            | "terminal_output"
+            | "execution_telemetry"
+            | "reasoning"
+    )
+}
+
+fn non_empty_payload_str(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn content_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = non_empty_payload_str(value) {
+        return Some(text);
+    }
+    if let Some(blocks) = value.as_array() {
+        let joined = blocks
+            .iter()
+            .filter_map(|block| {
+                non_empty_payload_str(block)
+                    .or_else(|| block.get("text").and_then(non_empty_payload_str))
+                    .or_else(|| block.get("content").and_then(content_text))
+            })
+            .collect::<String>();
+        return (!joined.is_empty()).then_some(joined);
+    }
+    if value.is_object() {
+        return value
+            .get("text")
+            .and_then(non_empty_payload_str)
+            .or_else(|| value.get("content").and_then(content_text));
+    }
+    None
+}
+
+fn delta_text(value: &serde_json::Value) -> Option<String> {
+    non_empty_payload_str(value)
+        .or_else(|| value.get("text").and_then(non_empty_payload_str))
+        .or_else(|| value.get("content").and_then(content_text))
+        .or_else(|| value.get("delta").and_then(delta_text))
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(content_text)
+        })
+}
+
 fn update_accumulated_response(
     accumulated: &mut String,
     pe: &switchyard_provider_api::ProviderEvent,
 ) {
     let payload = &pe.payload;
+
+    if let Some(item_type) = payload_item_type(payload)
+        && is_non_assistant_activity_item(item_type)
+    {
+        return;
+    }
 
     // 1. Check if it's a text message (plain text)
     if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
@@ -735,28 +838,34 @@ fn update_accumulated_response(
 
     // 2. Check for delta updates (Codex/Claude delta)
     if let Some(delta) = payload.get("delta") {
-        if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-            accumulated.push_str(t);
+        if let Some(t) = delta_text(delta) {
+            accumulated.push_str(&t);
             return;
         }
-        if let Some(t) = delta
-            .get("delta")
-            .and_then(|d2| d2.get("text"))
-            .and_then(|v| v.as_str())
-        {
-            accumulated.push_str(t);
+    }
+
+    if let Some(params) = payload.get("params") {
+        let before = accumulated.clone();
+        let nested = switchyard_provider_api::ProviderEvent::new(
+            pe.turn_id,
+            pe.event_type.clone(),
+            pe.provider.clone(),
+            params.clone(),
+        );
+        update_accumulated_response(accumulated, &nested);
+        if *accumulated != before {
             return;
         }
     }
 
     // 3. Check for Gemini content
-    if let Some(t) = payload.get("content").and_then(|v| v.as_str()) {
+    if let Some(t) = payload.get("content").and_then(content_text) {
         let is_delta = payload
             .get("delta")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if is_delta {
-            accumulated.push_str(t);
+            accumulated.push_str(&t);
         } else {
             *accumulated = t.to_string();
         }
@@ -772,6 +881,23 @@ fn update_accumulated_response(
         *accumulated = t.to_string();
         return;
     }
+    if let Some(t) = payload
+        .get("item")
+        .and_then(|i| i.get("content"))
+        .and_then(content_text)
+    {
+        *accumulated = t;
+        return;
+    }
+    if let Some(t) = payload
+        .get("item")
+        .and_then(|i| i.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(content_text)
+    {
+        *accumulated = t;
+        return;
+    }
 
     // 5. Check for Claude result
     if let Some(t) = payload.get("result").and_then(|v| v.as_str()) {
@@ -780,19 +906,12 @@ fn update_accumulated_response(
     }
 
     // 6. Check for Claude assistant content
-    if let Some(blocks) = payload
+    if let Some(t) = payload
         .get("message")
         .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
+        .and_then(content_text)
     {
-        for block in blocks {
-            if block.get("type").and_then(|t| t.as_str()) == Some("text")
-                && let Some(t) = block.get("text").and_then(|v| v.as_str())
-            {
-                *accumulated = t.to_string();
-                return;
-            }
-        }
+        *accumulated = t;
     }
 }
 
@@ -808,6 +927,58 @@ mod tests {
     fn temp_store() -> (JsonlStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         (JsonlStore::new(dir.path().to_path_buf()), dir)
+    }
+
+    #[test]
+    fn update_accumulated_response_handles_codex_delta_shapes() {
+        let turn_id = Uuid::now_v7();
+        let mut text = String::new();
+
+        let string_delta = switchyard_provider_api::ProviderEvent::new(
+            turn_id,
+            switchyard_provider_api::EventType::ItemUpdated,
+            "codex",
+            serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": { "delta": "hel" }
+            }),
+        );
+        update_accumulated_response(&mut text, &string_delta);
+
+        let object_delta = switchyard_provider_api::ProviderEvent::new(
+            turn_id,
+            switchyard_provider_api::EventType::ItemUpdated,
+            "codex",
+            serde_json::json!({
+                "type": "item.delta",
+                "delta": { "type": "agent_message_delta", "text": "lo" }
+            }),
+        );
+        update_accumulated_response(&mut text, &object_delta);
+
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn update_accumulated_response_ignores_tool_result_content() {
+        let turn_id = Uuid::now_v7();
+        let mut text = String::from("assistant body");
+        let tool_result = switchyard_provider_api::ProviderEvent::new(
+            turn_id,
+            switchyard_provider_api::EventType::ItemCompleted,
+            "codex",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "tool_result",
+                    "content": "tool stdout"
+                }
+            }),
+        );
+
+        update_accumulated_response(&mut text, &tool_result);
+
+        assert_eq!(text, "assistant body");
     }
 
     struct PolicyCaptureProvider {

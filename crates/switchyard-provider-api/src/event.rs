@@ -180,72 +180,101 @@ impl ProviderEvent {
     }
 }
 
+fn non_empty_json_str(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn extract_content_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = non_empty_json_str(value) {
+        return Some(text);
+    }
+
+    if let Some(blocks) = value.as_array() {
+        let joined = blocks
+            .iter()
+            .filter_map(|block| {
+                non_empty_json_str(block)
+                    .or_else(|| block.get("text").and_then(non_empty_json_str))
+                    .or_else(|| block.get("content").and_then(extract_content_text))
+            })
+            .collect::<String>();
+        return (!joined.is_empty()).then_some(joined);
+    }
+
+    if value.is_object() {
+        return value
+            .get("text")
+            .and_then(non_empty_json_str)
+            .or_else(|| value.get("content").and_then(extract_content_text));
+    }
+
+    None
+}
+
+fn extract_delta_text(value: &serde_json::Value) -> Option<String> {
+    non_empty_json_str(value)
+        .or_else(|| value.get("text").and_then(non_empty_json_str))
+        .or_else(|| value.get("content").and_then(extract_content_text))
+        .or_else(|| value.get("delta").and_then(extract_delta_text))
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(extract_content_text)
+        })
+}
+
 /// Extract a human-readable display text from a provider event payload.
 ///
 /// Tries multiple paths used by different providers:
 /// 1. `payload["text"]` — Switchyard text_message
-/// 2. `payload["item"]["text"]` — Codex item.completed
-/// 3. `payload["result"]` — Claude result event
-/// 4. `payload["message"]["content"][*]["text"]` — Claude assistant event
-/// 5. `payload["content"]` — Gemini message event
+/// 2. `payload["delta"]` — Codex/Claude delta shapes (string or nested object)
+/// 3. `payload["item"]["text" | "content"]` — Codex item.completed
+/// 4. `payload["result"]` — Claude result event
+/// 5. `payload["message"]["content"][*]["text"]` — Claude assistant event
+/// 6. `payload["content"]` — Gemini/message content, string or content blocks
 pub fn extract_display_text(payload: &serde_json::Value) -> Option<String> {
-    // Path 1: shared text_message format
-    if let Some(t) = payload.get("text").and_then(|v| v.as_str())
-        && !t.is_empty()
-    {
-        return Some(t.to_string());
+    if let Some(t) = payload.get("text").and_then(non_empty_json_str) {
+        return Some(t);
     }
-    // Path 2: Codex item.completed → item.text
+
+    if let Some(t) = payload.get("delta").and_then(extract_delta_text) {
+        return Some(t);
+    }
+
+    if let Some(item) = payload.get("item") {
+        if let Some(t) = item.get("text").and_then(non_empty_json_str) {
+            return Some(t);
+        }
+        if let Some(t) = item.get("content").and_then(extract_content_text) {
+            return Some(t);
+        }
+        if let Some(t) = item
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(extract_content_text)
+        {
+            return Some(t);
+        }
+    }
+
+    if let Some(t) = payload.get("result").and_then(non_empty_json_str) {
+        return Some(t);
+    }
+
     if let Some(t) = payload
-        .get("item")
-        .and_then(|i| i.get("text"))
-        .and_then(|v| v.as_str())
-        && !t.is_empty()
-    {
-        return Some(t.to_string());
-    }
-    // Path 3: Claude result
-    if let Some(t) = payload.get("result").and_then(|v| v.as_str())
-        && !t.is_empty()
-    {
-        return Some(t.to_string());
-    }
-    // Path 4: Claude assistant message content blocks
-    if let Some(blocks) = payload
         .get("message")
         .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
+        .and_then(extract_content_text)
     {
-        for block in blocks {
-            if block.get("type").and_then(|t| t.as_str()) == Some("text")
-                && let Some(t) = block.get("text").and_then(|v| v.as_str())
-                && !t.is_empty()
-            {
-                return Some(t.to_string());
-            }
-        }
+        return Some(t);
     }
-    // Path 5: Gemini content
-    if let Some(t) = payload.get("content").and_then(|v| v.as_str())
-        && !t.is_empty()
-    {
-        return Some(t.to_string());
-    }
-    // Path 6: Delta text (Codex item.delta or Claude content_block_delta)
-    if let Some(delta) = payload.get("delta") {
-        if let Some(t) = delta.get("text").and_then(|v| v.as_str())
-            && !t.is_empty()
-        {
-            return Some(t.to_string());
-        }
-        if let Some(t) = delta
-            .get("delta")
-            .and_then(|d2| d2.get("text"))
-            .and_then(|v| v.as_str())
-            && !t.is_empty()
-        {
-            return Some(t.to_string());
-        }
+
+    if let Some(t) = payload.get("content").and_then(extract_content_text) {
+        return Some(t);
     }
 
     // Some providers surface raw JSON-RPC notifications as
@@ -552,6 +581,14 @@ fn summarize_item_activity(
                 .and_then(|value| value.as_str())
                 .unwrap_or("resolved");
             format!("[权限] 已处理：{tag}")
+        }
+        "server_request" => {
+            let method = item
+                .get("method")
+                .or_else(|| payload.get("method"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("request");
+            format!("[请求] Codex 已处理：{method}")
         }
         "todo_list" => "[待办] 已更新".to_string(),
         "delegate_request" => "[委托] 已生成请求".to_string(),
@@ -1088,6 +1125,53 @@ mod tests {
         assert_eq!(
             extract_activity_summary(&tool_payload).as_deref(),
             Some("[命令] 开始执行：cargo check")
+        );
+    }
+
+    #[test]
+    fn extract_display_text_handles_codex_delta_and_content_blocks() {
+        let delta_payload = serde_json::json!({
+            "type": "item.delta",
+            "delta": { "type": "agent_message_delta", "text": "hel" }
+        });
+        assert_eq!(extract_display_text(&delta_payload).as_deref(), Some("hel"));
+
+        let string_delta_payload = serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": { "delta": "lo" }
+        });
+        assert_eq!(
+            extract_display_text(&string_delta_payload).as_deref(),
+            Some("lo")
+        );
+
+        let content_payload = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "content": [
+                    { "type": "text", "text": "hello " },
+                    { "type": "text", "text": "world" }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_display_text(&content_payload).as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn server_request_summary_is_human_readable() {
+        let payload = serde_json::json!({
+            "item_type": "server_request",
+            "method": "codex/getClientInfo",
+            "status": "completed"
+        });
+
+        assert_eq!(
+            extract_activity_summary(&payload).as_deref(),
+            Some("[请求] Codex 已处理：codex/getClientInfo")
         );
     }
 
