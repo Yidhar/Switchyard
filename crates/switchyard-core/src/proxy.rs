@@ -73,7 +73,8 @@ impl Provider for PersistentProviderProxy {
             // tool/file approval requests (Codex daemon) get gated by
             // `policy.write_access` and `policy.allowed_paths`. Live instances
             // without daemon-side approvals or image support fall through to
-            // the trait default, which appends local file references to text.
+            // the trait default, which now sends only literal user text rather
+            // than leaking local attachment paths into the prompt.
             let mut event_rx = match inst.send_turn_with_policy(&input, &policy).await {
                 Ok(rx) => rx,
                 Err(e) => {
@@ -157,29 +158,56 @@ impl Provider for PersistentProviderProxy {
     }
 }
 
-fn payload_item_type(payload: &serde_json::Value) -> Option<&str> {
-    payload
-        .get("item_type")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            payload
-                .get("item")
-                .and_then(|item| item.get("type"))
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| {
-            payload
-                .get("params")
-                .and_then(|params| params.get("item_type"))
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| {
-            payload
-                .get("params")
-                .and_then(|params| params.get("item"))
-                .and_then(|item| item.get("type"))
-                .and_then(|value| value.as_str())
-        })
+fn normalize_activity_kind(value: &str) -> String {
+    value
+        .trim()
+        .replace(
+            |c: char| c == '.' || c == '/' || c == '-' || c.is_whitespace(),
+            "_",
+        )
+        .to_ascii_lowercase()
+}
+
+fn normalize_runtime_kind(value: &str) -> String {
+    value
+        .trim()
+        .replace(
+            |c: char| c == '/' || c == '_' || c == '-' || c.is_whitespace(),
+            ".",
+        )
+        .to_ascii_lowercase()
+}
+
+fn item_type_from_loose_value(value: Option<&serde_json::Value>) -> Option<String> {
+    let raw = value?.as_str()?.trim();
+    if raw.is_empty() || raw.contains('.') || raw.contains('/') {
+        return None;
+    }
+    let normalized = normalize_activity_kind(raw);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn payload_item_type(payload: &serde_json::Value) -> Option<String> {
+    [
+        payload.get("item_type"),
+        payload.get("item").and_then(|item| item.get("type")),
+        payload
+            .get("params")
+            .and_then(|params| params.get("item_type")),
+        payload
+            .get("params")
+            .and_then(|params| params.get("item"))
+            .and_then(|item| item.get("type")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(normalize_activity_kind)
+    .find(|item_type| !item_type.is_empty())
+    .or_else(|| item_type_from_loose_value(payload.get("type")))
+    .or_else(|| {
+        item_type_from_loose_value(payload.get("params").and_then(|params| params.get("type")))
+    })
 }
 
 fn is_non_assistant_activity_item(item_type: &str) -> bool {
@@ -205,6 +233,15 @@ fn is_non_assistant_activity_item(item_type: &str) -> bool {
             | "approval_decision"
             | "server_request"
             | "terminal_output"
+            | "terminal_output_delta"
+            | "tool_output_delta"
+            | "command_output_delta"
+            | "shell_output_delta"
+            | "stdout_delta"
+            | "stderr_delta"
+            | "file_change_delta"
+            | "diff_delta"
+            | "patch_delta"
             | "execution_telemetry"
             | "reasoning"
     )
@@ -241,11 +278,81 @@ fn content_text(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn delta_text(value: &serde_json::Value) -> Option<String> {
-    non_empty_payload_str(value)
-        .or_else(|| value.get("text").and_then(non_empty_payload_str))
+fn runtime_protocol_kind(payload: &serde_json::Value) -> String {
+    [
+        payload.get("method"),
+        payload
+            .get("params")
+            .and_then(|params| params.get("method")),
+        payload.get("type"),
+        payload.get("params").and_then(|params| params.get("type")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(normalize_runtime_kind)
+    .find(|kind| !kind.is_empty())
+    .unwrap_or_default()
+}
+
+fn protocol_has_text_hint(payload: &serde_json::Value) -> bool {
+    let normalized = runtime_protocol_kind(payload);
+    normalized.contains("agentmessage")
+        || normalized.contains("agent.message")
+        || normalized.contains("assistant")
+        || normalized.contains("message.delta")
+        || normalized.contains("content.delta")
+        || normalized.contains("text.delta")
+        || normalized.contains("output.text")
+}
+
+fn allows_plain_text_field(
+    item_type: Option<&str>,
+    text_protocol_hint: bool,
+    has_protocol_kind: bool,
+) -> bool {
+    text_protocol_hint
+        || !has_protocol_kind
+        || matches!(item_type, Some("agent_message" | "assistant" | "message"))
+}
+
+fn is_textish_delta_kind(kind: &str) -> bool {
+    let normalized = normalize_runtime_kind(kind);
+    normalized.contains("agent.message")
+        || normalized.contains("assistant")
+        || normalized.contains("message.delta")
+        || normalized.contains("content.block.delta")
+        || normalized.contains("text.delta")
+        || normalized == "text"
+        || normalized == "output.text"
+        || normalized.contains("output.text.delta")
+        || normalized == "agent.message.delta"
+}
+
+fn delta_text(value: &serde_json::Value, inherited_text_hint: bool) -> Option<String> {
+    if let Some(text) = non_empty_payload_str(value) {
+        return inherited_text_hint.then_some(text);
+    }
+
+    let kind = value.get("type").and_then(|value| value.as_str());
+    let kind_is_textish = kind.map(is_textish_delta_kind).unwrap_or(false);
+    if kind.is_some() && !kind_is_textish {
+        return None;
+    }
+    if !inherited_text_hint && !kind_is_textish {
+        return None;
+    }
+
+    let nested_text_hint = inherited_text_hint || kind_is_textish;
+    value
+        .get("text")
+        .and_then(non_empty_payload_str)
         .or_else(|| value.get("content").and_then(content_text))
-        .or_else(|| value.get("delta").and_then(delta_text))
+        .or_else(|| {
+            value
+                .get("delta")
+                .and_then(|delta| delta_text(delta, nested_text_hint))
+        })
         .or_else(|| {
             value
                 .get("message")
@@ -255,17 +362,37 @@ fn delta_text(value: &serde_json::Value) -> Option<String> {
 }
 
 fn accumulate_response_text_from_event(response_text: &mut String, payload: &serde_json::Value) {
-    if let Some(item_type) = payload_item_type(payload)
+    accumulate_response_text_from_event_with_hint(response_text, payload, false);
+}
+
+fn accumulate_response_text_from_event_with_hint(
+    response_text: &mut String,
+    payload: &serde_json::Value,
+    inherited_text_hint: bool,
+) {
+    let item_type = payload_item_type(payload);
+
+    if let Some(item_type) = item_type.as_deref()
         && is_non_assistant_activity_item(item_type)
     {
         return;
     }
 
+    let protocol_kind = runtime_protocol_kind(payload);
+    let text_protocol_hint = inherited_text_hint || protocol_has_text_hint(payload);
+    let plain_text_allowed = allows_plain_text_field(
+        item_type.as_deref(),
+        text_protocol_hint,
+        !protocol_kind.is_empty(),
+    );
+
     // Plain Switchyard text_message events are deltas emitted by live
     // instances (Codex item/agentMessage/delta, Claude content_block_delta, or
     // plain subprocess lines). Append them.
     if let Some(text) = payload.get("text").and_then(|value| value.as_str()) {
-        response_text.push_str(text);
+        if plain_text_allowed {
+            response_text.push_str(text);
+        }
         return;
     }
 
@@ -273,7 +400,7 @@ fn accumulate_response_text_from_event(response_text: &mut String, payload: &ser
     // adapters that forward native provider JSON instead of normalizing to
     // text_message first.
     if let Some(delta) = payload.get("delta") {
-        if let Some(text) = delta_text(delta) {
+        if let Some(text) = delta_text(delta, text_protocol_hint) {
             response_text.push_str(&text);
             return;
         }
@@ -285,7 +412,7 @@ fn accumulate_response_text_from_event(response_text: &mut String, payload: &ser
     // into `params` so final `provider_response` does not remain empty.
     if let Some(params) = payload.get("params") {
         let before = response_text.clone();
-        accumulate_response_text_from_event(response_text, params);
+        accumulate_response_text_from_event_with_hint(response_text, params, text_protocol_hint);
         if *response_text != before {
             return;
         }
@@ -294,7 +421,7 @@ fn accumulate_response_text_from_event(response_text: &mut String, payload: &ser
     // Gemini stream-json uses {type:"message", role:"assistant",
     // content:"...", delta:true} for increments and delta:false/absent for a
     // consolidated replacement.
-    if let Some(text) = payload.get("content").and_then(content_text) {
+    if plain_text_allowed && let Some(text) = payload.get("content").and_then(content_text) {
         if payload
             .get("delta")
             .and_then(|value| value.as_bool())
@@ -504,6 +631,57 @@ mod tests {
                 "item": {
                     "type": "tool_result",
                     "content": "stdout that should stay in the tool card"
+                }
+            }),
+        );
+
+        assert_eq!(text, "assistant body");
+    }
+
+    #[test]
+    fn non_text_item_delta_does_not_append_to_response() {
+        let mut text = String::from("assistant body");
+
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "item.delta",
+                "delta": {
+                    "type": "terminal_output_delta",
+                    "text": "PWD:\nE:\\Switchyard\nROOT:\n..."
+                }
+            }),
+        );
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "item.delta",
+                "delta": "large tool stdout should not become assistant text"
+            }),
+        );
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "terminal_output_delta",
+                "text": "CODEX (CORE)\n\nPWD:\nE:\\Switchyard\nROOT:\n..."
+            }),
+        );
+
+        assert_eq!(text, "assistant body");
+    }
+
+    #[test]
+    fn file_edit_payload_does_not_replace_response() {
+        let mut text = String::from("assistant body");
+
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "item.updated",
+                "item": {
+                    "type": "file_change",
+                    "path": "src/main.rs",
+                    "diff": "--- a/src/main.rs\n+++ b/src/main.rs\n@@\n-old\n+new"
                 }
             }),
         );

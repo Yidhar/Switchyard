@@ -214,26 +214,35 @@ fn extract_content_text(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn extract_delta_text(value: &serde_json::Value) -> Option<String> {
+fn extract_delta_text(value: &serde_json::Value, inherited_text_hint: bool) -> Option<String> {
     if let Some(text) = non_empty_json_str(value) {
-        return Some(text);
+        return inherited_text_hint.then_some(text);
     }
 
     // Delta objects can carry non-assistant streams too (tool stdout, command
-    // output, etc.). Only object-shaped deltas with an explicit text-ish kind
+    // output, etc.). Only object-shaped deltas with an explicit text-ish kind,
+    // or a clearly assistant/text protocol method inherited from the envelope,
     // should be promoted into chat text; activity/tool renderers handle the
     // rest from the original payload.
-    if let Some(kind) = value.get("type").and_then(|value| value.as_str())
-        && !is_textish_delta_kind(kind)
-    {
+    let kind = value.get("type").and_then(|value| value.as_str());
+    let kind_is_textish = kind.map(is_textish_delta_kind).unwrap_or(false);
+    if kind.is_some() && !kind_is_textish {
+        return None;
+    }
+    if !inherited_text_hint && !kind_is_textish {
         return None;
     }
 
+    let nested_text_hint = inherited_text_hint || kind_is_textish;
     value
         .get("text")
         .and_then(non_empty_json_str)
         .or_else(|| value.get("content").and_then(extract_content_text))
-        .or_else(|| value.get("delta").and_then(extract_delta_text))
+        .or_else(|| {
+            value
+                .get("delta")
+                .and_then(|delta| extract_delta_text(delta, nested_text_hint))
+        })
         .or_else(|| {
             value
                 .get("message")
@@ -265,6 +274,44 @@ fn is_textish_delta_kind(kind: &str) -> bool {
         || normalized == "agent.message.delta"
 }
 
+fn payload_protocol_kind_for_display(payload: &serde_json::Value) -> String {
+    [
+        payload.get("method"),
+        payload
+            .get("params")
+            .and_then(|params| params.get("method")),
+        payload.get("type"),
+        payload.get("params").and_then(|params| params.get("type")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(normalize_runtime_kind)
+    .find(|kind| !kind.is_empty())
+    .unwrap_or_default()
+}
+
+fn payload_protocol_has_text_hint(payload: &serde_json::Value) -> bool {
+    let normalized = payload_protocol_kind_for_display(payload);
+    normalized.contains("agentmessage")
+        || normalized.contains("agent.message")
+        || normalized.contains("assistant")
+        || normalized.contains("message.delta")
+        || normalized.contains("content.delta")
+        || normalized.contains("text.delta")
+        || normalized.contains("output.text")
+}
+
+fn allows_plain_display_text_field(
+    item_type: Option<&str>,
+    text_protocol_hint: bool,
+    has_protocol_kind: bool,
+) -> bool {
+    text_protocol_hint
+        || !has_protocol_kind
+        || matches!(item_type, Some("agent_message" | "assistant" | "message"))
+}
+
 fn normalize_item_type_for_display(value: &str) -> String {
     value
         .trim()
@@ -273,6 +320,15 @@ fn normalize_item_type_for_display(value: &str) -> String {
             "_",
         )
         .to_ascii_lowercase()
+}
+
+fn item_type_from_loose_display_value(value: Option<&serde_json::Value>) -> Option<String> {
+    let raw = value?.as_str()?.trim();
+    if raw.is_empty() || raw.contains('.') || raw.contains('/') {
+        return None;
+    }
+    let normalized = normalize_item_type_for_display(raw);
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn payload_item_type_for_display(payload: &serde_json::Value) -> Option<String> {
@@ -292,6 +348,12 @@ fn payload_item_type_for_display(payload: &serde_json::Value) -> Option<String> 
     .filter_map(|value| value.as_str())
     .map(normalize_item_type_for_display)
     .find(|item_type| !item_type.is_empty())
+    .or_else(|| item_type_from_loose_display_value(payload.get("type")))
+    .or_else(|| {
+        item_type_from_loose_display_value(
+            payload.get("params").and_then(|params| params.get("type")),
+        )
+    })
 }
 
 fn is_non_assistant_display_item(item_type: &str) -> bool {
@@ -319,6 +381,15 @@ fn is_non_assistant_display_item(item_type: &str) -> bool {
             | "approval_decision"
             | "server_request"
             | "terminal_output"
+            | "terminal_output_delta"
+            | "tool_output_delta"
+            | "command_output_delta"
+            | "shell_output_delta"
+            | "stdout_delta"
+            | "stderr_delta"
+            | "file_change_delta"
+            | "diff_delta"
+            | "patch_delta"
             | "execution_telemetry"
             | "reasoning"
             | "error"
@@ -335,17 +406,37 @@ fn is_non_assistant_display_item(item_type: &str) -> bool {
 /// 5. `payload["message"]["content"][*]["text"]` — Claude assistant event
 /// 6. `payload["content"]` — Gemini/message content, string or content blocks
 pub fn extract_display_text(payload: &serde_json::Value) -> Option<String> {
-    if let Some(item_type) = payload_item_type_for_display(payload)
-        && is_non_assistant_display_item(&item_type)
+    extract_display_text_with_hint(payload, false)
+}
+
+fn extract_display_text_with_hint(
+    payload: &serde_json::Value,
+    inherited_text_hint: bool,
+) -> Option<String> {
+    let item_type = payload_item_type_for_display(payload);
+
+    if let Some(item_type) = item_type.as_deref()
+        && is_non_assistant_display_item(item_type)
     {
         return None;
     }
 
+    let protocol_kind = payload_protocol_kind_for_display(payload);
+    let text_protocol_hint = inherited_text_hint || payload_protocol_has_text_hint(payload);
+    let plain_text_allowed = allows_plain_display_text_field(
+        item_type.as_deref(),
+        text_protocol_hint,
+        !protocol_kind.is_empty(),
+    );
+
     if let Some(t) = payload.get("text").and_then(non_empty_json_str) {
-        return Some(t);
+        return plain_text_allowed.then_some(t);
     }
 
-    if let Some(t) = payload.get("delta").and_then(extract_delta_text) {
+    if let Some(t) = payload
+        .get("delta")
+        .and_then(|delta| extract_delta_text(delta, text_protocol_hint))
+    {
         return Some(t);
     }
 
@@ -377,7 +468,7 @@ pub fn extract_display_text(payload: &serde_json::Value) -> Option<String> {
         return Some(t);
     }
 
-    if let Some(t) = payload.get("content").and_then(extract_content_text) {
+    if plain_text_allowed && let Some(t) = payload.get("content").and_then(extract_content_text) {
         return Some(t);
     }
 
@@ -386,7 +477,7 @@ pub fn extract_display_text(payload: &serde_json::Value) -> Option<String> {
     // canonical body as a final fallback so live forwarding still extracts
     // assistant text when an adapter does not pre-flatten the envelope.
     if let Some(params) = payload.get("params")
-        && let Some(t) = extract_display_text(params)
+        && let Some(t) = extract_display_text_with_hint(params, text_protocol_hint)
     {
         return Some(t);
     }
@@ -1277,6 +1368,20 @@ mod tests {
         });
 
         assert_eq!(extract_display_text(&payload), None);
+
+        let string_delta_payload = serde_json::json!({
+            "type": "item.delta",
+            "delta": "PWD:\nE:\\Switchyard\nROOT:\n..."
+        });
+
+        assert_eq!(extract_display_text(&string_delta_payload), None);
+
+        let direct_terminal_payload = serde_json::json!({
+            "type": "terminal_output_delta",
+            "text": "CODEX (CORE)\n\nPWD:\nE:\\Switchyard\nROOT:\n..."
+        });
+
+        assert_eq!(extract_display_text(&direct_terminal_payload), None);
     }
 
     #[test]

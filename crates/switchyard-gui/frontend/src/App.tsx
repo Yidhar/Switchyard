@@ -209,6 +209,15 @@ const NON_ASSISTANT_RUNTIME_ITEM_TYPES = new Set([
   'approval_decision',
   'server_request',
   'terminal_output',
+  'terminal_output_delta',
+  'tool_output_delta',
+  'command_output_delta',
+  'shell_output_delta',
+  'stdout_delta',
+  'stderr_delta',
+  'file_change_delta',
+  'diff_delta',
+  'patch_delta',
   'execution_telemetry',
   'reasoning',
   'error',
@@ -260,14 +269,26 @@ function runtimeContentText(value: any): string | null {
   return null;
 }
 
-function runtimeDeltaText(value: any): string | null {
+function normalizeRuntimeKind(value: any): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\/_\-\s]+/g, '.');
+}
+
+function runtimeDeltaText(value: any, inheritedTextHint = false): string | null {
   if (value === undefined || value === null) return null;
-  if (typeof value === 'string') return value.length > 0 ? value : null;
+  if (typeof value === 'string') return inheritedTextHint && value.length > 0 ? value : null;
   if (typeof value !== 'object') return null;
+  const ownKind = normalizeRuntimeKind(value.type);
+  const ownKindIsTextish = ownKind ? isTextishRuntimeDeltaKind(ownKind) : false;
+  if (ownKind && !ownKindIsTextish) return null;
+  if (!inheritedTextHint && !ownKindIsTextish) return null;
+  const nestedTextHint = inheritedTextHint || ownKindIsTextish;
   if (typeof value.text === 'string' && value.text.length > 0) return value.text;
   const content = runtimeContentText(value.content);
   if (content) return content;
-  const nested = runtimeDeltaText(value.delta);
+  const nested = runtimeDeltaText(value.delta, nestedTextHint);
   if (nested) return nested;
   return runtimeContentText(value.message?.content);
 }
@@ -276,14 +297,16 @@ function runtimePayloadText(payload: any): string | null {
   if (!payload) return null;
   const item = runtimePayloadItem(payload);
   const params = payload.params || {};
+  const textProtocolHint = runtimeProtocolHasTextHint(payload);
+  const paramsTextProtocolHint = runtimeProtocolHasTextHint(params);
 
   if (typeof payload.text === 'string' && payload.text.length > 0) return payload.text;
   if (typeof params.text === 'string' && params.text.length > 0) return params.text;
 
   const deltaText =
-    runtimeDeltaText(payload.delta) ||
-    runtimeDeltaText(params.delta) ||
-    runtimeDeltaText(item?.delta);
+    runtimeDeltaText(payload.delta, textProtocolHint) ||
+    runtimeDeltaText(params.delta, textProtocolHint || paramsTextProtocolHint) ||
+    runtimeDeltaText(item?.delta, textProtocolHint);
   if (deltaText) return deltaText;
 
   const contentText =
@@ -313,24 +336,26 @@ function runtimeProtocolKind(payload: any): string {
 }
 
 function runtimeDeltaKind(payload: any): string {
-  return String(payload?.delta?.type || payload?.params?.delta?.type || runtimePayloadItem(payload)?.delta?.type || '')
-    .toLowerCase()
-    .replace(/[\/_-]+/g, '.');
+  return normalizeRuntimeKind(payload?.delta?.type || payload?.params?.delta?.type || runtimePayloadItem(payload)?.delta?.type || '');
 }
 
-function isRuntimeTextishDelta(payload: any): boolean {
-  if (!runtimePayloadText(payload)) return false;
+function isTextishRuntimeDeltaKind(kind: string): boolean {
+  const normalized = normalizeRuntimeKind(kind);
+  return (
+    normalized.includes('agent.message') ||
+    normalized.includes('assistant') ||
+    normalized.includes('message.delta') ||
+    normalized.includes('content.block.delta') ||
+    normalized.includes('text.delta') ||
+    normalized === 'text' ||
+    normalized === 'output.text' ||
+    normalized.includes('output.text.delta') ||
+    normalized === 'agent.message.delta'
+  );
+}
+
+function runtimeProtocolHasTextHint(payload: any): boolean {
   const protocol = runtimeProtocolKind(payload);
-  const deltaKind = runtimeDeltaKind(payload);
-  const deltaKindIsTextish =
-    deltaKind.includes('agent.message') ||
-    deltaKind.includes('assistant') ||
-    deltaKind.includes('message.delta') ||
-    deltaKind.includes('content.block.delta') ||
-    deltaKind.includes('text.delta') ||
-    deltaKind === 'text' ||
-    deltaKind === 'output.text';
-  if (deltaKind && !deltaKindIsTextish) return false;
   return (
     protocol.includes('agentmessage') ||
     protocol.includes('agent.message') ||
@@ -338,9 +363,72 @@ function isRuntimeTextishDelta(payload: any): boolean {
     protocol.includes('message.delta') ||
     protocol.includes('content.delta') ||
     protocol.includes('text.delta') ||
-    (protocol.includes('item.delta') && (!deltaKind || deltaKindIsTextish)) ||
-    deltaKindIsTextish
+    protocol.includes('output.text')
   );
+}
+
+function isRuntimeTextishDelta(payload: any): boolean {
+  const protocolTextHint = runtimeProtocolHasTextHint(payload);
+  const paramsProtocolTextHint = payload?.params ? runtimeProtocolHasTextHint(payload.params) : false;
+  const item = runtimePayloadItem(payload);
+  const deltaText =
+    runtimeDeltaText(payload?.delta, protocolTextHint) ||
+    runtimeDeltaText(payload?.params?.delta, protocolTextHint || paramsProtocolTextHint) ||
+    runtimeDeltaText(item?.delta, protocolTextHint);
+  if (!deltaText) return false;
+  const deltaKind = runtimeDeltaKind(payload);
+  const deltaKindIsTextish = deltaKind ? isTextishRuntimeDeltaKind(deltaKind) : false;
+  if (deltaKind && !deltaKindIsTextish) return false;
+  return protocolTextHint || paramsProtocolTextHint || deltaKindIsTextish;
+}
+
+function payloadLooksLikeToolOrActivity(payload: any): boolean {
+  if (!payload || typeof payload !== 'object') return false;
+  const item = runtimePayloadItem(payload);
+  const params = payload.params || {};
+  const itemType = runtimeItemType(payload);
+  if (itemType && isNonAssistantRuntimeItemType(itemType)) return true;
+
+  const protocol = runtimeProtocolKind(payload);
+  if (
+    protocol.includes('tool') ||
+    protocol.includes('command') ||
+    protocol.includes('shell') ||
+    protocol.includes('approval') ||
+    protocol.includes('server.request') ||
+    protocol.includes('terminal') ||
+    protocol.includes('execution') ||
+    protocol.includes('diff') ||
+    protocol.includes('file.change')
+  ) {
+    return true;
+  }
+
+  const activityKeys = [
+    'execution',
+    'command',
+    'cmd',
+    'stdout',
+    'stderr',
+    'aggregated_output',
+    'exit_code',
+    'diff',
+    'patch',
+    'file',
+    'path',
+    'request',
+    'tool',
+    'tool_name',
+    'function',
+    'arguments',
+    'changes',
+    'edits',
+  ];
+
+  return [payload, params, item].some((candidate) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+    return activityKeys.some((key) => Object.prototype.hasOwnProperty.call(candidate, key));
+  });
 }
 
 function appendRealtimeLines(current: string[] | undefined, incoming: string[]): string[] {
@@ -401,7 +489,8 @@ function isAssistantTextRuntimePayload(payload: any): boolean {
     !itemType &&
     !protocol.startsWith('turn.') &&
     !protocol.startsWith('thread.') &&
-    !protocol.startsWith('item.')
+    !protocol.startsWith('item.') &&
+    !payloadLooksLikeToolOrActivity(payload)
   ) {
     return Boolean(runtimePayloadText(payload));
   }
@@ -614,11 +703,13 @@ function upsertRuntimeItemEvent(existing: any[], data: any): any[] {
 
 function applyProviderTextUpdate(prev: string, text: string, payload: any): string {
   const incomingText = typeof text === 'string' ? text : '';
-  if (!payload) return incomingText ? prev + incomingText : prev;
+  if (!payload) return incomingText && !isSystemStatusText(incomingText) ? prev + incomingText : prev;
   if (!isAssistantTextRuntimePayload(payload)) return prev;
 
   const item = runtimePayloadItem(payload);
   const params = payload.params || {};
+  const textProtocolHint = runtimeProtocolHasTextHint(payload);
+  const paramsTextProtocolHint = runtimeProtocolHasTextHint(params);
 
   const directText = typeof payload.text === 'string' ? payload.text : null;
   if (directText !== null) {
@@ -630,9 +721,9 @@ function applyProviderTextUpdate(prev: string, text: string, payload: any): stri
   }
 
   const deltaText =
-    runtimeDeltaText(payload.delta) ||
-    runtimeDeltaText(params.delta) ||
-    runtimeDeltaText(item?.delta);
+    runtimeDeltaText(payload.delta, textProtocolHint) ||
+    runtimeDeltaText(params.delta, textProtocolHint || paramsTextProtocolHint) ||
+    runtimeDeltaText(item?.delta, textProtocolHint);
   if (deltaText !== null) return prev + deltaText;
 
   const contentText =
@@ -1909,8 +2000,10 @@ function App() {
     const app = appContainerRef.current;
     const leftColumn = event.currentTarget.previousElementSibling as HTMLElement | null;
     if (!app || !leftColumn) return;
+    const sash = event.currentTarget;
+    const pointerId = event.pointerId;
     event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
+    sash.setPointerCapture(pointerId);
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
     document.body.classList.add('is-layout-resizing');
@@ -1918,6 +2011,7 @@ function App() {
     const leftOrigin = leftColumn.getBoundingClientRect().left;
     let nextWidth = leftColumnWidthRef.current;
     let resizeFrame: number | null = null;
+    let finished = false;
     const applyPendingWidth = () => {
       resizeFrame = null;
       app.style.setProperty(
@@ -1938,9 +2032,13 @@ function App() {
       }
     };
 
-    const handlePointerUp = () => {
+    const finishResize = () => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('pointermove', handlePointerMove);
-      document.removeEventListener('pointerup', handlePointerUp);
+      document.removeEventListener('pointerup', finishResize);
+      document.removeEventListener('pointercancel', finishResize);
+      window.removeEventListener('blur', finishResize);
       if (resizeFrame !== null) {
         cancelAnimationFrame(resizeFrame);
         resizeFrame = null;
@@ -1953,10 +2051,19 @@ function App() {
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       document.body.classList.remove('is-layout-resizing');
+      try {
+        if (sash.hasPointerCapture(pointerId)) {
+          sash.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // The pointer may already be released after window blur/cancel.
+      }
     };
 
-    document.addEventListener('pointermove', handlePointerMove);
-    document.addEventListener('pointerup', handlePointerUp, { once: true });
+    document.addEventListener('pointermove', handlePointerMove, { passive: true });
+    document.addEventListener('pointerup', finishResize, { once: true });
+    document.addEventListener('pointercancel', finishResize, { once: true });
+    window.addEventListener('blur', finishResize, { once: true });
   };
 
   const startCanvasResize = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1964,8 +2071,10 @@ function App() {
     const app = appContainerRef.current;
     const row = mainRowRef.current;
     if (!app || !row) return;
+    const sash = event.currentTarget;
+    const pointerId = event.pointerId;
     event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
+    sash.setPointerCapture(pointerId);
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
     document.body.classList.add('is-layout-resizing');
@@ -1977,6 +2086,7 @@ function App() {
     );
     let nextWidth = canvasColumnWidthRef.current;
     let resizeFrame: number | null = null;
+    let finished = false;
     const applyPendingWidth = () => {
       resizeFrame = null;
       app.style.setProperty(
@@ -1997,9 +2107,13 @@ function App() {
       }
     };
 
-    const handlePointerUp = () => {
+    const finishResize = () => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('pointermove', handlePointerMove);
-      document.removeEventListener('pointerup', handlePointerUp);
+      document.removeEventListener('pointerup', finishResize);
+      document.removeEventListener('pointercancel', finishResize);
+      window.removeEventListener('blur', finishResize);
       if (resizeFrame !== null) {
         cancelAnimationFrame(resizeFrame);
         resizeFrame = null;
@@ -2012,10 +2126,19 @@ function App() {
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       document.body.classList.remove('is-layout-resizing');
+      try {
+        if (sash.hasPointerCapture(pointerId)) {
+          sash.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // The pointer may already be released after window blur/cancel.
+      }
     };
 
-    document.addEventListener('pointermove', handlePointerMove);
-    document.addEventListener('pointerup', handlePointerUp, { once: true });
+    document.addEventListener('pointermove', handlePointerMove, { passive: true });
+    document.addEventListener('pointerup', finishResize, { once: true });
+    document.addEventListener('pointercancel', finishResize, { once: true });
+    window.addEventListener('blur', finishResize, { once: true });
   };
 
   /// Context object passed to slash command handlers. Built fresh on
@@ -2545,6 +2668,7 @@ function App() {
           underneath both chat and canvas at once, matching VS Code's
           integrated-terminal layout. */}
       <div
+        className="main-pane-stack"
         style={{
           display: 'flex',
           flexDirection: 'column',
@@ -2556,6 +2680,7 @@ function App() {
       >
         <div
           ref={mainRowRef}
+          className="chat-canvas-row"
           style={{
             display: 'flex',
             flex: 1,
@@ -2564,7 +2689,7 @@ function App() {
             overflow: 'hidden',
           }}
         >
-          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          <div className="chat-pane" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
             <ChatArea
               selectedSession={selectedSession}
               isGenerating={isGenerating}
@@ -2609,6 +2734,7 @@ function App() {
                 }}
               />
               <div
+                className="canvas-column"
                 style={{
                   width: 'var(--switchyard-canvas-column-width, 680px)',
                   minWidth: MIN_CANVAS_COLUMN_WIDTH,

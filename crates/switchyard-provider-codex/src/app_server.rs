@@ -374,19 +374,7 @@ impl LiveInstance for CodexAppServerInstance {
         policy: &ExecutionPolicy,
     ) -> Result<mpsc::Receiver<ProviderEvent>, ProviderError> {
         let policy = policy.clone();
-        let mut input_items = vec![json!({
-            "type": "text",
-            "text": input.user_message_with_attachment_references(),
-            "text_elements": [],
-        })];
-        for attachment in &input.attachments {
-            if matches!(attachment.mime_type.as_deref(), Some(mime) if mime.starts_with("image/")) {
-                input_items.push(json!({
-                    "type": "localImage",
-                    "path": attachment.path.display().to_string(),
-                }));
-            }
-        }
+        let input_items = turn_input_items(input);
         // Send turn/start. Do not synchronously wait for its response before
         // installing the drain task: newer Codex app-server builds can emit
         // notifications or server-initiated approval requests immediately
@@ -892,19 +880,21 @@ fn extract_codex_text_delta(method: &str, params: &Value) -> Option<String> {
 
 fn extract_codex_delta_text(delta: &Value, method_has_text_hint: bool) -> Option<String> {
     if let Some(text) = non_empty_string(delta) {
-        return Some(text);
+        return method_has_text_hint.then_some(text);
     }
 
     let kind = delta.get("type").and_then(|value| value.as_str());
-    if let Some(kind) = kind
-        && !is_textish_delta_kind(Some(kind))
-    {
+    let kind_is_textish = kind
+        .map(|kind| is_textish_delta_kind(Some(kind)))
+        .unwrap_or(false);
+    if kind.is_some() && !kind_is_textish {
         return None;
     }
-    if !method_has_text_hint && !is_textish_delta_kind(kind) {
+    if !method_has_text_hint && !kind_is_textish {
         return None;
     }
 
+    let nested_text_hint = method_has_text_hint || kind_is_textish;
     if let Some(text) = delta.get("text").and_then(non_empty_string) {
         return Some(text);
     }
@@ -913,7 +903,7 @@ fn extract_codex_delta_text(delta: &Value, method_has_text_hint: bool) -> Option
     }
     if let Some(text) = delta
         .get("delta")
-        .and_then(|inner| extract_codex_delta_text(inner, method_has_text_hint))
+        .and_then(|inner| extract_codex_delta_text(inner, nested_text_hint))
     {
         return Some(text);
     }
@@ -1044,6 +1034,23 @@ fn approval_policy_payload(policy: &ExecutionPolicy) -> Value {
         "cwd": policy.cwd.display().to_string(),
         "allowed_paths": policy.allowed_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
     })
+}
+
+fn turn_input_items(input: &TurnInput) -> Vec<Value> {
+    let mut input_items = vec![json!({
+        "type": "text",
+        "text": input.user_message_text(),
+        "text_elements": [],
+    })];
+    for attachment in &input.attachments {
+        if matches!(attachment.mime_type.as_deref(), Some(mime) if mime.starts_with("image/")) {
+            input_items.push(json!({
+                "type": "localImage",
+                "path": attachment.path.display().to_string(),
+            }));
+        }
+    }
+    input_items
 }
 
 fn turn_start_params(thread_id: &str, input_items: Vec<Value>, policy: &ExecutionPolicy) -> Value {
@@ -1426,6 +1433,12 @@ mod tests {
         });
 
         assert_eq!(extract_codex_text_delta("item.delta", &params), None);
+
+        let string_delta = json!({
+            "delta": "PWD:\nE:\\Switchyard\nROOT:\n..."
+        });
+
+        assert_eq!(extract_codex_text_delta("item.delta", &string_delta), None);
     }
 
     #[test]
@@ -1583,6 +1596,42 @@ mod tests {
                 Some(false)
             );
         }
+    }
+
+    #[test]
+    fn turn_input_items_keep_image_structured_without_prompt_boilerplate() {
+        let image_path = PathBuf::from(
+            r"C:\Users\demo\.switchyard\clipboard_attachments\20260523T164228233Z_image.png",
+        );
+        let input = TurnInput::text("图片输入测试").with_attachments(vec![
+            switchyard_provider_api::InputAttachment {
+                path: image_path.clone(),
+                mime_type: Some("image/png".to_string()),
+            },
+        ]);
+
+        let items = turn_input_items(&input);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].get("type").and_then(|v| v.as_str()), Some("text"));
+        assert_eq!(
+            items[0].get("text").and_then(|v| v.as_str()),
+            Some("图片输入测试")
+        );
+        let text = items[0].get("text").and_then(|v| v.as_str()).unwrap();
+        assert!(!text.contains("[Switchyard Attachments]"));
+        assert!(!text.contains("clipboard_attachments"));
+        assert!(!text.contains("20260523T164228233Z_image.png"));
+
+        assert_eq!(
+            items[1].get("type").and_then(|v| v.as_str()),
+            Some("localImage")
+        );
+        let expected_path = image_path.display().to_string();
+        assert_eq!(
+            items[1].get("path").and_then(|v| v.as_str()),
+            Some(expected_path.as_str())
+        );
     }
 
     #[test]

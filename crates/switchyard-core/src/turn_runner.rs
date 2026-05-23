@@ -719,29 +719,56 @@ fn clean_system_status_lines(text: &str) -> String {
     lines.join("\n")
 }
 
-fn payload_item_type(payload: &serde_json::Value) -> Option<&str> {
-    payload
-        .get("item_type")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            payload
-                .get("item")
-                .and_then(|item| item.get("type"))
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| {
-            payload
-                .get("params")
-                .and_then(|params| params.get("item_type"))
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| {
-            payload
-                .get("params")
-                .and_then(|params| params.get("item"))
-                .and_then(|item| item.get("type"))
-                .and_then(|value| value.as_str())
-        })
+fn normalize_activity_kind(value: &str) -> String {
+    value
+        .trim()
+        .replace(
+            |c: char| c == '.' || c == '/' || c == '-' || c.is_whitespace(),
+            "_",
+        )
+        .to_ascii_lowercase()
+}
+
+fn normalize_runtime_kind(value: &str) -> String {
+    value
+        .trim()
+        .replace(
+            |c: char| c == '/' || c == '_' || c == '-' || c.is_whitespace(),
+            ".",
+        )
+        .to_ascii_lowercase()
+}
+
+fn item_type_from_loose_value(value: Option<&serde_json::Value>) -> Option<String> {
+    let raw = value?.as_str()?.trim();
+    if raw.is_empty() || raw.contains('.') || raw.contains('/') {
+        return None;
+    }
+    let normalized = normalize_activity_kind(raw);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn payload_item_type(payload: &serde_json::Value) -> Option<String> {
+    [
+        payload.get("item_type"),
+        payload.get("item").and_then(|item| item.get("type")),
+        payload
+            .get("params")
+            .and_then(|params| params.get("item_type")),
+        payload
+            .get("params")
+            .and_then(|params| params.get("item"))
+            .and_then(|item| item.get("type")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(normalize_activity_kind)
+    .find(|item_type| !item_type.is_empty())
+    .or_else(|| item_type_from_loose_value(payload.get("type")))
+    .or_else(|| {
+        item_type_from_loose_value(payload.get("params").and_then(|params| params.get("type")))
+    })
 }
 
 fn is_non_assistant_activity_item(item_type: &str) -> bool {
@@ -767,6 +794,15 @@ fn is_non_assistant_activity_item(item_type: &str) -> bool {
             | "approval_decision"
             | "server_request"
             | "terminal_output"
+            | "terminal_output_delta"
+            | "tool_output_delta"
+            | "command_output_delta"
+            | "shell_output_delta"
+            | "stdout_delta"
+            | "stderr_delta"
+            | "file_change_delta"
+            | "diff_delta"
+            | "patch_delta"
             | "execution_telemetry"
             | "reasoning"
     )
@@ -803,11 +839,81 @@ fn content_text(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn delta_text(value: &serde_json::Value) -> Option<String> {
-    non_empty_payload_str(value)
-        .or_else(|| value.get("text").and_then(non_empty_payload_str))
+fn runtime_protocol_kind(payload: &serde_json::Value) -> String {
+    [
+        payload.get("method"),
+        payload
+            .get("params")
+            .and_then(|params| params.get("method")),
+        payload.get("type"),
+        payload.get("params").and_then(|params| params.get("type")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(normalize_runtime_kind)
+    .find(|kind| !kind.is_empty())
+    .unwrap_or_default()
+}
+
+fn protocol_has_text_hint(payload: &serde_json::Value) -> bool {
+    let normalized = runtime_protocol_kind(payload);
+    normalized.contains("agentmessage")
+        || normalized.contains("agent.message")
+        || normalized.contains("assistant")
+        || normalized.contains("message.delta")
+        || normalized.contains("content.delta")
+        || normalized.contains("text.delta")
+        || normalized.contains("output.text")
+}
+
+fn allows_plain_text_field(
+    item_type: Option<&str>,
+    text_protocol_hint: bool,
+    has_protocol_kind: bool,
+) -> bool {
+    text_protocol_hint
+        || !has_protocol_kind
+        || matches!(item_type, Some("agent_message" | "assistant" | "message"))
+}
+
+fn is_textish_delta_kind(kind: &str) -> bool {
+    let normalized = normalize_runtime_kind(kind);
+    normalized.contains("agent.message")
+        || normalized.contains("assistant")
+        || normalized.contains("message.delta")
+        || normalized.contains("content.block.delta")
+        || normalized.contains("text.delta")
+        || normalized == "text"
+        || normalized == "output.text"
+        || normalized.contains("output.text.delta")
+        || normalized == "agent.message.delta"
+}
+
+fn delta_text(value: &serde_json::Value, inherited_text_hint: bool) -> Option<String> {
+    if let Some(text) = non_empty_payload_str(value) {
+        return inherited_text_hint.then_some(text);
+    }
+
+    let kind = value.get("type").and_then(|value| value.as_str());
+    let kind_is_textish = kind.map(is_textish_delta_kind).unwrap_or(false);
+    if kind.is_some() && !kind_is_textish {
+        return None;
+    }
+    if !inherited_text_hint && !kind_is_textish {
+        return None;
+    }
+
+    let nested_text_hint = inherited_text_hint || kind_is_textish;
+    value
+        .get("text")
+        .and_then(non_empty_payload_str)
         .or_else(|| value.get("content").and_then(content_text))
-        .or_else(|| value.get("delta").and_then(delta_text))
+        .or_else(|| {
+            value
+                .get("delta")
+                .and_then(|delta| delta_text(delta, nested_text_hint))
+        })
         .or_else(|| {
             value
                 .get("message")
@@ -820,17 +926,34 @@ fn update_accumulated_response(
     accumulated: &mut String,
     pe: &switchyard_provider_api::ProviderEvent,
 ) {
-    let payload = &pe.payload;
+    update_accumulated_response_with_hint(accumulated, pe, false);
+}
 
-    if let Some(item_type) = payload_item_type(payload)
+fn update_accumulated_response_with_hint(
+    accumulated: &mut String,
+    pe: &switchyard_provider_api::ProviderEvent,
+    inherited_text_hint: bool,
+) {
+    let payload = &pe.payload;
+    let item_type = payload_item_type(payload);
+
+    if let Some(item_type) = item_type.as_deref()
         && is_non_assistant_activity_item(item_type)
     {
         return;
     }
 
+    let protocol_kind = runtime_protocol_kind(payload);
+    let text_protocol_hint = inherited_text_hint || protocol_has_text_hint(payload);
+    let plain_text_allowed = allows_plain_text_field(
+        item_type.as_deref(),
+        text_protocol_hint,
+        !protocol_kind.is_empty(),
+    );
+
     // 1. Check if it's a text message (plain text)
     if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
-        if !is_system_status_line(t) {
+        if plain_text_allowed && !is_system_status_line(t) {
             accumulated.push_str(t);
         }
         return;
@@ -838,7 +961,7 @@ fn update_accumulated_response(
 
     // 2. Check for delta updates (Codex/Claude delta)
     if let Some(delta) = payload.get("delta") {
-        if let Some(t) = delta_text(delta) {
+        if let Some(t) = delta_text(delta, text_protocol_hint) {
             accumulated.push_str(&t);
             return;
         }
@@ -852,14 +975,14 @@ fn update_accumulated_response(
             pe.provider.clone(),
             params.clone(),
         );
-        update_accumulated_response(accumulated, &nested);
+        update_accumulated_response_with_hint(accumulated, &nested, text_protocol_hint);
         if *accumulated != before {
             return;
         }
     }
 
     // 3. Check for Gemini content
-    if let Some(t) = payload.get("content").and_then(content_text) {
+    if plain_text_allowed && let Some(t) = payload.get("content").and_then(content_text) {
         let is_delta = payload
             .get("delta")
             .and_then(|v| v.as_bool())
@@ -977,6 +1100,72 @@ mod tests {
         );
 
         update_accumulated_response(&mut text, &tool_result);
+
+        assert_eq!(text, "assistant body");
+    }
+
+    #[test]
+    fn update_accumulated_response_ignores_non_text_delta_output() {
+        let turn_id = Uuid::now_v7();
+        let mut text = String::from("assistant body");
+        let terminal_delta = switchyard_provider_api::ProviderEvent::new(
+            turn_id,
+            switchyard_provider_api::EventType::ItemUpdated,
+            "codex",
+            serde_json::json!({
+                "type": "item.delta",
+                "delta": {
+                    "type": "terminal_output_delta",
+                    "text": "PWD:\nE:\\Switchyard\nROOT:\n..."
+                }
+            }),
+        );
+        update_accumulated_response(&mut text, &terminal_delta);
+
+        let untyped_item_delta = switchyard_provider_api::ProviderEvent::new(
+            turn_id,
+            switchyard_provider_api::EventType::ItemUpdated,
+            "codex",
+            serde_json::json!({
+                "type": "item.delta",
+                "delta": "large tool stdout should not become assistant text"
+            }),
+        );
+        update_accumulated_response(&mut text, &untyped_item_delta);
+
+        let direct_terminal_delta = switchyard_provider_api::ProviderEvent::new(
+            turn_id,
+            switchyard_provider_api::EventType::ItemUpdated,
+            "codex",
+            serde_json::json!({
+                "type": "terminal_output_delta",
+                "text": "CODEX (CORE)\n\nPWD:\nE:\\Switchyard\nROOT:\n..."
+            }),
+        );
+        update_accumulated_response(&mut text, &direct_terminal_delta);
+
+        assert_eq!(text, "assistant body");
+    }
+
+    #[test]
+    fn update_accumulated_response_ignores_file_edit_payloads() {
+        let turn_id = Uuid::now_v7();
+        let mut text = String::from("assistant body");
+        let file_change = switchyard_provider_api::ProviderEvent::new(
+            turn_id,
+            switchyard_provider_api::EventType::ItemUpdated,
+            "codex",
+            serde_json::json!({
+                "type": "item.updated",
+                "item": {
+                    "type": "file_change",
+                    "path": "src/main.rs",
+                    "diff": "--- a/src/main.rs\n+++ b/src/main.rs\n@@\n-old\n+new"
+                }
+            }),
+        );
+
+        update_accumulated_response(&mut text, &file_change);
 
         assert_eq!(text, "assistant body");
     }
