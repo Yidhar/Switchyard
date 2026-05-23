@@ -896,6 +896,11 @@ fn extract_codex_delta_text(delta: &Value, method_has_text_hint: bool) -> Option
     }
 
     let kind = delta.get("type").and_then(|value| value.as_str());
+    if let Some(kind) = kind
+        && !is_textish_delta_kind(Some(kind))
+    {
+        return None;
+    }
     if !method_has_text_hint && !is_textish_delta_kind(kind) {
         return None;
     }
@@ -1421,6 +1426,18 @@ mod tests {
         });
 
         assert_eq!(extract_codex_text_delta("item.delta", &params), None);
+    }
+
+    #[test]
+    fn non_text_delta_is_not_extracted_with_content_method_hint() {
+        let params = json!({
+            "delta": { "type": "tool_output_delta", "text": "stdout" }
+        });
+
+        assert_eq!(
+            extract_codex_text_delta("response/content/delta", &params),
+            None
+        );
     }
 
     #[test]

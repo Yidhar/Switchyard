@@ -215,8 +215,23 @@ fn extract_content_text(value: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_delta_text(value: &serde_json::Value) -> Option<String> {
-    non_empty_json_str(value)
-        .or_else(|| value.get("text").and_then(non_empty_json_str))
+    if let Some(text) = non_empty_json_str(value) {
+        return Some(text);
+    }
+
+    // Delta objects can carry non-assistant streams too (tool stdout, command
+    // output, etc.). Only object-shaped deltas with an explicit text-ish kind
+    // should be promoted into chat text; activity/tool renderers handle the
+    // rest from the original payload.
+    if let Some(kind) = value.get("type").and_then(|value| value.as_str())
+        && !is_textish_delta_kind(kind)
+    {
+        return None;
+    }
+
+    value
+        .get("text")
+        .and_then(non_empty_json_str)
         .or_else(|| value.get("content").and_then(extract_content_text))
         .or_else(|| value.get("delta").and_then(extract_delta_text))
         .or_else(|| {
@@ -225,6 +240,89 @@ fn extract_delta_text(value: &serde_json::Value) -> Option<String> {
                 .and_then(|message| message.get("content"))
                 .and_then(extract_content_text)
         })
+}
+
+fn normalize_runtime_kind(value: &str) -> String {
+    value
+        .trim()
+        .replace(
+            |c: char| c == '/' || c == '_' || c == '-' || c.is_whitespace(),
+            ".",
+        )
+        .to_ascii_lowercase()
+}
+
+fn is_textish_delta_kind(kind: &str) -> bool {
+    let normalized = normalize_runtime_kind(kind);
+    normalized.contains("agent.message")
+        || normalized.contains("assistant")
+        || normalized.contains("message.delta")
+        || normalized.contains("content.block.delta")
+        || normalized.contains("text.delta")
+        || normalized == "text"
+        || normalized == "output.text"
+        || normalized.contains("output.text.delta")
+        || normalized == "agent.message.delta"
+}
+
+fn normalize_item_type_for_display(value: &str) -> String {
+    value
+        .trim()
+        .replace(
+            |c: char| c == '.' || c == '/' || c == '-' || c.is_whitespace(),
+            "_",
+        )
+        .to_ascii_lowercase()
+}
+
+fn payload_item_type_for_display(payload: &serde_json::Value) -> Option<String> {
+    [
+        payload.get("item_type"),
+        payload.get("item").and_then(|item| item.get("type")),
+        payload
+            .get("params")
+            .and_then(|params| params.get("item_type")),
+        payload
+            .get("params")
+            .and_then(|params| params.get("item"))
+            .and_then(|item| item.get("type")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(normalize_item_type_for_display)
+    .find(|item_type| !item_type.is_empty())
+}
+
+fn is_non_assistant_display_item(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "tool_use"
+            | "tool_call"
+            | "function_call"
+            | "custom_tool_call"
+            | "mcp_tool_call"
+            | "local_shell_call"
+            | "tool_result"
+            | "tool_response"
+            | "function_call_output"
+            | "custom_tool_call_output"
+            | "mcp_tool_call_output"
+            | "local_shell_call_output"
+            | "command_execution"
+            | "file_change"
+            | "diff_ready"
+            | "todo_list"
+            | "delegate_request"
+            | "delegate_result"
+            | "approval_request"
+            | "approval_decision"
+            | "server_request"
+            | "terminal_output"
+            | "execution_telemetry"
+            | "reasoning"
+            | "error"
+    )
 }
 
 /// Extract a human-readable display text from a provider event payload.
@@ -237,6 +335,12 @@ fn extract_delta_text(value: &serde_json::Value) -> Option<String> {
 /// 5. `payload["message"]["content"][*]["text"]` — Claude assistant event
 /// 6. `payload["content"]` — Gemini/message content, string or content blocks
 pub fn extract_display_text(payload: &serde_json::Value) -> Option<String> {
+    if let Some(item_type) = payload_item_type_for_display(payload)
+        && is_non_assistant_display_item(&item_type)
+    {
+        return None;
+    }
+
     if let Some(t) = payload.get("text").and_then(non_empty_json_str) {
         return Some(t);
     }
@@ -1126,6 +1230,53 @@ mod tests {
             extract_activity_summary(&tool_payload).as_deref(),
             Some("[命令] 开始执行：cargo check")
         );
+    }
+
+    #[test]
+    fn extract_display_text_ignores_tool_and_command_output_content() {
+        let command_payload = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "git status --short",
+                "status": "completed",
+                "exit_code": 0,
+                "content": "M crates/switchyard-gui/Cargo.toml\n--- stat ---\nwarning: ...",
+                "aggregated_output": "M crates/switchyard-gui/Cargo.toml\n--- stat ---\nwarning: ..."
+            }
+        });
+        assert_eq!(extract_display_text(&command_payload), None);
+        assert_eq!(
+            extract_activity_summary(&command_payload).as_deref(),
+            Some("[命令] 执行完成：git status --short")
+        );
+
+        let shell_output_payload = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "type": "item.completed",
+                "item": {
+                    "type": "local_shell_call_output",
+                    "command": "cargo check",
+                    "content": "Finished dev [unoptimized + debuginfo] target(s)"
+                }
+            }
+        });
+        assert_eq!(extract_display_text(&shell_output_payload), None);
+        assert_eq!(
+            extract_activity_summary(&shell_output_payload).as_deref(),
+            Some("[命令] 本地 Shell 输出已返回：cargo check")
+        );
+    }
+
+    #[test]
+    fn extract_display_text_ignores_non_text_delta_output() {
+        let payload = serde_json::json!({
+            "type": "item.delta",
+            "delta": { "type": "tool_output_delta", "text": "stdout should stay in tool logs" }
+        });
+
+        assert_eq!(extract_display_text(&payload), None);
     }
 
     #[test]

@@ -186,6 +186,38 @@ function runtimeItemType(payload: any): string {
   return normalizeRuntimeEventType(text);
 }
 
+const NON_ASSISTANT_RUNTIME_ITEM_TYPES = new Set([
+  'tool_use',
+  'tool_call',
+  'function_call',
+  'custom_tool_call',
+  'mcp_tool_call',
+  'local_shell_call',
+  'tool_result',
+  'tool_response',
+  'function_call_output',
+  'custom_tool_call_output',
+  'mcp_tool_call_output',
+  'local_shell_call_output',
+  'command_execution',
+  'file_change',
+  'diff_ready',
+  'todo_list',
+  'delegate_request',
+  'delegate_result',
+  'approval_request',
+  'approval_decision',
+  'server_request',
+  'terminal_output',
+  'execution_telemetry',
+  'reasoning',
+  'error',
+]);
+
+function isNonAssistantRuntimeItemType(itemType: string): boolean {
+  return NON_ASSISTANT_RUNTIME_ITEM_TYPES.has(itemType);
+}
+
 function hasMeaningfulRuntimeValue(value: any): boolean {
   if (value === undefined || value === null) return false;
   if (typeof value === 'string') return value.trim().length > 0;
@@ -298,6 +330,7 @@ function isRuntimeTextishDelta(payload: any): boolean {
     deltaKind.includes('text.delta') ||
     deltaKind === 'text' ||
     deltaKind === 'output.text';
+  if (deltaKind && !deltaKindIsTextish) return false;
   return (
     protocol.includes('agentmessage') ||
     protocol.includes('agent.message') ||
@@ -353,6 +386,7 @@ function isAssistantTextRuntimePayload(payload: any): boolean {
   )?.toLowerCase();
   const protocol = runtimeProtocolKind(payload);
 
+  if (isNonAssistantRuntimeItemType(itemType)) return false;
   if (itemType === 'agent_message' || itemType === 'assistant') return true;
   if (itemType === 'message') return role === 'assistant';
   if (protocol.includes('agentmessage') || protocol.includes('agent_message')) return true;
@@ -363,7 +397,12 @@ function isAssistantTextRuntimePayload(payload: any): boolean {
   // renderable item kind), treat it as assistant text. Once an item kind is
   // present, keep tool/result/reasoning payloads out of the chat body and let
   // renderTurnEvents display them in Execution Details instead.
-  if (!itemType && !protocol.startsWith('turn.') && !protocol.startsWith('thread.')) {
+  if (
+    !itemType &&
+    !protocol.startsWith('turn.') &&
+    !protocol.startsWith('thread.') &&
+    !protocol.startsWith('item.')
+  ) {
     return Boolean(runtimePayloadText(payload));
   }
 
