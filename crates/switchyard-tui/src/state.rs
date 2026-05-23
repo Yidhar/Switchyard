@@ -806,6 +806,17 @@ impl RuntimeState {
                     "[hyard/callback] 已向 {provider} 注入 {count} 个后台回执"
                 ));
             }
+            RuntimeEvent::TurnPreparing {
+                provider, phase, ..
+            } => {
+                self.phase = Phase::CoreRunning;
+                self.current_provider = provider.clone();
+                self.current_peer = None;
+                self.peer_execution = None;
+                self.ensure_provider_view(provider);
+                self.push_provider_view_line(provider, format!("[system] 正在准备：{phase}"));
+                self.push_event(format!("[core/{provider}] 准备中：{phase}"));
+            }
             RuntimeEvent::CoreTurnStarted { turn_id, provider } => {
                 self.clear_live_hyard_jobs();
                 self.phase = Phase::CoreRunning;
@@ -1073,6 +1084,7 @@ impl RuntimeState {
                 self.push_event(format!("[hyard] 委托 {peer} -> {status}"));
             }
             RuntimeEvent::HyardJobObserved {
+                turn_id: _,
                 source_provider,
                 observed_at,
                 job,
@@ -1155,6 +1167,13 @@ impl RuntimeState {
                 );
                 self.push_event(format!("[core/{provider}] 失败：{}", truncate(error, 60)));
             }
+            // Worker lifecycle events are GUI-only (drive the Team Workers
+            // panel). TUI ignores them for now — could surface as event-log
+            // lines in a follow-up if useful.
+            RuntimeEvent::WorkerSpawned { .. }
+            | RuntimeEvent::WorkerStateChanged { .. }
+            | RuntimeEvent::WorkerRetrying { .. }
+            | RuntimeEvent::WorkerTerminated { .. } => {}
         }
         self.dirty = true;
     }
@@ -1390,6 +1409,7 @@ mod tests {
         }]);
 
         state.apply(&RuntimeEvent::HyardJobObserved {
+            turn_id: Uuid::now_v7(),
             source_provider: "codex".to_string(),
             observed_at: "2026-04-04T12:05:00Z".to_string(),
             job: HyardJobObservation {
@@ -1639,6 +1659,7 @@ mod tests {
         state.apply(&RuntimeEvent::CoreItemUpdated {
             turn_id: Uuid::now_v7(),
             provider: "claude".to_string(),
+            event_type: "item_updated".to_string(),
             text: "hello world".to_string(),
             payload: None,
         });
@@ -1736,6 +1757,7 @@ mod tests {
     fn peer_runtime_hints_do_not_overwrite_authoritative_live_job() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::HyardJobObserved {
+            turn_id: Uuid::now_v7(),
             source_provider: "codex".to_string(),
             observed_at: "2026-04-04T12:05:00Z".to_string(),
             job: HyardJobObservation {
@@ -1756,6 +1778,7 @@ mod tests {
         state.apply(&RuntimeEvent::PeerItemUpdated {
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
+            event_type: "item_updated".to_string(),
             text: "inferred text".to_string(),
             payload: None,
         });
@@ -1799,6 +1822,7 @@ mod tests {
         state.apply(&RuntimeEvent::PeerItemUpdated {
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
+            event_type: "item_updated".to_string(),
             text: "peer output".to_string(),
             payload: None,
         });
@@ -1952,6 +1976,7 @@ mod tests {
         state.apply(&RuntimeEvent::CoreItemUpdated {
             turn_id: core_turn,
             provider: "claude".to_string(),
+            event_type: "item_updated".to_string(),
             text: "thinking...".to_string(),
             payload: None,
         });
@@ -1993,6 +2018,7 @@ mod tests {
         state.apply(&RuntimeEvent::PeerItemUpdated {
             turn_id: peer_turn,
             provider: "gemini".to_string(),
+            event_type: "item_updated".to_string(),
             text: "looks good".to_string(),
             payload: None,
         });

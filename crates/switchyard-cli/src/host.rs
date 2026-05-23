@@ -24,7 +24,8 @@ use chrono::Utc;
 use switchyard_config::SwitchyardConfig;
 use switchyard_core::{
     ProviderRegistry, RuntimeEvent, TurnPhase, build_peer_catalog_probed,
-    run_routed_turn_with_archive, run_turn_phased,
+    execution_policy_from_config, run_routed_turn_with_archive_and_policy,
+    run_turn_phased_with_policy,
 };
 #[cfg(test)]
 use switchyard_host_jobs::refresh_orphaned_job_state_with;
@@ -874,9 +875,14 @@ async fn execute_host_follow_cycle(
         ));
     }
 
-    let resume = execute_host_resume_for_session(registry, config, session_id, None, true, cwd)
-        .await?;
-    Ok(follow_resumed_json(session_id, timeout_secs, &watch, &resume))
+    let resume =
+        execute_host_resume_for_session(registry, config, session_id, None, true, cwd).await?;
+    Ok(follow_resumed_json(
+        session_id,
+        timeout_secs,
+        &watch,
+        &resume,
+    ))
 }
 
 fn follow_wait_timeout_json(
@@ -1055,7 +1061,8 @@ async fn execute_host_resume_for_session(
 
     let peer_catalog = build_peer_catalog_probed(&provider_name, registry, &config.providers).await;
     let artifact_dir = config.artifact_dir(cwd);
-    let output = run_routed_turn_with_archive(
+    let policy = execution_policy_from_config(config, cwd);
+    let output = run_routed_turn_with_archive_and_policy(
         &mut store,
         &mut session,
         provider_impl.as_ref(),
@@ -1065,6 +1072,7 @@ async fn execute_host_resume_for_session(
         user_message.clone(),
         cwd.to_path_buf(),
         Some(&artifact_dir),
+        policy,
     )
     .await
     .map_err(|err| {
@@ -1908,11 +1916,9 @@ fn spawn_worker_process(
                                 false,
                             ) {
                                 Ok(child) => Ok(child),
-                                Err(fallback_err) => {
-                                    Err(format!(
-                                        "spawn host worker with explicit handle list: {primary_err}; without breakaway: {fallback_handle_list_err}; direct spawn fallback: {fallback_primary_err}; secondary fallback failed: {fallback_err}"
-                                    ))
-                                }
+                                Err(fallback_err) => Err(format!(
+                                    "spawn host worker with explicit handle list: {primary_err}; without breakaway: {fallback_handle_list_err}; direct spawn fallback: {fallback_primary_err}; secondary fallback failed: {fallback_err}"
+                                )),
                             }
                         }
                     }
@@ -2750,7 +2756,8 @@ async fn run_host_job(
         }
     });
 
-    let run_result = run_turn_phased(
+    let policy = execution_policy_from_config(&prepared.config, &prepared.cwd);
+    let run_result = run_turn_phased_with_policy(
         &mut store,
         &mut session,
         prepared.provider_impl.as_ref(),
@@ -2760,6 +2767,7 @@ async fn run_host_job(
         Some(&runtime_tx),
         TurnPhase::Normal,
         cancel.clone(),
+        policy,
     )
     .await;
 
@@ -2844,6 +2852,12 @@ async fn run_host_job(
 
 fn apply_runtime_event(job: &mut HostJobState, event: &RuntimeEvent) {
     match event {
+        RuntimeEvent::TurnPreparing {
+            provider, phase, ..
+        } => {
+            job.status = HostJobStatus::Running;
+            job.last_event = Some(format!("turn_preparing:{provider}:{phase}"));
+        }
         RuntimeEvent::CoreTurnStarted { turn_id, provider } => {
             job.status = HostJobStatus::Running;
             job.turn_id = Some(*turn_id);
@@ -2914,7 +2928,11 @@ fn apply_runtime_event(job: &mut HostJobState, event: &RuntimeEvent) {
         | RuntimeEvent::PeerTerminalOutput { .. }
         | RuntimeEvent::DelegateCompleted { .. }
         | RuntimeEvent::PeerOutputCompleted { .. }
-        | RuntimeEvent::FinalizationStarted { .. } => {}
+        | RuntimeEvent::FinalizationStarted { .. }
+        | RuntimeEvent::WorkerSpawned { .. }
+        | RuntimeEvent::WorkerStateChanged { .. }
+        | RuntimeEvent::WorkerRetrying { .. }
+        | RuntimeEvent::WorkerTerminated { .. } => {}
     }
 }
 
@@ -2960,7 +2978,9 @@ mod tests {
         fn save_inbox_entry(&mut self, entry: &InboxEntry) -> Result<(), StoreError> {
             self.save_calls += 1;
             if self.fail_on_save_number == Some(self.save_calls) {
-                return Err(StoreError::Io(std::io::Error::other("injected save failure")));
+                return Err(StoreError::Io(std::io::Error::other(
+                    "injected save failure",
+                )));
             }
 
             if let Some(existing) = self
@@ -3259,6 +3279,7 @@ I have analyzed the current command surface.\n\
             &RuntimeEvent::CoreItemUpdated {
                 turn_id,
                 provider: "claude".to_string(),
+                event_type: "item_updated".to_string(),
                 text: "[执行] 命令已解析：claude -> claude.exe".to_string(),
                 payload: None,
             },

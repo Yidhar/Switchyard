@@ -3,6 +3,7 @@ use std::{path::PathBuf, process};
 use clap::Parser;
 use switchyard_config::SwitchyardConfig;
 use switchyard_core::ProviderRegistry;
+use switchyard_provider_antigravity::AntigravityProvider;
 use switchyard_provider_api::Provider;
 use switchyard_provider_claude::ClaudeProvider;
 use switchyard_provider_codex::CodexProvider;
@@ -41,6 +42,8 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                 "codex"
             } else if name.contains("claude") {
                 "claude"
+            } else if name.contains("antigravity") || name.contains("agy") {
+                "antigravity"
             } else if name.contains("gemini") {
                 "gemini"
             } else {
@@ -54,7 +57,12 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                     Box::new(|cfg| {
                         let p: Box<dyn Provider> = match cfg {
                             Some(c) => Box::new(CodexProvider::from_config(c)),
-                            None => Box::new(CodexProvider::new("codex", vec![], std::collections::HashMap::new(), 900)),
+                            None => Box::new(CodexProvider::new(
+                                "codex",
+                                vec![],
+                                std::collections::HashMap::new(),
+                                900,
+                            )),
                         };
                         p
                     }),
@@ -66,7 +74,12 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                     Box::new(|cfg| {
                         let p: Box<dyn Provider> = match cfg {
                             Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                            None => Box::new(ClaudeProvider::new("claude", vec![], std::collections::HashMap::new(), 900)),
+                            None => Box::new(ClaudeProvider::new(
+                                "claude",
+                                vec![],
+                                std::collections::HashMap::new(),
+                                900,
+                            )),
                         };
                         p
                     }),
@@ -78,7 +91,29 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                     Box::new(|cfg| {
                         let p: Box<dyn Provider> = match cfg {
                             Some(c) => Box::new(GeminiProvider::from_config(c)),
-                            None => Box::new(GeminiProvider::new("gemini", vec![], std::collections::HashMap::new(), 900)),
+                            None => Box::new(GeminiProvider::new(
+                                "gemini",
+                                vec![],
+                                std::collections::HashMap::new(),
+                                900,
+                            )),
+                        };
+                        p
+                    }),
+                );
+            }
+            "antigravity" => {
+                registry.register(
+                    name.clone(),
+                    Box::new(|cfg| {
+                        let p: Box<dyn Provider> = match cfg {
+                            Some(c) => Box::new(AntigravityProvider::from_config(c)),
+                            None => Box::new(AntigravityProvider::new(
+                                "agy",
+                                vec![],
+                                std::collections::HashMap::new(),
+                                900,
+                            )),
                         };
                         p
                     }),
@@ -95,7 +130,12 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
             Box::new(|cfg| {
                 let p: Box<dyn Provider> = match cfg {
                     Some(c) => Box::new(CodexProvider::from_config(c)),
-                    None => Box::new(CodexProvider::new("codex", vec![], std::collections::HashMap::new(), 900)),
+                    None => Box::new(CodexProvider::new(
+                        "codex",
+                        vec![],
+                        std::collections::HashMap::new(),
+                        900,
+                    )),
                 };
                 p
             }),
@@ -107,7 +147,12 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
             Box::new(|cfg| {
                 let p: Box<dyn Provider> = match cfg {
                     Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                    None => Box::new(ClaudeProvider::new("claude", vec![], std::collections::HashMap::new(), 900)),
+                    None => Box::new(ClaudeProvider::new(
+                        "claude",
+                        vec![],
+                        std::collections::HashMap::new(),
+                        900,
+                    )),
                 };
                 p
             }),
@@ -119,7 +164,29 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
             Box::new(|cfg| {
                 let p: Box<dyn Provider> = match cfg {
                     Some(c) => Box::new(GeminiProvider::from_config(c)),
-                    None => Box::new(GeminiProvider::new("gemini", vec![], std::collections::HashMap::new(), 900)),
+                    None => Box::new(GeminiProvider::new(
+                        "gemini",
+                        vec![],
+                        std::collections::HashMap::new(),
+                        900,
+                    )),
+                };
+                p
+            }),
+        );
+    }
+    if !registry.has("antigravity") {
+        registry.register(
+            "antigravity",
+            Box::new(|cfg| {
+                let p: Box<dyn Provider> = match cfg {
+                    Some(c) => Box::new(AntigravityProvider::from_config(c)),
+                    None => Box::new(AntigravityProvider::new(
+                        "agy",
+                        vec![],
+                        std::collections::HashMap::new(),
+                        900,
+                    )),
                 };
                 p
             }),
