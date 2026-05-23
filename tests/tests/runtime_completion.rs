@@ -46,6 +46,10 @@ fn event_name(e: &RuntimeEvent) -> &'static str {
         RuntimeEvent::FinalizationStarted { .. } => "FinalizationStarted",
         RuntimeEvent::TurnCompleted { .. } => "TurnCompleted",
         RuntimeEvent::TurnFailed { .. } => "TurnFailed",
+        RuntimeEvent::WorkerSpawned { .. } => "WorkerSpawned",
+        RuntimeEvent::WorkerStateChanged { .. } => "WorkerStateChanged",
+        RuntimeEvent::WorkerRetrying { .. } => "WorkerRetrying",
+        RuntimeEvent::WorkerTerminated { .. } => "WorkerTerminated",
     }
 }
 

@@ -835,6 +835,10 @@ async fn full_delegation_event_order() {
             RuntimeEvent::FinalizationStarted { .. } => "FinalizationStarted",
             RuntimeEvent::TurnCompleted { .. } => "TurnCompleted",
             RuntimeEvent::TurnFailed { .. } => "TurnFailed",
+            RuntimeEvent::WorkerSpawned { .. } => "WorkerSpawned",
+            RuntimeEvent::WorkerStateChanged { .. } => "WorkerStateChanged",
+            RuntimeEvent::WorkerRetrying { .. } => "WorkerRetrying",
+            RuntimeEvent::WorkerTerminated { .. } => "WorkerTerminated",
         })
         .collect();
 

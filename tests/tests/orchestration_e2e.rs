@@ -411,8 +411,8 @@ async fn routed_turn_injects_hyard_continuation_hint_into_finalization_prompt() 
 
 #[tokio::test]
 async fn delegate_using_live_instance_registry() {
-    use switchyard_provider_api::{LiveInstance, ContextBundle, ProviderEvent};
     use switchyard_core::instance::InstancePool;
+    use switchyard_provider_api::{ContextBundle, LiveInstance, ProviderEvent};
 
     struct MockLiveInstance {
         events: Vec<ProviderEvent>,
@@ -421,7 +421,10 @@ async fn delegate_using_live_instance_registry() {
 
     #[async_trait::async_trait]
     impl LiveInstance for MockLiveInstance {
-        async fn send_message(&mut self, _text: &str) -> Result<mpsc::Receiver<ProviderEvent>, ProviderError> {
+        async fn send_message(
+            &mut self,
+            _text: &str,
+        ) -> Result<mpsc::Receiver<ProviderEvent>, ProviderError> {
             let (tx, rx) = mpsc::channel(10);
             for evt in self.events.drain(..) {
                 tx.send(evt).await.ok();
@@ -452,19 +455,31 @@ async fn delegate_using_live_instance_registry() {
         host_surface: None,
     });
 
-    // Create registry and register a live instance
-    let registry = InstancePool::new();
+    // Create registry and register a live instance bound to this session.
+    use switchyard_provider_api::{
+        InstanceKind, InstanceMetadata, InstanceState, LiveInstanceRegistry,
+    };
+    let registry: Arc<dyn LiveInstanceRegistry> = Arc::new(InstancePool::new());
     let context_calls = Arc::new(Mutex::new(Vec::new()));
     let peer_turn_id = Uuid::now_v7();
     let live_instance = MockLiveInstance {
         events: vec![
             ProviderEvent::turn_started(peer_turn_id, "reviewer"),
-            ProviderEvent::text_message(peer_turn_id, "reviewer", "Code looks beautiful and correct!"),
+            ProviderEvent::text_message(
+                peer_turn_id,
+                "reviewer",
+                "Code looks beautiful and correct!",
+            ),
             ProviderEvent::turn_completed(peer_turn_id, "reviewer"),
         ],
         context_calls: context_calls.clone(),
     };
-    registry.register("reviewer", Box::new(live_instance));
+    let mut metadata =
+        InstanceMetadata::new("reviewer", session.session_id, None, InstanceKind::Worker);
+    metadata.state = InstanceState::Idle;
+    registry
+        .register(metadata, Box::new(live_instance))
+        .unwrap();
 
     let output = run_routed_turn(
         &mut store,
@@ -472,7 +487,7 @@ async fn delegate_using_live_instance_registry() {
         &core_provider,
         &catalog,
         &|_| None, // Resolve peer returns None because we want to use the live registry!
-        Some(&registry),
+        Some(registry.clone()),
         "review the auth module".to_string(),
         PathBuf::from("."),
     )
@@ -484,13 +499,16 @@ async fn delegate_using_live_instance_registry() {
 
     // Verify context was updated in the live instance
     let calls = context_calls.lock().await;
-    assert!(!calls.is_empty(), "Live instance context should have been updated");
+    assert!(
+        !calls.is_empty(),
+        "Live instance context should have been updated"
+    );
 }
 
 #[tokio::test]
 async fn delegate_concurrent_execution_using_pooled_instances() {
-    use switchyard_provider_api::{LiveInstance, ContextBundle, ProviderEvent};
     use switchyard_core::instance::InstancePool;
+    use switchyard_provider_api::{ContextBundle, LiveInstance, ProviderEvent};
 
     struct SlowMockLiveInstance {
         events: Vec<ProviderEvent>,
@@ -499,7 +517,10 @@ async fn delegate_concurrent_execution_using_pooled_instances() {
 
     #[async_trait::async_trait]
     impl LiveInstance for SlowMockLiveInstance {
-        async fn send_message(&mut self, text: &str) -> Result<mpsc::Receiver<ProviderEvent>, ProviderError> {
+        async fn send_message(
+            &mut self,
+            text: &str,
+        ) -> Result<mpsc::Receiver<ProviderEvent>, ProviderError> {
             eprintln!("SlowMockLiveInstance send_message: {}", text);
             let (tx, rx) = mpsc::channel(10);
             let evts = self.events.drain(..).collect::<Vec<_>>();
@@ -532,7 +553,10 @@ async fn delegate_concurrent_execution_using_pooled_instances() {
     #[async_trait::async_trait]
     impl Provider for MultiDelegatingProvider {
         async fn probe(&self) -> Result<ProbeResult, ProviderError> {
-            Ok(ProbeResult { available: true, ..Default::default() })
+            Ok(ProbeResult {
+                available: true,
+                ..Default::default()
+            })
         }
         async fn start_turn(
             &self,
@@ -543,8 +567,14 @@ async fn delegate_concurrent_execution_using_pooled_instances() {
             event_tx: mpsc::Sender<ProviderEvent>,
             _cancel: switchyard_provider_api::CancellationToken,
         ) -> Result<(), ProviderError> {
-            eprintln!("MultiDelegatingProvider user_message: {}", input.user_message);
-            event_tx.send(ProviderEvent::turn_started(turn_id, "delegator")).await.ok();
+            eprintln!(
+                "MultiDelegatingProvider user_message: {}",
+                input.user_message
+            );
+            event_tx
+                .send(ProviderEvent::turn_started(turn_id, "delegator"))
+                .await
+                .ok();
             let response = if input.user_message.contains("delegate_result") {
                 "Final answer."
             } else {
@@ -558,14 +588,39 @@ async fn delegate_concurrent_execution_using_pooled_instances() {
                  }\n\
                  <<<SWITCHYARD_JSON_END>>>"
             };
-            self.results.lock().await.insert(turn_id, response.to_string());
-            event_tx.send(ProviderEvent::text_message(turn_id, "delegator", response)).await.ok();
-            event_tx.send(ProviderEvent::turn_completed(turn_id, "delegator")).await.ok();
+            self.results
+                .lock()
+                .await
+                .insert(turn_id, response.to_string());
+            event_tx
+                .send(ProviderEvent::text_message(turn_id, "delegator", response))
+                .await
+                .ok();
+            event_tx
+                .send(ProviderEvent::turn_completed(turn_id, "delegator"))
+                .await
+                .ok();
             Ok(())
         }
-        async fn finalize_turn(&self, turn_id: Uuid) -> Result<(TurnResult, ArtifactBundle), ProviderError> {
-            let resp = self.results.lock().await.remove(&turn_id).unwrap_or_else(|| "Final answer.".to_string());
-            Ok((TurnResult { response_text: resp, exit_code: Some(0), stderr: None, metadata: HashMap::new() }, ArtifactBundle { artifacts: vec![] }))
+        async fn finalize_turn(
+            &self,
+            turn_id: Uuid,
+        ) -> Result<(TurnResult, ArtifactBundle), ProviderError> {
+            let resp = self
+                .results
+                .lock()
+                .await
+                .remove(&turn_id)
+                .unwrap_or_else(|| "Final answer.".to_string());
+            Ok((
+                TurnResult {
+                    response_text: resp,
+                    exit_code: Some(0),
+                    stderr: None,
+                    metadata: HashMap::new(),
+                },
+                ArtifactBundle { artifacts: vec![] },
+            ))
         }
     }
 
@@ -579,26 +634,43 @@ async fn delegate_concurrent_execution_using_pooled_instances() {
         host_surface: None,
     });
 
-    let registry = InstancePool::new();
+    use switchyard_provider_api::{
+        InstanceKind, InstanceMetadata, InstanceState, LiveInstanceRegistry,
+    };
+    let registry: Arc<dyn LiveInstanceRegistry> = Arc::new(InstancePool::new());
     let turn1 = Uuid::now_v7();
     let turn2 = Uuid::now_v7();
 
-    registry.register("worker", Box::new(SlowMockLiveInstance {
-        events: vec![
-            ProviderEvent::turn_started(turn1, "worker"),
-            ProviderEvent::text_message(turn1, "worker", "result 1"),
-            ProviderEvent::turn_completed(turn1, "worker"),
-        ],
-        sleep_ms: 400,
-    }));
-    registry.register("worker", Box::new(SlowMockLiveInstance {
-        events: vec![
-            ProviderEvent::turn_started(turn2, "worker"),
-            ProviderEvent::text_message(turn2, "worker", "result 2"),
-            ProviderEvent::turn_completed(turn2, "worker"),
-        ],
-        sleep_ms: 400,
-    }));
+    let mut meta1 = InstanceMetadata::new("worker", session.session_id, None, InstanceKind::Worker);
+    meta1.state = InstanceState::Idle;
+    registry
+        .register(
+            meta1,
+            Box::new(SlowMockLiveInstance {
+                events: vec![
+                    ProviderEvent::turn_started(turn1, "worker"),
+                    ProviderEvent::text_message(turn1, "worker", "result 1"),
+                    ProviderEvent::turn_completed(turn1, "worker"),
+                ],
+                sleep_ms: 400,
+            }),
+        )
+        .unwrap();
+    let mut meta2 = InstanceMetadata::new("worker", session.session_id, None, InstanceKind::Worker);
+    meta2.state = InstanceState::Idle;
+    registry
+        .register(
+            meta2,
+            Box::new(SlowMockLiveInstance {
+                events: vec![
+                    ProviderEvent::turn_started(turn2, "worker"),
+                    ProviderEvent::text_message(turn2, "worker", "result 2"),
+                    ProviderEvent::turn_completed(turn2, "worker"),
+                ],
+                sleep_ms: 400,
+            }),
+        )
+        .unwrap();
 
     let start = std::time::Instant::now();
     let multi_provider = MultiDelegatingProvider {
@@ -610,7 +682,7 @@ async fn delegate_concurrent_execution_using_pooled_instances() {
         &multi_provider,
         &catalog,
         &|_| None,
-        Some(&registry),
+        Some(registry.clone()),
         "start delegation".to_string(),
         PathBuf::from("."),
     )
@@ -619,6 +691,9 @@ async fn delegate_concurrent_execution_using_pooled_instances() {
 
     let duration = start.elapsed();
     assert!(output.delegated);
-    assert!(duration.as_millis() < 700, "Expected parallel execution under 700ms, took {}ms", duration.as_millis());
+    assert!(
+        duration.as_millis() < 700,
+        "Expected parallel execution under 700ms, took {}ms",
+        duration.as_millis()
+    );
 }
-

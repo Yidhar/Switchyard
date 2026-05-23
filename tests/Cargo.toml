@@ -23,6 +23,7 @@ switchyard-provider-subprocess = { workspace = true }
 switchyard-provider-claude = { workspace = true }
 switchyard-provider-codex = { workspace = true }
 switchyard-provider-gemini = { workspace = true }
+switchyard-provider-antigravity = { workspace = true }
 switchyard-cli = { workspace = true }
 switchyard-tui = { workspace = true }
 switchyard-host-jobs = { workspace = true }
@@ -31,6 +32,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
