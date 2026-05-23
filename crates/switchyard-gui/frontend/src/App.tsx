@@ -44,25 +44,40 @@ const MIN_CANVAS_COLUMN_WIDTH = 360;
 const DEFAULT_CANVAS_COLUMN_WIDTH = 680;
 const DEFAULT_SANDBOX_MODE: SandboxMode = 'workspace-write';
 const ATTACHMENT_MARKER = '[Switchyard Attachments]';
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tif', 'tiff']);
+
+function isImageAttachmentPath(path: string): boolean {
+  const cleanPath = path.trim().replace(/^["']|["']$/g, '');
+  const filename = cleanPath.split(/[\\/]/).filter(Boolean).pop() ?? cleanPath;
+  const dotIndex = filename.lastIndexOf('.');
+  if (dotIndex === -1) return false;
+  return IMAGE_EXTENSIONS.has(filename.slice(dotIndex + 1).toLowerCase());
+}
 
 function normalizeSendPayload(input: string | SendPayload): SendPayload {
   if (typeof input === 'string') {
-    return { text: input, imagePaths: [] };
+    return { text: input, imagePaths: [], filePaths: [] };
   }
   return {
     text: input.text,
     imagePaths: Array.isArray(input.imagePaths) ? input.imagePaths : [],
+    filePaths: Array.isArray(input.filePaths) ? input.filePaths : [],
   };
 }
 
 function describeSendPayload(payload: SendPayload): string {
   const imageCount = payload.imagePaths.length;
-  if (imageCount === 0) return payload.text;
-  const suffix = imageCount === 1 ? '1 image' : `${imageCount} images`;
-  return `${payload.text || 'Image message'} (${suffix})`;
+  const fileCount = payload.filePaths?.length ?? 0;
+  if (imageCount === 0 && fileCount === 0) return payload.text;
+  const parts = [
+    imageCount > 0 ? `${imageCount} image${imageCount === 1 ? '' : 's'}` : null,
+    fileCount > 0 ? `${fileCount} file${fileCount === 1 ? '' : 's'}` : null,
+  ].filter(Boolean);
+  const fallback = fileCount > 0 ? 'Attachment message' : 'Image message';
+  return `${payload.text || fallback} (${parts.join(', ')})`;
 }
 
-function extractImagePathsFromAttachmentReferences(text: string): string[] {
+function extractAttachmentPathsFromAttachmentReferences(text: string): string[] {
   const markerIndex = text.indexOf(ATTACHMENT_MARKER);
   if (markerIndex === -1) return [];
   return text
@@ -74,11 +89,20 @@ function extractImagePathsFromAttachmentReferences(text: string): string[] {
     .filter(Boolean);
 }
 
+function extractImagePathsFromAttachmentReferences(text: string): string[] {
+  return extractAttachmentPathsFromAttachmentReferences(text).filter(isImageAttachmentPath);
+}
+
+function extractFilePathsFromAttachmentReferences(text: string): string[] {
+  return extractAttachmentPathsFromAttachmentReferences(text).filter((path) => !isImageAttachmentPath(path));
+}
+
 function displayMessageWithAttachmentReferences(payload: SendPayload): string {
-  if (payload.imagePaths.length === 0 || payload.text.includes(ATTACHMENT_MARKER)) {
+  const attachmentPaths = [...payload.imagePaths, ...(payload.filePaths ?? [])];
+  if (attachmentPaths.length === 0 || payload.text.includes(ATTACHMENT_MARKER)) {
     return payload.text;
   }
-  return `${payload.text}\n\n${ATTACHMENT_MARKER}\n${payload.imagePaths.map((path) => `- ${path}`).join('\n')}`;
+  return `${payload.text}\n\n${ATTACHMENT_MARKER}\n${attachmentPaths.map((path) => `- ${path}`).join('\n')}`;
 }
 
 function runtimePayloadItem(payload: any): any {
@@ -1662,6 +1686,7 @@ function App() {
   const runSingleMessage = async (sessionForSend: Session, payload: SendPayload) => {
     const message = payload.text;
     const imagePaths = payload.imagePaths;
+    const filePaths = payload.filePaths ?? [];
     const sandboxMode = sandboxModeRef.current;
     setActiveCoreText('');
     setActivePeerText('');
@@ -1694,6 +1719,7 @@ function App() {
         provider: sessionForSend.active_core,
         sandboxMode,
         imagePaths,
+        filePaths,
       });
     } catch (e) {
       addLog(new Date().toLocaleTimeString(), 'sys', `Execution failed: ${e}`);
@@ -1912,17 +1938,19 @@ function App() {
     const rawPayload = normalizeSendPayload(rawInput);
     const text = rawPayload.text.trim();
     const imagePaths = rawPayload.imagePaths;
-    if (!text && imagePaths.length === 0) return;
+    const filePaths = rawPayload.filePaths ?? [];
+    if (!text && imagePaths.length === 0 && filePaths.length === 0) return;
     const payload: SendPayload = {
-      text: text || '请分析这些图片。',
+      text: text || (filePaths.length > 0 ? '请分析这些附件。' : '请分析这些图片。'),
       imagePaths,
+      filePaths,
     };
 
     // Slash commands short-circuit the orchestrator dispatch. They
     // work without a selected session (e.g. `/help` from a blank
     // workspace), so we resolve them before the session check.
     const slash = parseSlash(payload.text);
-    if (slash && payload.imagePaths.length === 0) {
+    if (slash && payload.imagePaths.length === 0 && (payload.filePaths?.length ?? 0) === 0) {
       const ctx = slashContext();
       slash.cmd.run(slash.args, ctx).then((result) => {
         if (result.error) {
@@ -2017,6 +2045,7 @@ function App() {
       const payload: SendPayload = {
         text: newText,
         imagePaths: extractImagePathsFromAttachmentReferences(newText),
+        filePaths: extractFilePathsFromAttachmentReferences(newText),
       };
       if (isSendPipelineBusy()) {
         enqueueQueuedMessage(payload);
@@ -2059,6 +2088,7 @@ function App() {
       const payload: SendPayload = {
         text: message,
         imagePaths: extractImagePathsFromAttachmentReferences(message),
+        filePaths: extractFilePathsFromAttachmentReferences(message),
       };
       if (isSendPipelineBusy()) {
         enqueueQueuedMessage(payload);

@@ -35,8 +35,17 @@ export const runTurn = (
   provider?: string,
   sandboxMode?: SandboxMode,
   imagePaths: string[] = [],
+  filePaths: string[] = [],
 ): Promise<string> => {
-  return invoke<string>('run_turn', { sessionId, message, provider, sandboxMode, imagePaths });
+  return invoke<string>('run_turn', { sessionId, message, provider, sandboxMode, imagePaths, filePaths });
+};
+
+export const saveClipboardAttachment = (
+  nameHint: string | undefined,
+  mimeType: string | undefined,
+  dataUrl: string,
+): Promise<string> => {
+  return invoke<string>('save_clipboard_attachment', { nameHint, mimeType, dataUrl });
 };
 
 export const resolveToolApproval = (

@@ -36,7 +36,7 @@ impl TurnInput {
     /// attached local files appended. Providers with native multimodal support
     /// still receive the actual attachment payload separately; this note keeps
     /// transcript history and non-native providers from silently dropping the
-    /// user's image references.
+    /// user's file references.
     pub fn user_message_with_attachment_references(&self) -> String {
         if self.attachments.is_empty() || self.user_message.contains("[Switchyard Attachments]") {
             return self.user_message.clone();
@@ -48,7 +48,7 @@ impl TurnInput {
         }
         out.push_str("[Switchyard Attachments]\n");
         out.push_str(
-            "The user attached these local image files. Treat them as visual inputs when your provider supports images; otherwise use the file paths as references:\n",
+            "The user attached these local files. Image attachments may also be available as visual inputs when your provider supports images; otherwise use the listed file paths as references:\n",
         );
         for attachment in &self.attachments {
             match attachment.mime_type.as_deref() {

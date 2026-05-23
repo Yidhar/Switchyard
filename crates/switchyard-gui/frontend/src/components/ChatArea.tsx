@@ -1,8 +1,10 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { Send, RefreshCw, MessageSquare, Pencil, Check, Square, Plus, ChevronDown, X, Image as ImageIcon } from 'lucide-react';
-import type { Session, Turn, SandboxMode, SendPayload, ImageAttachment } from '../types';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { Send, RefreshCw, MessageSquare, Pencil, Check, Square, Plus, ChevronDown, X, FileText, Image as ImageIcon } from 'lucide-react';
+import type { Session, Turn, SandboxMode, SendPayload, InputAttachment, AttachmentKind } from '../types';
 import { completeSlash } from './slashCommands';
+import { saveClipboardAttachment } from '../services/api';
 
 interface ChatAreaProps {
   selectedSession: Session | null;
@@ -81,6 +83,64 @@ function sandboxOptionFor(mode: SandboxMode) {
 
 function filenameFromPath(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tif', 'tiff']);
+
+function extensionFromPath(path: string): string {
+  const filename = filenameFromPath(path);
+  const dotIndex = filename.lastIndexOf('.');
+  return dotIndex === -1 ? '' : filename.slice(dotIndex + 1).toLowerCase();
+}
+
+function imageMimeTypeForPath(path: string): string | null {
+  switch (extensionFromPath(path)) {
+    case 'png':
+      return 'image/png';
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg';
+    case 'webp':
+      return 'image/webp';
+    case 'gif':
+      return 'image/gif';
+    case 'bmp':
+      return 'image/bmp';
+    case 'tif':
+    case 'tiff':
+      return 'image/tiff';
+    default:
+      return null;
+  }
+}
+
+function attachmentKindForPath(path: string): AttachmentKind {
+  return IMAGE_EXTENSIONS.has(extensionFromPath(path)) ? 'image' : 'file';
+}
+
+function attachmentFromPath(path: string): InputAttachment {
+  const kind = attachmentKindForPath(path);
+  return {
+    path,
+    name: filenameFromPath(path),
+    kind,
+    mimeType: kind === 'image' ? imageMimeTypeForPath(path) : null,
+  };
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error('failed to read file'));
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result);
+      } else {
+        reject(new Error('clipboard item did not produce a data URL'));
+      }
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 interface RenderedMessageBodyProps {
@@ -759,60 +819,69 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         {/* Queued (not-yet-dispatched) user messages */}
         {queuedMessages.length > 0 && (
           <>
-            {queuedMessages.map((msg, qIdx) => (
-              <div
-                key={`queued-${qIdx}`}
-                className="message-bubble message-user"
-                style={{ opacity: 0.55, borderStyle: 'dashed', borderWidth: '1px', borderColor: 'var(--border-muted)' }}
-                title="Queued — will dispatch after the current turn finishes"
-              >
-                <div className="message-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
-                  <span>You (queued #{qIdx + 1})</span>
-                  {qIdx === 0 && (
-                    <button
-                      onClick={onClearQueue}
-                      title="Discard all queued messages"
+            {queuedMessages.map((msg, qIdx) => {
+              const queuedImageCount = msg.imagePaths.length;
+              const queuedFileCount = msg.filePaths?.length ?? 0;
+              const queuedAttachmentCount = queuedImageCount + queuedFileCount;
+              const queuedAttachmentLabel = [
+                queuedImageCount > 0 ? `${queuedImageCount} image${queuedImageCount === 1 ? '' : 's'}` : null,
+                queuedFileCount > 0 ? `${queuedFileCount} file${queuedFileCount === 1 ? '' : 's'}` : null,
+              ].filter(Boolean).join(', ');
+              return (
+                <div
+                  key={`queued-${qIdx}`}
+                  className="message-bubble message-user"
+                  style={{ opacity: 0.55, borderStyle: 'dashed', borderWidth: '1px', borderColor: 'var(--border-muted)' }}
+                  title="Queued — will dispatch after the current turn finishes"
+                >
+                  <div className="message-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+                    <span>You (queued #{qIdx + 1})</span>
+                    {qIdx === 0 && (
+                      <button
+                        onClick={onClearQueue}
+                        title="Discard all queued messages"
+                        style={{
+                          background: 'transparent',
+                          border: '1px solid var(--border-muted)',
+                          color: 'var(--text-muted)',
+                          fontSize: '11px',
+                          padding: '2px 8px',
+                          borderRadius: '3px',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Clear queue
+                      </button>
+                    )}
+                  </div>
+                  <RenderedMessageBody
+                    text={msg.text}
+                    renderMessageBody={renderMessageBody}
+                    onOpenFile={onOpenFile}
+                  />
+                  {queuedAttachmentCount > 0 && (
+                    <div
                       style={{
-                        background: 'transparent',
-                        border: '1px solid var(--border-muted)',
-                        color: 'var(--text-muted)',
-                        fontSize: '11px',
-                        padding: '2px 8px',
-                        borderRadius: '3px',
-                        cursor: 'pointer',
+                        marginTop: 8,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        alignSelf: 'flex-start',
+                        background: 'rgba(59, 130, 246, 0.10)',
+                        border: '1px solid rgba(59, 130, 246, 0.24)',
+                        borderRadius: 999,
+                        padding: '3px 8px',
+                        color: 'var(--text-secondary)',
+                        fontSize: 12,
                       }}
                     >
-                      Clear queue
-                    </button>
+                      {queuedFileCount > 0 ? <FileText size={12} /> : <ImageIcon size={12} />}
+                      <span>{queuedAttachmentLabel} attached</span>
+                    </div>
                   )}
                 </div>
-                <RenderedMessageBody
-                  text={msg.text}
-                  renderMessageBody={renderMessageBody}
-                  onOpenFile={onOpenFile}
-                />
-                {msg.imagePaths.length > 0 && (
-                  <div
-                    style={{
-                      marginTop: 8,
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      alignSelf: 'flex-start',
-                      background: 'rgba(59, 130, 246, 0.10)',
-                      border: '1px solid rgba(59, 130, 246, 0.24)',
-                      borderRadius: 999,
-                      padding: '3px 8px',
-                      color: 'var(--text-secondary)',
-                      fontSize: 12,
-                    }}
-                  >
-                    <ImageIcon size={12} />
-                    <span>{msg.imagePaths.length} image{msg.imagePaths.length === 1 ? '' : 's'} attached</span>
-                  </div>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </>
         )}
 
@@ -855,9 +924,13 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
   onSandboxModeChange,
 }) => {
   const [inputText, setInputText] = useState('');
-  const [attachments, setAttachments] = useState<ImageAttachment[]>([]);
+  const [attachments, setAttachments] = useState<InputAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const composerRef = useRef<HTMLDivElement>(null);
   const [permissionsOpen, setPermissionsOpen] = useState(false);
   const permissionsMenuRef = useRef<HTMLDivElement>(null);
+  const dragDepthRef = useRef(0);
   const currentSandbox = sandboxOptionFor(sandboxMode);
   const canSubmit = inputText.trim().length > 0 || attachments.length > 0;
   const completions = attachments.length === 0 && inputText.startsWith('/') ? completeSlash(inputText) : [];
@@ -872,33 +945,153 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
     return () => window.removeEventListener('pointerdown', onPointerDown);
   }, [permissionsOpen]);
 
-  const addImages = async () => {
+  const addAttachmentsFromPaths = useCallback((paths: string[]) => {
+    const cleanPaths = paths
+      .map((path) => (typeof path === 'string' ? path.trim() : ''))
+      .filter(Boolean);
+    if (cleanPaths.length === 0) return;
+    setAttachmentError(null);
+    setAttachments((prev) => {
+      const seen = new Set(prev.map((attachment) => attachment.path));
+      const next = [...prev];
+      for (const path of cleanPaths) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        next.push(attachmentFromPath(path));
+      }
+      return next;
+    });
+  }, []);
+
+  const saveDroppedOrPastedFiles = useCallback(async (files: File[]) => {
+    const savedPaths: string[] = [];
+    for (const file of files) {
+      const nativePath = (file as File & { path?: string }).path;
+      if (typeof nativePath === 'string' && nativePath.trim()) {
+        savedPaths.push(nativePath);
+        continue;
+      }
+
+      try {
+        const dataUrl = await readFileAsDataUrl(file);
+        const savedPath = await saveClipboardAttachment(
+          file.name || undefined,
+          file.type || undefined,
+          dataUrl,
+        );
+        savedPaths.push(savedPath);
+      } catch (error) {
+        console.error('Failed to save pasted/dropped attachment', error);
+        setAttachmentError(`无法读取或保存附件 ${file.name || 'clipboard item'}：${String(error)}`);
+      }
+    }
+    if (savedPaths.length > 0) {
+      addAttachmentsFromPaths(savedPaths);
+    }
+  }, [addAttachmentsFromPaths]);
+
+  const addAttachments = async () => {
     try {
       const selected = await openDialog({
         multiple: true,
-        filters: [
-          {
-            name: 'Images',
-            extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tif', 'tiff'],
-          },
-        ],
       });
       if (!selected) return;
       const paths = Array.isArray(selected) ? selected : [selected];
-      setAttachments((prev) => {
-        const seen = new Set(prev.map((attachment) => attachment.path));
-        const next = [...prev];
-        for (const path of paths) {
-          if (typeof path !== 'string' || !path.trim() || seen.has(path)) continue;
-          seen.add(path);
-          next.push({ path, name: filenameFromPath(path) });
-        }
-        return next;
-      });
+      addAttachmentsFromPaths(paths.filter((path): path is string => typeof path === 'string'));
     } catch (error) {
-      console.error('Failed to open image picker', error);
+      console.error('Failed to open attachment picker', error);
+      setAttachmentError(`无法打开附件选择器：${String(error)}`);
     }
   };
+
+  const isPointInsideComposer = useCallback((position?: { x: number; y: number }) => {
+    const rect = composerRef.current?.getBoundingClientRect();
+    if (!rect || !position) return true;
+    const scale = window.devicePixelRatio || 1;
+    const x = position.x / scale;
+    const y = position.y / scale;
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === 'enter') {
+          if (isPointInsideComposer(payload.position)) {
+            setIsDragOver(true);
+          }
+        } else if (payload.type === 'over') {
+          setIsDragOver(isPointInsideComposer(payload.position));
+        } else if (payload.type === 'leave') {
+          setIsDragOver(false);
+        } else if (payload.type === 'drop') {
+          const inside = isPointInsideComposer(payload.position);
+          setIsDragOver(false);
+          dragDepthRef.current = 0;
+          if (inside) {
+            addAttachmentsFromPaths(payload.paths);
+          }
+        }
+      })
+      .then((dispose) => {
+        if (disposed) {
+          dispose();
+        } else {
+          unlisten = dispose;
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to listen for native drag/drop events', error);
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [addAttachmentsFromPaths, isPointInsideComposer]);
+
+  const handlePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData?.files ?? []);
+    if (files.length === 0) return;
+    event.preventDefault();
+    void saveDroppedOrPastedFiles(files);
+  }, [saveDroppedOrPastedFiles]);
+
+  const handleDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setIsDragOver(false);
+    const files = Array.from(event.dataTransfer.files ?? []);
+    if (files.length > 0) {
+      void saveDroppedOrPastedFiles(files);
+    }
+  }, [saveDroppedOrPastedFiles]);
 
   const removeAttachment = (path: string) => {
     setAttachments((prev) => prev.filter((attachment) => attachment.path !== path));
@@ -907,13 +1100,21 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
   const submit = () => {
     if (!canSubmit) return;
     const currentAttachments = attachments;
-    const text = inputText.trim() || '请分析这些图片。';
+    const imagePaths = currentAttachments
+      .filter((attachment) => attachment.kind === 'image')
+      .map((attachment) => attachment.path);
+    const filePaths = currentAttachments
+      .filter((attachment) => attachment.kind !== 'image')
+      .map((attachment) => attachment.path);
+    const text = inputText.trim() || (filePaths.length > 0 ? '请分析这些附件。' : '请分析这些图片。');
     const payload: SendPayload = {
       text,
-      imagePaths: currentAttachments.map((attachment) => attachment.path),
+      imagePaths,
+      filePaths,
     };
     setInputText('');
     setAttachments([]);
+    setAttachmentError(null);
     void handleSend(payload, (restoredText) => {
       setInputText(restoredText);
       setAttachments(currentAttachments);
@@ -970,15 +1171,46 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
         </div>
       )}
       <div
+        ref={composerRef}
         className="input-wrapper"
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
         style={{
           flexDirection: 'column',
           alignItems: 'stretch',
           gap: 8,
           borderRadius: 10,
           padding: 10,
+          position: 'relative',
+          borderColor: isDragOver ? 'rgba(59, 130, 246, 0.75)' : undefined,
+          background: isDragOver ? 'rgba(59, 130, 246, 0.08)' : undefined,
+          boxShadow: isDragOver ? '0 0 0 1px rgba(59, 130, 246, 0.22), 0 0 18px rgba(59, 130, 246, 0.14)' : undefined,
         }}
       >
+        {isDragOver && (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 6,
+              border: '1px dashed rgba(96, 165, 250, 0.85)',
+              borderRadius: 8,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: 'rgba(15, 23, 42, 0.72)',
+              color: '#bfdbfe',
+              fontSize: 12,
+              fontWeight: 700,
+              letterSpacing: 0.2,
+              pointerEvents: 'none',
+              zIndex: 4,
+            }}
+          >
+            松开以附加文件或图片
+          </div>
+        )}
         {attachments.length > 0 && (
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
             {attachments.map((attachment) => (
@@ -998,7 +1230,11 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
                   fontSize: 12,
                 }}
               >
-                <ImageIcon size={13} style={{ color: 'var(--color-primary)', flex: '0 0 auto' }} />
+                {attachment.kind === 'image' ? (
+                  <ImageIcon size={13} style={{ color: 'var(--color-primary)', flex: '0 0 auto' }} />
+                ) : (
+                  <FileText size={13} style={{ color: 'var(--color-primary)', flex: '0 0 auto' }} />
+                )}
                 <span
                   style={{
                     overflow: 'hidden',
@@ -1011,7 +1247,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
                 <button
                   type="button"
                   onClick={() => removeAttachment(attachment.path)}
-                  title="Remove image"
+                  title="Remove attachment"
                   style={{
                     display: 'inline-flex',
                     alignItems: 'center',
@@ -1032,6 +1268,21 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
             ))}
           </div>
         )}
+        {attachmentError && (
+          <div
+            style={{
+              color: '#fca5a5',
+              fontSize: 11,
+              lineHeight: 1.35,
+              background: 'rgba(239, 68, 68, 0.08)',
+              border: '1px solid rgba(239, 68, 68, 0.22)',
+              borderRadius: 6,
+              padding: '5px 8px',
+            }}
+          >
+            {attachmentError}
+          </div>
+        )}
 
         <div>
           {/* Textarea is always enabled — sending with no selected
@@ -1044,11 +1295,12 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
             className="chat-textarea"
             placeholder={
               !selectedSession
-                ? "Ask anything… attach images with +; a new session will be created on send"
-                : "Ask anything… attach images with + (type '/' for commands)"
+                ? "Ask anything… attach files/images with +, paste, or drop; a new session will be created on send"
+                : "Ask anything… attach files/images with +, paste, or drop (type '/' for commands)"
             }
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
+            onPaste={handlePaste}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -1067,8 +1319,8 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
             <button
               type="button"
-              onClick={addImages}
-              title="Attach images"
+              onClick={addAttachments}
+              title="Attach files or images"
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -1161,7 +1413,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: '0 0 auto' }}>
             {attachments.length > 0 && (
               <span style={{ color: 'var(--text-muted)', fontSize: 11, whiteSpace: 'nowrap' }}>
-                {attachments.length} image{attachments.length === 1 ? '' : 's'} ready
+                {attachments.length} attachment{attachments.length === 1 ? '' : 's'} ready
               </span>
             )}
             {/* Single action button toggles between Send (idle) and Stop

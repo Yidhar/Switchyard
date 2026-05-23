@@ -385,10 +385,12 @@ impl LiveInstance for CodexAppServerInstance {
             "text_elements": [],
         })];
         for attachment in &input.attachments {
-            input_items.push(json!({
-                "type": "localImage",
-                "path": attachment.path.display().to_string(),
-            }));
+            if matches!(attachment.mime_type.as_deref(), Some(mime) if mime.starts_with("image/")) {
+                input_items.push(json!({
+                    "type": "localImage",
+                    "path": attachment.path.display().to_string(),
+                }));
+            }
         }
         // Send turn/start. Do not synchronously wait for its response before
         // installing the drain task: newer Codex app-server builds can emit

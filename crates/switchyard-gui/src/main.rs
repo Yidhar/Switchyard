@@ -7,6 +7,7 @@ mod file_watcher;
 mod git;
 mod pty;
 
+use base64::Engine;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -1643,50 +1644,78 @@ async fn get_session_events(
     Ok(events)
 }
 
-fn validate_image_attachments(
+fn validate_turn_attachments(
     cwd: &Path,
     image_paths: Vec<String>,
+    file_paths: Vec<String>,
 ) -> Result<Vec<InputAttachment>, String> {
-    image_paths
-        .into_iter()
-        .filter(|raw| !raw.trim().is_empty())
-        .map(|raw| {
-            let candidate = PathBuf::from(raw.trim());
-            let absolute = if candidate.is_absolute() {
-                candidate
-            } else {
-                cwd.join(candidate)
-            };
-            let normalized = lexical_normalize(&absolute);
-            if !normalized.is_file() {
-                return Err(format!(
-                    "attached image not found: {}",
-                    normalized.display()
-                ));
-            }
-            let extension = normalized
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_ascii_lowercase())
-                .ok_or_else(|| {
-                    format!(
-                        "attached image has no supported extension: {}",
-                        normalized.display()
-                    )
-                })?;
-            let mime_type = image_mime_type(&extension).ok_or_else(|| {
-                format!(
-                    "unsupported image extension '.{}' for {}",
-                    extension,
-                    normalized.display()
-                )
-            })?;
-            Ok(InputAttachment {
-                path: normalized,
-                mime_type: Some(mime_type.to_string()),
-            })
-        })
-        .collect()
+    let mut attachments = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for raw in image_paths {
+        push_validated_attachment(cwd, raw, true, &mut seen, &mut attachments)?;
+    }
+    for raw in file_paths {
+        push_validated_attachment(cwd, raw, false, &mut seen, &mut attachments)?;
+    }
+
+    Ok(attachments)
+}
+
+fn push_validated_attachment(
+    cwd: &Path,
+    raw: String,
+    require_image: bool,
+    seen: &mut BTreeSet<PathBuf>,
+    attachments: &mut Vec<InputAttachment>,
+) -> Result<(), String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+
+    let candidate = PathBuf::from(raw);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    };
+    let normalized = lexical_normalize(&absolute);
+    if !normalized.is_file() {
+        let label = if require_image {
+            "attached image"
+        } else {
+            "attached file"
+        };
+        return Err(format!("{label} not found: {}", normalized.display()));
+    }
+    let extension = normalized
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let image_mime = image_mime_type(&extension);
+    if require_image && image_mime.is_none() {
+        if extension.is_empty() {
+            return Err(format!(
+                "attached image has no supported extension: {}",
+                normalized.display()
+            ));
+        }
+        return Err(format!(
+            "unsupported image extension '.{}' for {}",
+            extension,
+            normalized.display()
+        ));
+    }
+    let mime_type = image_mime.or_else(|| generic_mime_type(&extension));
+    if seen.insert(normalized.clone()) {
+        attachments.push(InputAttachment {
+            path: normalized,
+            mime_type: mime_type.map(str::to_string),
+        });
+    }
+    Ok(())
 }
 
 fn image_mime_type(extension: &str) -> Option<&'static str> {
@@ -1701,6 +1730,184 @@ fn image_mime_type(extension: &str) -> Option<&'static str> {
     }
 }
 
+fn generic_mime_type(extension: &str) -> Option<&'static str> {
+    match extension {
+        "txt" | "text" | "log" => Some("text/plain"),
+        "md" | "markdown" => Some("text/markdown"),
+        "json" => Some("application/json"),
+        "jsonl" => Some("application/x-ndjson"),
+        "toml" => Some("application/toml"),
+        "yaml" | "yml" => Some("application/yaml"),
+        "csv" => Some("text/csv"),
+        "html" | "htm" => Some("text/html"),
+        "css" => Some("text/css"),
+        "js" | "mjs" | "cjs" => Some("text/javascript"),
+        "ts" | "tsx" => Some("text/typescript"),
+        "jsx" => Some("text/jsx"),
+        "rs" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "cs" | "sh" | "ps1" | "bat"
+        | "cmd" | "sql" | "xml" | "svg" => Some("text/plain"),
+        "pdf" => Some("application/pdf"),
+        "zip" => Some("application/zip"),
+        "gz" => Some("application/gzip"),
+        "tar" => Some("application/x-tar"),
+        _ => None,
+    }
+}
+
+const MAX_CLIPBOARD_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+
+fn extension_for_mime_type(mime_type: &str) -> Option<&'static str> {
+    match mime_type
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        "image/tiff" => Some("tiff"),
+        "text/plain" => Some("txt"),
+        "text/markdown" => Some("md"),
+        "application/json" => Some("json"),
+        "application/pdf" => Some("pdf"),
+        _ => None,
+    }
+}
+
+fn sanitize_attachment_filename(name_hint: Option<String>, mime_type: Option<&str>) -> String {
+    let raw_name = name_hint
+        .as_deref()
+        .and_then(|name| Path::new(name).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment");
+    let mut cleaned = raw_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while cleaned.contains("..") {
+        cleaned = cleaned.replace("..", ".");
+    }
+    cleaned = cleaned
+        .trim_matches(|ch| ch == '.' || ch == '_' || ch == '-')
+        .to_string();
+    if cleaned.is_empty() {
+        cleaned = "attachment".to_string();
+    }
+    if cleaned.len() > 120 {
+        cleaned.truncate(120);
+        cleaned = cleaned.trim_end_matches('.').to_string();
+        if cleaned.is_empty() {
+            cleaned = "attachment".to_string();
+        }
+    }
+    if Path::new(&cleaned).extension().is_none()
+        && let Some(ext) = mime_type.and_then(extension_for_mime_type)
+    {
+        cleaned.push('.');
+        cleaned.push_str(ext);
+    }
+    cleaned
+}
+
+fn decode_clipboard_data_url(
+    data_url: &str,
+    mime_type_hint: Option<String>,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    let trimmed = data_url.trim();
+    if trimmed.is_empty() {
+        return Err("clipboard attachment payload is empty".to_string());
+    }
+
+    let (metadata, payload) = if let Some(rest) = trimmed.strip_prefix("data:") {
+        let (metadata, payload) = rest
+            .split_once(',')
+            .ok_or_else(|| "clipboard data URL is missing a comma separator".to_string())?;
+        (Some(metadata), payload)
+    } else {
+        (None, trimmed)
+    };
+
+    if let Some(metadata) = metadata {
+        let is_base64 = metadata
+            .split(';')
+            .any(|part| part.eq_ignore_ascii_case("base64"));
+        if !is_base64 {
+            return Err("clipboard data URL must be base64 encoded".to_string());
+        }
+    }
+
+    let mime_type = metadata
+        .and_then(|metadata| metadata.split(';').next())
+        .map(str::trim)
+        .filter(|mime| !mime.is_empty())
+        .map(str::to_string)
+        .or_else(|| mime_type_hint.filter(|mime| !mime.trim().is_empty()));
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.as_bytes())
+        .map_err(|e| format!("decode clipboard attachment: {e}"))?;
+    if bytes.len() > MAX_CLIPBOARD_ATTACHMENT_BYTES {
+        return Err(format!(
+            "clipboard attachment is too large ({} bytes, max {} bytes)",
+            bytes.len(),
+            MAX_CLIPBOARD_ATTACHMENT_BYTES
+        ));
+    }
+
+    Ok((bytes, mime_type))
+}
+
+#[tauri::command]
+fn save_clipboard_attachment(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    name_hint: Option<String>,
+    mime_type: Option<String>,
+    data_url: String,
+) -> Result<String, String> {
+    let ws = workspace_state.current()?;
+    let (bytes, effective_mime_type) = decode_clipboard_data_url(&data_url, mime_type)?;
+    let filename = sanitize_attachment_filename(name_hint, effective_mime_type.as_deref());
+    let attachment_dir = workspace_data_dir(ws.workspace_id).join("clipboard_attachments");
+    std::fs::create_dir_all(&attachment_dir)
+        .map_err(|e| format!("create clipboard attachment dir: {e}"))?;
+
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+    for suffix in 0..1000 {
+        let candidate_name = if suffix == 0 {
+            format!("{stamp}_{filename}")
+        } else {
+            format!("{stamp}_{suffix}_{filename}")
+        };
+        let path = attachment_dir.join(candidate_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(&bytes)
+                    .map_err(|e| format!("write clipboard attachment: {e}"))?;
+                return Ok(path.to_string_lossy().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create clipboard attachment file: {e}")),
+        }
+    }
+
+    Err("failed to allocate a unique clipboard attachment filename".to_string())
+}
+
 #[tauri::command]
 async fn run_turn(
     app: tauri::AppHandle,
@@ -1712,10 +1919,15 @@ async fn run_turn(
     provider: Option<String>,
     sandbox_mode: Option<SandboxMode>,
     image_paths: Option<Vec<String>>,
+    file_paths: Option<Vec<String>>,
 ) -> Result<String, String> {
     let (ws, mut store, data_dir, config) = open_current_store(&workspace_state)?;
     let cwd = ws.primary_root.clone();
-    let attachments = validate_image_attachments(&cwd, image_paths.unwrap_or_default())?;
+    let attachments = validate_turn_attachments(
+        &cwd,
+        image_paths.unwrap_or_default(),
+        file_paths.unwrap_or_default(),
+    )?;
     let registry = build_registry(&config);
 
     let session_uuid =
@@ -2718,6 +2930,7 @@ fn main() {
             create_session,
             get_session_turns,
             get_session_events,
+            save_clipboard_attachment,
             run_turn,
             cancel_turn,
             resolve_tool_approval,

@@ -31,14 +31,21 @@ export interface SwitchyardConfig {
   store: StoreConfig;
 }
 
-export interface ImageAttachment {
+export type AttachmentKind = 'image' | 'file';
+
+export interface InputAttachment {
   path: string;
   name: string;
+  kind: AttachmentKind;
+  mimeType?: string | null;
 }
+
+export type ImageAttachment = InputAttachment;
 
 export interface SendPayload {
   text: string;
   imagePaths: string[];
+  filePaths?: string[];
 }
 
 export interface Session {
