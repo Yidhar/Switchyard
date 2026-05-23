@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Session, Turn, SwitchyardConfig, ProviderStatus } from '../types';
+import type { Session, Turn, SwitchyardConfig, ProviderStatus, SandboxMode } from '../types';
 
 export const listSessions = (): Promise<Session[]> => {
   return invoke<Session[]>('list_sessions');
@@ -29,8 +29,14 @@ export const saveConfig = (config: SwitchyardConfig): Promise<void> => {
   return invoke<void>('save_config', { config });
 };
 
-export const runTurn = (sessionId: string, message: string, provider?: string): Promise<string> => {
-  return invoke<string>('run_turn', { sessionId, message, provider });
+export const runTurn = (
+  sessionId: string,
+  message: string,
+  provider?: string,
+  sandboxMode?: SandboxMode,
+  imagePaths: string[] = [],
+): Promise<string> => {
+  return invoke<string>('run_turn', { sessionId, message, provider, sandboxMode, imagePaths });
 };
 
 export const cancelTurn = (): Promise<void> => {

@@ -100,20 +100,152 @@ body {
 
 /* App Layout Grid */
 .app-container {
+  /* Icon rail (auto) / left column / VS Code-like sash / chat+canvas.
+     Bottom row starts after the icon rail so the rail keeps a clean
+     full-height distribution while the status bar hosts the Terminal
+     toggle, workers count, and other clickable items.
+     ControlCenter lives in a right-side slide-in drawer (overlay). */
   display: grid;
-  grid-template-columns: 280px 1fr 320px;
+  grid-template-columns:
+    auto
+    var(--switchyard-left-column-width, 280px)
+    3px
+    minmax(0, 1fr);
+  grid-template-rows: 1fr auto;
   height: 100vh;
   width: 100vw;
-  padding: 16px;
-  gap: 16px;
+  padding: 0;
+  gap: 0;
+  background: var(--bg-app, #0b0d11);
+  position: relative;
 }
 
-/* Sidebar Styling */
+/* VS Code-like draggable splitters ("sashes"). They are intentionally a
+   little wider than the visual 1px border so users can grab them easily
+   without fighting exact pixels. */
+.layout-sash {
+  position: relative;
+  background: transparent;
+  z-index: 3;
+  flex-shrink: 0;
+  touch-action: none;
+}
+
+.layout-sash::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  background: var(--color-primary);
+  transition: opacity 120ms ease;
+  pointer-events: none;
+}
+
+.layout-sash:hover::after,
+.is-layout-resizing .layout-sash::after {
+  opacity: 0.45;
+}
+
+.is-layout-resizing,
+.is-layout-resizing * {
+  user-select: none !important;
+}
+
+.layout-sash-vertical {
+  width: 3px;
+  cursor: col-resize;
+  border-right: 1px solid var(--border-muted);
+}
+
+.layout-sash-vertical::after {
+  left: 0;
+  right: 0;
+}
+
+.layout-sash-main {
+  flex: 0 0 3px;
+  border-left: 1px solid var(--border-muted);
+  border-right: 1px solid rgba(255, 255, 255, 0.02);
+}
+
+.layout-sash-horizontal {
+  height: 6px;
+  cursor: row-resize;
+}
+
+.layout-sash-horizontal::after {
+  top: 2px;
+  bottom: 2px;
+}
+
+.terminal-panel-sash {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  z-index: 5;
+  transform: translateY(-3px);
+}
+
+/* Slide-in diagnostics drawer. Anchored to the right edge with a CSS
+   transform so the open/close animation doesn't trigger layout reflow
+   in the main grid (which would otherwise cause the chat content to
+   jump). The chat column keeps full width regardless of drawer state. */
+.diagnostics-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 380px;
+  max-width: 90vw;
+  background: rgba(10, 12, 16, 0.98);
+  border-left: 1px solid var(--border-muted);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.4);
+  transform: translateX(100%);
+  transition: transform 220ms ease;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.diagnostics-drawer.is-open {
+  transform: translateX(0);
+}
+
+.diagnostics-drawer-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-muted);
+  background: rgba(255, 255, 255, 0.02);
+  flex-shrink: 0;
+}
+
+.diagnostics-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* The left column (workspace + session list) sits in row 1 / cell 2;
+   the StatusBar owns row 2 under it, while IconRail spans both rows. */
+.left-column {
+  height: 100%;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+/* Sidebar Styling. Lives inside `.left-column` (a flex column) so it
+   should grow to fill the remaining height under WorkspaceHeader. */
 .sidebar {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
+  border-radius: 0;
 }
 
 .sidebar-header {
@@ -181,35 +313,94 @@ body {
   gap: 8px;
 }
 
+/* Session list row — Claude-Code-style: single line, title + relative
+   timestamp at rest, action cluster reveals only on hover. The `.active`
+   class highlights the row's background but does NOT auto-reveal the
+   actions — matching how Claude Code keeps the list quiet even on the
+   selected entry. */
 .session-item {
-  padding: 12px;
+  padding: 8px 12px;
   border-radius: 4px;
+  position: relative;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.session-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.session-item.active {
+  background: rgba(99, 102, 241, 0.10);
 }
 
-.session-item-title {
-  font-weight: 600;
-  font-size: 14px;
-  color: var(--text-primary);
-  margin-bottom: 4px;
+/* Single row layout — name flexes, date sits at the right and slides
+   out when the action cluster needs the slot. */
+.session-item-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
+  min-height: 22px;
 }
 
-.session-item-badge {
-  padding: 2px 6px;
-  border-radius: 3px;
-  font-size: 10px;
-  text-transform: uppercase;
-  font-weight: 700;
+.session-item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
 }
-.badge-codex { background: rgba(59, 130, 246, 0.15); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.3); }
-.badge-claude { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
-.badge-gemini { background: rgba(6, 182, 212, 0.2); color: #22d3ee; border: 1px solid rgba(6, 182, 212, 0.4); }
 
 .session-item-date {
+  flex-shrink: 0;
   font-size: 11px;
   color: var(--text-muted);
+  transition: opacity 120ms ease;
+}
+.session-item:hover .session-item-date {
+  /* Fade the timestamp so the action cluster can take its slot
+     without the row jumping. */
+  opacity: 0;
+}
+
+.session-item-actions {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+.session-item:hover .session-item-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.session-item-action-btn {
+  background: transparent;
+  border: none;
+  padding: 3px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  transition: background 120ms ease, color 120ms ease;
+}
+.session-item-action-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+}
+.session-item-action-danger {
+  color: var(--color-error, #ef4444);
+}
+.session-item-action-danger:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: #fca5a5;
 }
 
 .sidebar-footer {
@@ -247,12 +438,31 @@ body {
   overflow: hidden;
 }
 
+/* The chat column is also tagged `.glass-panel` for its backdrop
+   blur + tinted background. That class otherwise wraps things in a
+   1px border + 4px radius (good for floating cards, bad here) — it
+   pushes the chat-header 1px lower than the workspace and Canvas
+   column tops, breaking horizontal alignment. Drop the border/radius
+   for the full-height column variants but keep the glass effect. */
+.main-content.glass-panel,
+.sidebar.glass-panel {
+  border: none;
+  border-radius: 0;
+}
+
+/* Chat header height is locked to the Canvas's combined tab-bar +
+   file-header height (~64px) so the bottom borders of both columns
+   line up at the same Y. Without this, the Canvas tabs feel like
+   they're floating above the chat title. */
 .chat-header {
-  padding: 16px 24px;
+  min-height: 64px;
+  padding: 0 16px;
   border-bottom: 1px solid var(--border-muted);
   display: flex;
   justify-content: space-between;
   align-items: center;
+  box-sizing: border-box;
+  flex-shrink: 0;
 }
 
 .chat-header-info h2 {
@@ -308,18 +518,39 @@ body {
   font-size: 14px;
 }
 
+/* User bubbles stay visually distinct (subtle container) so the
+   "who said what" affordance survives without dominating the page. */
 .message-user {
   align-self: flex-end;
-  background: rgba(59, 130, 246, 0.15);
-  border: 1px solid rgba(59, 130, 246, 0.3);
+  background: rgba(59, 130, 246, 0.10);
+  border: 1px solid rgba(59, 130, 246, 0.25);
   border-bottom-right-radius: 2px;
 }
 
+/* Assistant messages no longer use a bubble container — they flow as
+   plain text with a small provider label. This matches the "AI is
+   the page, not a guest" convention from Codex/Claude UIs. The legacy
+   `message-assistant` class kept here as a thin compatibility shim
+   for any third-party CSS that targets it; the rendered markup uses
+   `message-assistant-flow` instead. */
 .message-assistant {
   align-self: flex-start;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid var(--border-muted);
-  border-bottom-left-radius: 2px;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+/* Flow-style assistant message: no container, generous max-width,
+   subtle label row that reveals timestamp + actions on hover. */
+.message-assistant-flow {
+  align-self: stretch;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0 12px;
+  line-height: 1.55;
+  font-size: 14px;
+  color: var(--text-primary);
 }
 
 .message-header {
@@ -329,6 +560,24 @@ body {
   margin-bottom: 6px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+/* Hover-reveal: actions + meta are hidden until the surrounding
+   message is hovered. Same pattern Codex uses — quiet at rest, full
+   info on intent. */
+.message-bubble .message-meta,
+.message-assistant-flow .message-meta {
+  opacity: 0;
+  transition: opacity 120ms ease;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.message-bubble:hover .message-meta,
+.message-assistant-flow:hover .message-meta {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .message-body {
@@ -342,6 +591,37 @@ body {
   border-radius: 3px;
   font-family: var(--font-mono);
   font-size: 13px;
+}
+
+.message-body .inline-file-reference {
+  appearance: none;
+  display: inline;
+  margin: 0 1px;
+  padding: 0 4px;
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  border-radius: 4px;
+  background: rgba(59, 130, 246, 0.1);
+  color: #93c5fd;
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.94em;
+  line-height: 1.35;
+  cursor: pointer;
+  text-decoration: none;
+  vertical-align: baseline;
+}
+
+.message-body .inline-file-reference:hover,
+.message-body .inline-file-reference:focus-visible {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: rgba(59, 130, 246, 0.55);
+  color: #bfdbfe;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.message-body code.inline-file-reference {
+  color: #93c5fd;
 }
 
 .message-body pre {
@@ -377,7 +657,7 @@ body {
 
 /* Chat Input Bar */
 .chat-input-container {
-  padding: 16px;
+  padding: 12px;
   border-top: 1px solid var(--border-muted);
 }
 
@@ -431,6 +711,18 @@ body {
   color: var(--text-muted);
   cursor: not-allowed;
   box-shadow: none;
+}
+
+.composer-send-button {
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
+.composer-send-button:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(59, 130, 246, 0.25);
 }
 
 /* Star Topology Right Drawer */
@@ -1372,4 +1664,3 @@ body {
   background-color: transparent;
   border-left: 3px solid transparent;
 }
-

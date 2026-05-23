@@ -61,7 +61,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               ))}
 
-              <button 
+              <button
                 className={`settings-tab-btn ${settingsTab === 'store' ? 'active' : ''}`}
                 onClick={() => setSettingsTab('store')}
               >
@@ -238,8 +238,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
                 <div className="settings-form-group">
                   <label>Database Storage Path</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     className="settings-input settings-input-mono"
                     value={config.store.path}
                     onChange={(e) => onFieldChange('store', 'path', e.target.value)}
@@ -247,6 +247,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </>
             )}
+
           </div>
         </div>
 
