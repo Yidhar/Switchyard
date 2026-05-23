@@ -109,13 +109,20 @@ pub async fn submit_tool_approval_decision(
     decision: ToolApprovalDecision,
     reason: Option<String>,
 ) -> Result<(), String> {
-    let sender = approval_registry()
-        .lock()
-        .await
-        .remove(request_id)
-        .ok_or_else(|| {
-            "approval request not found; it may have already been resolved or timed out".to_string()
-        })?;
+    let sender = {
+        let mut registry = approval_registry().lock().await;
+        match registry.remove(request_id) {
+            Some(sender) => sender,
+            None => {
+                let mut pending_sample = registry.keys().take(5).cloned().collect::<Vec<_>>();
+                pending_sample.sort();
+                return Err(format!(
+                    "approval request '{request_id}' not found; it may have already been resolved, timed out, or replaced by a newer turn; pending={}; pending_sample={pending_sample:?}",
+                    registry.len()
+                ));
+            }
+        }
+    };
     sender
         .send(ResolvedApproval { decision, reason })
         .map_err(|_| "approval request receiver is no longer active".to_string())
@@ -124,7 +131,6 @@ pub async fn submit_tool_approval_decision(
 async fn wait_for_gui_approval(
     request_id: &str,
     approval_rx: oneshot::Receiver<ResolvedApproval>,
-    event_tx: &mpsc::Sender<ProviderEvent>,
 ) -> ApprovalResolution {
     tokio::select! {
         resolved = approval_rx => match resolved {
@@ -156,17 +162,6 @@ async fn wait_for_gui_approval(
                     "timed out after {} seconds waiting for approve/deny",
                     APPROVAL_TIMEOUT.as_secs()
                 )),
-                status: "failed",
-            }
-        },
-        _ = event_tx.closed() => {
-            forget_pending_approval(request_id).await;
-            ApprovalResolution {
-                decision: json!({ "decision": "deny" }),
-                audit_tag: "deny:approval_stream_closed".to_string(),
-                reason: Some(
-                    "approval stream closed before the user approved or denied the request".to_string(),
-                ),
                 status: "failed",
             }
         },
@@ -513,7 +508,7 @@ impl LiveInstance for CodexAppServerInstance {
                                 status: "failed",
                             }
                         } else {
-                            wait_for_gui_approval(&request_id, approval_rx, &event_tx).await
+                            wait_for_gui_approval(&request_id, approval_rx).await
                         }
                     };
 
@@ -922,13 +917,29 @@ fn codex_sandbox_policy_payload(policy: &ExecutionPolicy) -> Value {
             // changes the file permission mode.
             "networkAccess": true,
         }),
-        EffectiveSandboxMode::WorkspaceWrite => json!({
-            "type": "workspaceWrite",
-            "writableRoots": codex_writable_roots_payload(policy),
-            "networkAccess": true,
-            "excludeTmpdirEnvVar": false,
-            "excludeSlashTmp": false,
-        }),
+        EffectiveSandboxMode::WorkspaceWrite => {
+            let sandbox = json!({
+                "type": "workspaceWrite",
+                "writableRoots": codex_writable_roots_payload(policy),
+                "networkAccess": true,
+            });
+            // These tmpdir flags are Unix-oriented. Keep them out of the
+            // Windows app-server payload so Codex's Windows sandbox
+            // initializer only receives platform-relevant fields.
+            #[cfg(not(windows))]
+            {
+                let mut sandbox = sandbox;
+                if let Some(obj) = sandbox.as_object_mut() {
+                    obj.insert("excludeTmpdirEnvVar".to_string(), json!(false));
+                    obj.insert("excludeSlashTmp".to_string(), json!(false));
+                }
+                sandbox
+            }
+            #[cfg(windows)]
+            {
+                sandbox
+            }
+        }
     }
 }
 
@@ -1158,6 +1169,15 @@ async fn await_response(
 mod tests {
     use super::*;
 
+    fn approval_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    async fn clear_pending_approvals_for_test() {
+        approval_registry().lock().await.clear();
+    }
+
     #[test]
     fn annotate_protocol_payload_adds_method_and_normalized_type() {
         let mut payload =
@@ -1220,6 +1240,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn gui_approval_approve_resolves_to_codex_approve() {
+        let _guard = approval_test_lock().lock().await;
+        clear_pending_approvals_for_test().await;
+
+        let request_id = "approval-test-approve";
+        let approval_rx = register_pending_approval(request_id.to_string()).await;
+        submit_tool_approval_decision(
+            request_id,
+            ToolApprovalDecision::Approve,
+            Some("accepted from test".to_string()),
+        )
+        .await
+        .expect("submit approval");
+
+        let resolution = wait_for_gui_approval(request_id, approval_rx).await;
+        assert_eq!(
+            resolution.decision.get("decision").and_then(|v| v.as_str()),
+            Some("approve")
+        );
+        assert_eq!(resolution.audit_tag, "approve:user");
+        assert_eq!(resolution.status, "completed");
+        assert_eq!(resolution.reason.as_deref(), Some("accepted from test"));
+
+        clear_pending_approvals_for_test().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_approval_request_reports_pending_snapshot() {
+        let _guard = approval_test_lock().lock().await;
+        clear_pending_approvals_for_test().await;
+
+        let _rx = register_pending_approval("pending-sample".to_string()).await;
+        let err =
+            submit_tool_approval_decision("missing-request", ToolApprovalDecision::Approve, None)
+                .await
+                .expect_err("missing approval should fail");
+
+        assert!(err.contains("approval request 'missing-request' not found"));
+        assert!(err.contains("pending=1"));
+        assert!(err.contains("pending-sample"));
+
+        clear_pending_approvals_for_test().await;
+    }
+
     #[test]
     fn turn_start_params_carries_cwd_approval_reviewer_and_sandbox_policy() {
         let repo = std::env::current_dir()
@@ -1273,6 +1338,22 @@ mod tests {
                     .collect::<Vec<_>>()),
             Some(vec![expected_repo.as_str(), expected_shared.as_str()])
         );
+        #[cfg(windows)]
+        {
+            assert!(sandbox.get("excludeTmpdirEnvVar").is_none());
+            assert!(sandbox.get("excludeSlashTmp").is_none());
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                sandbox.get("excludeTmpdirEnvVar").and_then(|v| v.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                sandbox.get("excludeSlashTmp").and_then(|v| v.as_bool()),
+                Some(false)
+            );
+        }
     }
 
     #[test]
