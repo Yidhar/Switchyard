@@ -9,6 +9,11 @@ pub const ACTIVE_TURN_LEASE_SECS: i64 = 15;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: Uuid,
+    /// Workspace this session belongs to. Old sessions persisted before
+    /// the workspace concept landed deserialize with `Uuid::nil()`; the
+    /// app migrates them to a "Default" workspace on first launch.
+    #[serde(default)]
+    pub workspace_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub active_core: String,
@@ -36,9 +41,17 @@ pub enum SessionMode {
 
 impl Session {
     pub fn new(active_core: String) -> Self {
+        Self::new_in_workspace(Uuid::nil(), active_core)
+    }
+
+    /// Mint a fresh session bound to a workspace. Callers that haven't
+    /// adopted the workspace concept yet (legacy tests) can use
+    /// [`Self::new`] which stamps `Uuid::nil()` and lets the app migrate.
+    pub fn new_in_workspace(workspace_id: Uuid, active_core: String) -> Self {
         let now = Utc::now();
         Self {
             session_id: Uuid::now_v7(),
+            workspace_id,
             created_at: now,
             updated_at: now,
             active_core,

@@ -1,6 +1,7 @@
 pub mod error;
 pub mod jsonl;
 pub mod sqlite;
+pub mod workspace_index;
 
 use switchyard_session::{Artifact, Event, InboxEntry, Session, Turn};
 use uuid::Uuid;
@@ -9,6 +10,9 @@ pub use error::StoreError;
 pub use jsonl::JsonlStore;
 pub use sqlite::{
     SQLITE_SCHEMA_VERSION, SqliteHealthInfo, SqliteMigrationRecord, SqliteSchemaInfo, SqliteStore,
+};
+pub use workspace_index::{
+    WorkspaceIndex, WorkspaceIndexError, default_index_path, workspace_data_dir,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +30,16 @@ pub trait SessionRepository {
 pub trait TurnRepository {
     fn append_turn(&mut self, turn: &Turn) -> Result<(), StoreError>;
     fn list_turns(&self, session_id: Uuid) -> Result<Vec<Turn>, StoreError>;
+
+    /// Delete the turn identified by `turn_id` together with every later turn
+    /// in the same session and all events / artifacts attached to those turns.
+    /// Used by the edit/retry UI to rewind canonical history to the point
+    /// immediately before `turn_id` so the next `run_turn` can re-dispatch a
+    /// corrected message.
+    ///
+    /// No-op when `turn_id` is unknown. Implementations must be transactional
+    /// — partial rewinds (turns gone but events left dangling) are not allowed.
+    fn delete_turn_tail(&mut self, turn_id: Uuid) -> Result<(), StoreError>;
 }
 
 pub trait EventLog {
@@ -151,6 +165,13 @@ impl TurnRepository for StoreHandle {
         match self {
             Self::Jsonl(store) => store.list_turns(session_id),
             Self::Sqlite(store) => store.list_turns(session_id),
+        }
+    }
+
+    fn delete_turn_tail(&mut self, turn_id: Uuid) -> Result<(), StoreError> {
+        match self {
+            Self::Jsonl(store) => store.delete_turn_tail(turn_id),
+            Self::Sqlite(store) => store.delete_turn_tail(turn_id),
         }
     }
 }
