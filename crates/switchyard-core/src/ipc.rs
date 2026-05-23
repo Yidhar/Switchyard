@@ -1,10 +1,10 @@
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use serde::{Deserialize, Serialize};
 
 use crate::instance::InstancePool;
 use switchyard_provider_api::LiveInstanceRegistry;
@@ -54,7 +54,10 @@ impl AsyncWrite for IpcStream {
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             #[cfg(windows)]
             IpcStream::Windows(s) => Pin::new(s).poll_shutdown(cx),
@@ -82,7 +85,11 @@ pub struct IpcResponse {
 }
 
 #[cfg(windows)]
-pub async fn run_ipc_server(pool: Arc<InstancePool>, pipe_name: &str, cancel: CancellationToken) -> Result<(), std::io::Error> {
+pub async fn run_ipc_server(
+    pool: Arc<InstancePool>,
+    pipe_name: &str,
+    cancel: CancellationToken,
+) -> Result<(), std::io::Error> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let mut first = true;
@@ -118,7 +125,11 @@ pub async fn run_ipc_server(pool: Arc<InstancePool>, pipe_name: &str, cancel: Ca
 }
 
 #[cfg(unix)]
-pub async fn run_ipc_server(pool: Arc<InstancePool>, socket_path: &str, cancel: CancellationToken) -> Result<(), std::io::Error> {
+pub async fn run_ipc_server(
+    pool: Arc<InstancePool>,
+    socket_path: &str,
+    cancel: CancellationToken,
+) -> Result<(), std::io::Error> {
     use tokio::net::UnixListener;
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
@@ -148,7 +159,10 @@ pub async fn run_ipc_server(pool: Arc<InstancePool>, socket_path: &str, cancel: 
     Ok(())
 }
 
-async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_ipc_client(
+    stream: IpcStream,
+    pool: Arc<InstancePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncWriteExt;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
@@ -175,14 +189,41 @@ async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result
             let task = req.task.clone();
             let turn_id = Uuid::now_v7();
 
-            let inst_lock = match pool.checkout_instance(&provider) {
-                Some(inst) => inst,
+            // Session-scoped pool requires the caller to identify the session.
+            // The IpcRequest schema already exposes the field as Option<String>;
+            // delegate requires it to be present and a valid UUID.
+            let session_id = match req
+                .session_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(id) => id,
                 None => {
                     let err_resp = IpcResponse {
                         status: "failed".to_string(),
                         event: None,
                         result: None,
-                        error: Some(format!("Provider {provider} not running in pool")),
+                        error: Some(
+                            "delegate requires session_id (UUID) in the request payload".into(),
+                        ),
+                    };
+                    let mut resp_str = serde_json::to_string(&err_resp)?;
+                    resp_str.push('\n');
+                    writer.write_all(resp_str.as_bytes()).await?;
+                    continue;
+                }
+            };
+
+            let (instance_id, inst_lock) = match pool.checkout_any_idle(&provider, session_id) {
+                Some(pair) => pair,
+                None => {
+                    let err_resp = IpcResponse {
+                        status: "failed".to_string(),
+                        event: None,
+                        result: None,
+                        error: Some(format!(
+                            "Provider {provider} has no idle instance in session {session_id}"
+                        )),
                     };
                     let mut resp_str = serde_json::to_string(&err_resp)?;
                     resp_str.push('\n');
@@ -200,7 +241,9 @@ async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result
             // Write start response
             let start_resp = IpcResponse {
                 status: "running".to_string(),
-                event: Some(serde_json::json!({ "event_type": "turn.started", "turn_id": turn_id })),
+                event: Some(
+                    serde_json::json!({ "event_type": "turn.started", "turn_id": turn_id }),
+                ),
                 result: None,
                 error: None,
             };
@@ -211,7 +254,7 @@ async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result
             let mut inner_rx = match runner_task.await? {
                 Ok(rx) => rx,
                 Err(e) => {
-                    pool.release_instance(&provider, inst_lock);
+                    pool.release(instance_id);
                     let fail_resp = IpcResponse {
                         status: "failed".to_string(),
                         event: None,
@@ -229,7 +272,9 @@ async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result
             while let Some(event) = inner_rx.recv().await {
                 if let Some(text) = event.payload.get("text").and_then(|t| t.as_str()) {
                     response_text.push_str(text);
-                } else if let Some(result_text) = event.payload.get("result").and_then(|r| r.as_str()) {
+                } else if let Some(result_text) =
+                    event.payload.get("result").and_then(|r| r.as_str())
+                {
                     response_text.push_str(result_text);
                 }
 
@@ -244,7 +289,7 @@ async fn handle_ipc_client(stream: IpcStream, pool: Arc<InstancePool>) -> Result
                 writer.write_all(resp_str.as_bytes()).await?;
             }
 
-            pool.release_instance(&provider, inst_lock);
+            pool.release(instance_id);
 
             let success_resp = IpcResponse {
                 status: "success".to_string(),

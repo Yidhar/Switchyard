@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 pub enum RuntimeEvent {
     /// Unread callback receipts were injected into the next routed provider-facing turn.
     CallbackReceiptsInjected { provider: String, count: usize },
+    /// GUI/backend pre-flight work started before the canonical turn exists.
+    /// This covers slow steps such as persistent CLI warm-start/resume and peer
+    /// catalog probing, so frontends can show progress instead of waiting for
+    /// the later `CoreTurnStarted` event.
+    TurnPreparing {
+        session_id: Uuid,
+        provider: String,
+        phase: String,
+    },
     /// Core provider turn started.
     CoreTurnStarted { turn_id: Uuid, provider: String },
     /// Core provider execution command resolved.
@@ -25,6 +34,11 @@ pub enum RuntimeEvent {
     CoreItemUpdated {
         turn_id: Uuid,
         provider: String,
+        /// Canonical provider event type, e.g. `item_started`, `item_updated`,
+        /// `item_completed`, or `artifact_ready`. Frontends need this to render
+        /// tool lifecycles consistently instead of treating every live update as
+        /// a generic `item_updated` snapshot.
+        event_type: String,
         text: String,
         payload: Option<serde_json::Value>,
     },
@@ -54,6 +68,9 @@ pub enum RuntimeEvent {
     PeerItemUpdated {
         turn_id: Uuid,
         provider: String,
+        /// Canonical provider event type, e.g. `item_started`, `item_updated`,
+        /// `item_completed`, or `artifact_ready`.
+        event_type: String,
         text: String,
         payload: Option<serde_json::Value>,
     },
@@ -73,6 +90,7 @@ pub enum RuntimeEvent {
     },
     /// A HYARD bridge command surfaced a job snapshot (delegate/status/result/await/cancel).
     HyardJobObserved {
+        turn_id: Uuid,
         source_provider: String,
         observed_at: String,
         job: HyardJobObservation,
@@ -94,5 +112,50 @@ pub enum RuntimeEvent {
         turn_id: Uuid,
         provider: String,
         error: String,
+    },
+    /// A persistent worker (Core or peer) was just registered in the pool.
+    /// Frontend should append it to the session's worker roster.
+    WorkerSpawned {
+        session_id: Uuid,
+        instance_id: Uuid,
+        provider: String,
+        label: Option<String>,
+        /// "core" or "worker" — mirrors `InstanceKind` serialization.
+        kind: String,
+        spawned_at: String,
+    },
+    /// A worker's pool state transitioned. Sent on idle↔busy, retrying flips,
+    /// and any other observable state mutation. UI updates the existing row
+    /// in place.
+    WorkerStateChanged {
+        session_id: Uuid,
+        instance_id: Uuid,
+        state: String,
+        in_flight_turn_id: Option<Uuid>,
+    },
+    /// Supervisor is about to retry a delegation after a mid-turn worker
+    /// death. `attempt` is the 1-indexed retry number; `last_error` describes
+    /// what killed the previous instance. The Core is intentionally NOT
+    /// informed of retries — this event is for the UI's benefit only.
+    WorkerRetrying {
+        session_id: Uuid,
+        /// `None` if the previous spawn attempt itself failed (no instance id
+        /// exists for the corpse).
+        instance_id: Option<Uuid>,
+        provider: String,
+        label: Option<String>,
+        attempt: u32,
+        last_error: String,
+    },
+    /// A worker was removed from the pool. `reason` distinguishes graceful
+    /// shutdown from mid-turn death so the UI can colour appropriately.
+    WorkerTerminated {
+        session_id: Uuid,
+        instance_id: Uuid,
+        provider: String,
+        label: Option<String>,
+        /// One of: `released`, `completed_use_once`, `died_mid_turn`,
+        /// `permanent_death`, `core_reset`, `session_clear`.
+        reason: String,
     },
 }

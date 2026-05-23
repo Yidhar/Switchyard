@@ -1,4 +1,5 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
@@ -19,4 +20,15 @@ pub enum ProviderError {
 
     #[error("unsupported capability: {0}")]
     UnsupportedCapability(String),
+}
+
+/// Returned by [`LiveInstanceRegistry::register`] when an instance with the
+/// same `(provider, session_id, label)` triple already exists. Label-less
+/// instances never conflict.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("label conflict in pool: provider={provider} session={session_id} label={label}")]
+pub struct LabelConflict {
+    pub provider: String,
+    pub session_id: Uuid,
+    pub label: String,
 }

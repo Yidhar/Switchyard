@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc};
@@ -89,7 +89,8 @@ impl LiveInstance for SubprocessLiveInstance {
                     {
                         break;
                     }
-                    let pe = ProviderEvent::new(turn_id, EventType::ItemUpdated, &provider_name, json);
+                    let pe =
+                        ProviderEvent::new(turn_id, EventType::ItemUpdated, &provider_name, json);
                     if event_tx.send(pe).await.is_err() {
                         break;
                     }
@@ -106,8 +107,9 @@ impl LiveInstance for SubprocessLiveInstance {
     }
 
     async fn update_context(&mut self, context: ContextBundle) -> Result<(), ProviderError> {
-        let serialized = serde_json::to_string(&context)
-            .map_err(|e| ProviderError::ExecutionFailed(format!("Failed to serialize context: {e}")))?;
+        let serialized = serde_json::to_string(&context).map_err(|e| {
+            ProviderError::ExecutionFailed(format!("Failed to serialize context: {e}"))
+        })?;
         // Send as context update signal
         self.stdin
             .write_all(format!("__HYARD_CONTEXT_UPDATE__ {}\n", serialized).as_bytes())

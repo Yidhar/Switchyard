@@ -38,6 +38,15 @@ pub struct ProviderEvent {
     pub provider: String,
     pub timestamp: DateTime<Utc>,
     pub payload: serde_json::Value,
+    /// Live-instance origin id, stamped by the WorkerSupervisor for events
+    /// produced by registered workers. `None` for one-shot CLI subprocess
+    /// turns and per-turn FakeProvider events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Uuid>,
+    /// Semantic worker label (typically the Core's delegation request id like
+    /// `claude-project-structure-map`). `None` for unlabelled workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl ProviderEvent {
@@ -54,7 +63,17 @@ impl ProviderEvent {
             provider: provider.into(),
             timestamp: Utc::now(),
             payload,
+            instance_id: None,
+            label: None,
         }
+    }
+
+    /// Stamp this event with its originating worker identity. Returns a new
+    /// event; does not mutate the original.
+    pub fn with_worker_identity(mut self, instance_id: Uuid, label: Option<String>) -> Self {
+        self.instance_id = Some(instance_id);
+        self.label = label;
+        self
     }
 
     pub fn text_message(
@@ -219,16 +238,30 @@ pub fn extract_display_text(payload: &serde_json::Value) -> Option<String> {
         {
             return Some(t.to_string());
         }
-        if let Some(t) = delta.get("delta").and_then(|d2| d2.get("text")).and_then(|v| v.as_str())
+        if let Some(t) = delta
+            .get("delta")
+            .and_then(|d2| d2.get("text"))
+            .and_then(|v| v.as_str())
             && !t.is_empty()
         {
             return Some(t.to_string());
         }
     }
+
+    // Some providers surface raw JSON-RPC notifications as
+    // `{ method, params: { ...actual payload... } }`. Treat `params` as the
+    // canonical body as a final fallback so live forwarding still extracts
+    // assistant text when an adapter does not pre-flatten the envelope.
+    if let Some(params) = payload.get("params")
+        && let Some(t) = extract_display_text(params)
+    {
+        return Some(t);
+    }
     None
 }
 
 pub fn extract_execution_telemetry(payload: &serde_json::Value) -> Option<ExecutionTelemetry> {
+    let payload = normalized_event_body(payload);
     if payload.get("item_type").and_then(|t| t.as_str()) != Some("execution_telemetry") {
         return None;
     }
@@ -237,6 +270,7 @@ pub fn extract_execution_telemetry(payload: &serde_json::Value) -> Option<Execut
 }
 
 pub fn extract_terminal_output(payload: &serde_json::Value) -> Option<TerminalOutput> {
+    let payload = normalized_event_body(payload);
     if payload.get("item_type").and_then(|t| t.as_str()) != Some("terminal_output") {
         return None;
     }
@@ -257,7 +291,70 @@ pub fn extract_terminal_output(payload: &serde_json::Value) -> Option<TerminalOu
     })
 }
 
+/// Returns true for provider reasoning lifecycle payloads that do not contain
+/// any user-visible summary/text/content.
+///
+/// Several providers emit high-frequency `reasoning` item lifecycle updates as
+/// heartbeats before a real summary exists. Treating those as displayable
+/// activity produces empty "reasoning" cards/log lines and can make GUI streams
+/// very expensive. This helper only classifies the no-content case; reasoning
+/// payloads with a real summary still remain available to UIs through the raw
+/// payload/event store.
+pub fn is_empty_reasoning_payload(payload: &serde_json::Value) -> bool {
+    let payload = normalized_event_body(payload);
+    let item = payload.get("item").unwrap_or(payload);
+
+    if payload_item_type(payload, item) != Some("reasoning") {
+        return false;
+    }
+
+    !has_reasoning_display_content(item) && !has_reasoning_display_content(payload)
+}
+
+fn payload_item_type<'a>(
+    payload: &'a serde_json::Value,
+    item: &'a serde_json::Value,
+) -> Option<&'a str> {
+    item.get("type")
+        .and_then(|t| t.as_str())
+        .or_else(|| payload.get("item_type").and_then(|t| t.as_str()))
+}
+
+fn has_reasoning_display_content(value: &serde_json::Value) -> bool {
+    ["summary", "text", "content"]
+        .into_iter()
+        .filter_map(|key| value.get(key))
+        .any(json_has_visible_text)
+        || value
+            .get("delta")
+            .map(has_reasoning_display_content)
+            .unwrap_or(false)
+}
+
+fn json_has_visible_text(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        serde_json::Value::Array(items) => items.iter().any(json_has_visible_text),
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            !matches!(
+                key.as_str(),
+                "type"
+                    | "role"
+                    | "status"
+                    | "id"
+                    | "call_id"
+                    | "tool_call_id"
+                    | "request_id"
+                    | "index"
+                    | "encrypted_content"
+            ) && json_has_visible_text(value)
+        }),
+        _ => false,
+    }
+}
+
 pub fn extract_hyard_job_observation(payload: &serde_json::Value) -> Option<HyardJobObservation> {
+    let payload = normalized_event_body(payload);
     let item = payload.get("item")?;
     if item.get("type").and_then(|t| t.as_str()) != Some("command_execution") {
         return None;
@@ -338,6 +435,12 @@ pub fn extract_activity_summary(payload: &serde_json::Value) -> Option<String> {
         return Some(summary);
     }
 
+    if let Some(params) = payload.get("params")
+        && let Some(summary) = extract_activity_summary(params)
+    {
+        return Some(summary);
+    }
+
     if let Some(msg_type) = payload.get("type").and_then(|t| t.as_str()) {
         match msg_type {
             "thread.started" => return Some("[会话] 已启动".to_string()),
@@ -356,6 +459,7 @@ pub fn extract_activity_summary(payload: &serde_json::Value) -> Option<String> {
                 return Some("[结果] 状态已更新".to_string());
             }
             "rate_limit_event" => return Some("[限额] 已更新".to_string()),
+            "reasoning" => return None,
             _ => {}
         }
     }
@@ -365,28 +469,20 @@ pub fn extract_activity_summary(payload: &serde_json::Value) -> Option<String> {
         .and_then(|item| item.get("type"))
         .and_then(|t| t.as_str())
     {
-        return Some(match item_type {
-            "reasoning" => "[思考] 正在整理推理".to_string(),
-            "tool_call" => "[工具] 正在调用工具".to_string(),
-            "file_change" => "[文件] 正在修改".to_string(),
-            "diff_ready" => "[Diff] 已生成差异".to_string(),
-            "todo_list" => "[待办] 已更新".to_string(),
-            "delegate_request" => "[委托] 已生成请求".to_string(),
-            "delegate_result" => "[委托] 已返回结果".to_string(),
-            "error" => payload
-                .get("item")
-                .and_then(|item| item.get("message"))
-                .and_then(|m| m.as_str())
-                .map(|message| format!("[错误] {}", preview(message, 80)))
-                .unwrap_or_else(|| "[错误]".to_string()),
-            _ => {
-                if let Some(msg_type) = payload.get("type").and_then(|t| t.as_str()) {
-                    format!("[{msg_type}:{item_type}]")
-                } else {
-                    format!("[item:{item_type}]")
-                }
-            }
-        });
+        let item = payload.get("item").unwrap_or(payload);
+        if item_type == "reasoning" {
+            return None;
+        }
+        if let Some(summary) = summarize_item_activity(item_type, item, payload) {
+            return Some(summary);
+        }
+        return Some(
+            if let Some(msg_type) = payload.get("type").and_then(|t| t.as_str()) {
+                format!("[{msg_type}:{item_type}]")
+            } else {
+                format!("[item:{item_type}]")
+            },
+        );
     }
 
     if let Some(msg_type) = payload.get("type").and_then(|t| t.as_str()) {
@@ -400,12 +496,18 @@ pub fn extract_activity_summary(payload: &serde_json::Value) -> Option<String> {
         if item_type == "terminal_output" {
             return None;
         }
+        if item_type == "reasoning" {
+            return None;
+        }
         if item_type == "execution_telemetry" {
             return Some(
                 extract_execution_telemetry(payload)
                     .map(summarize_execution_telemetry)
                     .unwrap_or_else(|| "[执行] 已解析命令".to_string()),
             );
+        }
+        if let Some(summary) = summarize_item_activity(item_type, payload, payload) {
+            return Some(summary);
         }
         return Some(format!("[{item_type}]"));
     }
@@ -416,6 +518,71 @@ pub fn extract_activity_summary(payload: &serde_json::Value) -> Option<String> {
     }
 
     None
+}
+
+fn summarize_item_activity(
+    item_type: &str,
+    item: &serde_json::Value,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let label = item_activity_label(item, payload);
+    let with_label = |base: &str| match label.as_deref() {
+        Some(label) => format!("{base}：{label}"),
+        None => base.to_string(),
+    };
+
+    Some(match item_type {
+        "tool_call" | "tool_use" | "function_call" | "custom_tool_call" | "mcp_tool_call" => {
+            with_label("[工具] 正在调用工具")
+        }
+        "local_shell_call" => with_label("[命令] 正在调用本地 Shell"),
+        "tool_result"
+        | "tool_response"
+        | "function_call_output"
+        | "custom_tool_call_output"
+        | "mcp_tool_call_output" => with_label("[工具] 工具结果已返回"),
+        "local_shell_call_output" => with_label("[命令] 本地 Shell 输出已返回"),
+        "file_change" => "[文件] 正在修改".to_string(),
+        "diff_ready" => "[Diff] 已生成差异".to_string(),
+        "todo_list" => "[待办] 已更新".to_string(),
+        "delegate_request" => "[委托] 已生成请求".to_string(),
+        "delegate_result" => "[委托] 已返回结果".to_string(),
+        "error" => item
+            .get("message")
+            .or_else(|| payload.get("message"))
+            .and_then(|m| m.as_str())
+            .map(|message| format!("[错误] {}", preview(message, 80)))
+            .unwrap_or_else(|| "[错误]".to_string()),
+        _ => return None,
+    })
+}
+
+fn item_activity_label(item: &serde_json::Value, payload: &serde_json::Value) -> Option<String> {
+    [
+        item.get("name"),
+        payload.get("name"),
+        item.get("tool_name"),
+        payload.get("tool_name"),
+        item.get("function"),
+        payload.get("function"),
+        item.get("command"),
+        payload.get("command"),
+        item.get("cmd"),
+        payload.get("cmd"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        if let Some(text) = value.as_str()
+            && !text.trim().is_empty()
+        {
+            return Some(preview(text, 80));
+        }
+        value
+            .get("name")
+            .and_then(|name| name.as_str())
+            .and_then(|text| (!text.trim().is_empty()).then(|| preview(text, 80)))
+    })
 }
 
 fn summarize_execution_telemetry(execution: ExecutionTelemetry) -> String {
@@ -460,6 +627,7 @@ fn preview_path_leaf(path: &str) -> String {
 }
 
 fn extract_command_execution_summary(payload: &serde_json::Value) -> Option<String> {
+    let payload = normalized_event_body(payload);
     let item = payload.get("item")?;
     if item.get("type").and_then(|t| t.as_str()) != Some("command_execution") {
         return None;
@@ -507,6 +675,20 @@ fn extract_command_execution_summary(payload: &serde_json::Value) -> Option<Stri
         ),
         _ => format!("[命令] 状态更新：{command_preview}"),
     })
+}
+
+fn normalized_event_body(payload: &serde_json::Value) -> &serde_json::Value {
+    if payload.get("item_type").is_some()
+        || payload.get("item").is_some()
+        || payload.get("text").is_some()
+        || payload.get("result").is_some()
+        || payload.get("content").is_some()
+        || payload.get("line").is_some()
+        || payload.get("execution").is_some()
+    {
+        return payload;
+    }
+    payload.get("params").unwrap_or(payload)
 }
 
 fn is_hyard_host_command(command: &str) -> bool {
@@ -778,6 +960,39 @@ mod tests {
     }
 
     #[test]
+    fn extract_activity_summary_recognizes_tool_protocol_variants() {
+        let function_call = serde_json::json!({
+            "type": "item.started",
+            "item": { "type": "function_call", "name": "read_file" }
+        });
+        assert_eq!(
+            extract_activity_summary(&function_call).as_deref(),
+            Some("[工具] 正在调用工具：read_file")
+        );
+
+        let tool_output = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "type": "item.completed",
+                "item": { "type": "local_shell_call_output", "command": "cargo check" }
+            }
+        });
+        assert_eq!(
+            extract_activity_summary(&tool_output).as_deref(),
+            Some("[命令] 本地 Shell 输出已返回：cargo check")
+        );
+
+        let top_level_tool_use = serde_json::json!({
+            "item_type": "mcp_tool_call",
+            "tool_name": "apply_patch"
+        });
+        assert_eq!(
+            extract_activity_summary(&top_level_tool_use).as_deref(),
+            Some("[工具] 正在调用工具：apply_patch")
+        );
+    }
+
+    #[test]
     fn display_text_or_summary_falls_back_when_no_text_exists() {
         let event = ProviderEvent::new(
             Uuid::nil(),
@@ -792,6 +1007,78 @@ mod tests {
         assert_eq!(
             event.display_text_or_summary().as_deref(),
             Some("[助手] 正在输出回复")
+        );
+    }
+
+    #[test]
+    fn empty_reasoning_payloads_do_not_create_activity_summaries() {
+        let payload = serde_json::json!({
+            "type": "item.updated",
+            "item": {
+                "type": "reasoning",
+                "summary": [],
+                "content": ""
+            }
+        });
+        let event = ProviderEvent::new(
+            Uuid::nil(),
+            EventType::ItemUpdated,
+            "codex",
+            payload.clone(),
+        );
+
+        assert!(is_empty_reasoning_payload(&payload));
+        assert_eq!(extract_activity_summary(&payload), None);
+        assert_eq!(event.display_text_or_summary(), None);
+    }
+
+    #[test]
+    fn reasoning_payload_with_real_summary_is_not_empty() {
+        let payload = serde_json::json!({
+            "method": "item/updated",
+            "params": {
+                "type": "item.updated",
+                "item": {
+                    "type": "reasoning",
+                    "summary": [
+                        { "type": "summary_text", "text": "checked queue draining path" }
+                    ]
+                }
+            }
+        });
+
+        assert!(!is_empty_reasoning_payload(&payload));
+        assert_eq!(extract_activity_summary(&payload), None);
+    }
+
+    #[test]
+    fn json_rpc_params_payloads_extract_text_and_activity() {
+        let text_payload = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "type": "item.completed",
+                "item": { "type": "agent_message", "text": "final from params" }
+            }
+        });
+        assert_eq!(
+            extract_display_text(&text_payload).as_deref(),
+            Some("final from params")
+        );
+
+        let tool_payload = serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "status": "in_progress",
+                    "command": "cargo check"
+                }
+            }
+        });
+        assert_eq!(
+            extract_activity_summary(&tool_payload).as_deref(),
+            Some("[命令] 开始执行：cargo check")
         );
     }
 
@@ -943,5 +1230,39 @@ mod tests {
             })
         );
         assert_eq!(event.display_text_or_summary(), None);
+    }
+
+    #[test]
+    fn telemetry_and_terminal_extract_from_json_rpc_params() {
+        let execution = sample_execution();
+        let telemetry_payload = serde_json::json!({
+            "method": "item/updated",
+            "params": {
+                "item_type": "execution_telemetry",
+                "execution": execution.clone(),
+            }
+        });
+        assert_eq!(
+            extract_execution_telemetry(&telemetry_payload),
+            Some(execution)
+        );
+
+        let terminal_payload = serde_json::json!({
+            "method": "item/updated",
+            "params": {
+                "item_type": "terminal_output",
+                "line": "hello",
+                "stream": "stdout",
+                "transport": "pty"
+            }
+        });
+        assert_eq!(
+            extract_terminal_output(&terminal_payload),
+            Some(TerminalOutput {
+                line: "hello".to_string(),
+                stream: Some("stdout".to_string()),
+                transport: Some("pty".to_string()),
+            })
+        );
     }
 }

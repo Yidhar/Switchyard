@@ -19,6 +19,7 @@ use switchyard_provider_subprocess::{
 pub(crate) fn build_gemini_invocation(
     extra_args: &[String],
     input: &TurnInput,
+    policy: &ExecutionPolicy,
 ) -> (Vec<String>, String) {
     let prompt = compose_prompt(input);
     // `-p ""` triggers headless mode; actual prompt goes through stdin
@@ -29,8 +30,31 @@ pub(crate) fn build_gemini_invocation(
         "-o".to_string(),
         "stream-json".to_string(),
     ];
+    args.extend(gemini_policy_args(policy));
     args.extend_from_slice(extra_args);
     (args, prompt)
+}
+
+fn gemini_policy_args(policy: &ExecutionPolicy) -> Vec<String> {
+    let mut args = Vec::new();
+    match policy.effective_sandbox_mode() {
+        EffectiveSandboxMode::ReadOnly => {
+            args.push("--approval-mode".to_string());
+            args.push("plan".to_string());
+        }
+        EffectiveSandboxMode::WorkspaceWrite => {
+            args.push("--approval-mode".to_string());
+            args.push("auto_edit".to_string());
+        }
+        EffectiveSandboxMode::DangerFullAccess => {
+            args.push("--yolo".to_string());
+        }
+    }
+    for path in policy.additional_allowed_paths() {
+        args.push("--include-directories".to_string());
+        args.push(path.display().to_string());
+    }
+    args
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -40,6 +64,7 @@ pub async fn run_gemini_turn(
     command: &str,
     extra_args: &[String],
     input: &TurnInput,
+    policy: &ExecutionPolicy,
     timeout_secs: u64,
     env: Option<&std::collections::HashMap<String, String>>,
     cwd: Option<&std::path::Path>,
@@ -51,7 +76,7 @@ pub async fn run_gemini_turn(
         .await
         .ok();
 
-    let (args, prompt) = build_gemini_invocation(extra_args, input);
+    let (args, prompt) = build_gemini_invocation(extra_args, input, policy);
     let plan = build_subprocess_invocation_plan(original_command, command, &args);
 
     let config = SubprocessConfig {
@@ -159,8 +184,10 @@ mod tests {
         let input = TurnInput {
             user_message: "Say hello".to_string(),
             system_prompt: Some("You are helpful".to_string()),
+            attachments: Vec::new(),
         };
-        let (args, prompt) = build_gemini_invocation(&[], &input);
+        let policy = ExecutionPolicy::workspace_write(".");
+        let (args, prompt) = build_gemini_invocation(&[], &input, &policy);
 
         // Args must contain -p with empty string, NOT the prompt content
         assert_eq!(args[0], "-p");
@@ -187,12 +214,47 @@ mod tests {
         let input = TurnInput {
             user_message: "test".to_string(),
             system_prompt: None,
+            attachments: Vec::new(),
         };
-        let extra = vec!["--sandbox".to_string(), "read-only".to_string()];
-        let (args, _) = build_gemini_invocation(&extra, &input);
+        let policy = ExecutionPolicy::workspace_write(".");
+        let extra = vec!["--foo".to_string()];
+        let (args, _) = build_gemini_invocation(&extra, &input, &policy);
 
-        assert_eq!(args.len(), 6); // -p "" -o stream-json --sandbox read-only
-        assert_eq!(args[4], "--sandbox");
-        assert_eq!(args[5], "read-only");
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "",
+                "-o",
+                "stream-json",
+                "--approval-mode",
+                "auto_edit",
+                "--foo"
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini_policy_args_map_modes_and_extra_dirs() {
+        let read_only = ExecutionPolicy::read_only(".");
+        assert_eq!(
+            gemini_policy_args(&read_only),
+            vec!["--approval-mode", "plan"]
+        );
+
+        let workspace = ExecutionPolicy::workspace_write("/repo")
+            .add_allowed_paths(vec![std::path::PathBuf::from("/tmp/cache")]);
+        assert_eq!(
+            gemini_policy_args(&workspace),
+            vec![
+                "--approval-mode",
+                "auto_edit",
+                "--include-directories",
+                "/tmp/cache"
+            ]
+        );
+
+        let danger = ExecutionPolicy::danger_full_access(".");
+        assert_eq!(gemini_policy_args(&danger), vec!["--yolo"]);
     }
 }

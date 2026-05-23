@@ -1,8 +1,34 @@
-mod app_server;
+//! Antigravity CLI (`agy`) adapter.
+//!
+//! Antigravity is Google's designated successor to the Gemini CLI. As of
+//! 2026-05-21 its CLI surface is significantly thinner than Gemini's: there
+//! is no `--output-format`, no `--acp`, no `stream-json`, no `--session-id`
+//! analogue, no `--model`. Headless execution is one-shot plain-text via
+//! `agy -p "<prompt>"`. See `docs/research/CLI_SESSION_SEMANTICS_2026-05-21.md`
+//! for the full capability matrix.
+//!
+//! Implications for this adapter:
+//!
+//! - **No `LiveInstance`** — there is no streaming IPC channel to keep open.
+//!   Each Switchyard turn is a fresh `agy -p` subprocess. `as_persistent`
+//!   returns `None`; the `PersistentProviderProxy` falls through to the
+//!   per-turn execution path.
+//! - **Context lives in the prompt, not in the daemon** — Switchyard's
+//!   canonical store is the source of truth. `compose_prompt` folds prior
+//!   turns / session summary into the user message before each `agy -p`
+//!   invocation, so we don't depend on Antigravity's opaque `.pb` session
+//!   files at `~/.gemini/antigravity-cli/conversations/<uuid>.pb`.
+//! - **Resume path deferred** — Antigravity exposes `-c` (continue most
+//!   recent in cwd) and `--conversation <id>`, but the id is not surfaced by
+//!   the CLI itself (Antigravity issue #7). When that lands, we can add a
+//!   warmpath that reads `~/.gemini/antigravity-cli/cache/last_conversations.json`
+//!   and re-uses the id across Switchyard turns within the same session.
+//!
+//! When upstream ships ACP (issue #31) the adapter can grow a JSON-RPC over
+//! stdio path similar to the Codex `app_server` module.
+
 mod probe;
 mod turn;
-
-pub use app_server::CodexAppServerInstance;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,20 +40,22 @@ use uuid::Uuid;
 use switchyard_provider_api::*;
 use switchyard_provider_subprocess::{effective_timeout_secs, resolve_command};
 
-/// Codex provider adapter. Uses `codex` CLI in headless mode.
-pub struct CodexProvider {
+pub struct AntigravityProvider {
     /// Original configured command as provided by config/defaults.
     pub original_command: String,
-    /// Resolved path/name of the codex command.
+    /// Resolved path/name of the agy command. On Windows this typically
+    /// resolves to `%LOCALAPPDATA%\agy\bin\agy.exe`; on macOS/Linux usually
+    /// `~/.local/bin/agy` placed by the install script.
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub timeout_secs: u64,
-    /// Stores results from start_turn for later finalize_turn.
+    /// Per-turn results stash used by `finalize_turn` to hand back the
+    /// composed `TurnResult` after `start_turn` completes.
     results: Arc<Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
 }
 
-impl CodexProvider {
+impl AntigravityProvider {
     pub fn new(
         command: impl Into<String>,
         args: Vec<String>,
@@ -57,7 +85,7 @@ impl CodexProvider {
 }
 
 #[async_trait]
-impl Provider for CodexProvider {
+impl Provider for AntigravityProvider {
     async fn probe(&self) -> Result<ProbeResult, ProviderError> {
         probe::run_probe(&self.command).await
     }
@@ -72,15 +100,15 @@ impl Provider for CodexProvider {
         cancel: CancellationToken,
     ) -> Result<(), ProviderError> {
         let timeout_secs = effective_timeout_secs(self.timeout_secs, policy.timeout_secs);
-        let result = turn::run_codex_turn(
+        let result = turn::run_antigravity_turn(
             turn_id,
             &self.original_command,
             &self.command,
             &self.args,
             &input,
+            &policy,
             timeout_secs,
             Some(&self.env),
-            &policy,
             Some(&policy.cwd),
             &event_tx,
             cancel,
@@ -102,46 +130,7 @@ impl Provider for CodexProvider {
             .ok_or_else(|| ProviderError::ExecutionFailed(format!("no result for turn {turn_id}")))
     }
 
-    fn as_persistent(&self) -> Option<&dyn PersistentProvider> {
-        Some(self)
-    }
-}
-
-#[async_trait]
-impl PersistentProvider for CodexProvider {
-    async fn start_persistent_instance(
-        &self,
-        cwd: std::path::PathBuf,
-        envs: HashMap<String, String>,
-    ) -> Result<Box<dyn LiveInstance>, ProviderError> {
-        // Persistent path is now Codex's official JSON-RPC IPC daemon
-        // (`codex app-server`). Replaces the old SubprocessLiveInstance
-        // sentinel protocol which never actually worked against real codex.
-        let instance =
-            CodexAppServerInstance::spawn(&self.command, &self.args, envs, Some(&cwd)).await?;
-        Ok(Box::new(instance))
-    }
-
-    async fn start_persistent_instance_resumed(
-        &self,
-        cwd: std::path::PathBuf,
-        envs: HashMap<String, String>,
-        resume_token: Option<String>,
-    ) -> Result<Box<dyn LiveInstance>, ProviderError> {
-        // Codex's `app-server` JSON-RPC layer exposes `thread/resume {threadId}`
-        // for warm continuation. If `resume_token` is None we land on a
-        // fresh `thread/start`. If Some but the daemon refuses (token
-        // expired, format change), `spawn_with_resume` transparently falls
-        // back to `thread/start` so the call never fails just because the
-        // token went stale.
-        let instance = CodexAppServerInstance::spawn_with_resume(
-            &self.command,
-            &self.args,
-            envs,
-            Some(&cwd),
-            resume_token.as_deref(),
-        )
-        .await?;
-        Ok(Box::new(instance))
-    }
+    // Deliberately no `as_persistent` override. Antigravity has no streaming
+    // IPC verb today (no `stream-json`, no `--acp`). The default `None` makes
+    // `PersistentProviderProxy` fall through to per-turn subprocess execution.
 }

@@ -18,6 +18,7 @@ pub async fn run_codex_turn(
     input: &TurnInput,
     timeout_secs: u64,
     env: Option<&std::collections::HashMap<String, String>>,
+    policy: &ExecutionPolicy,
     cwd: Option<&std::path::Path>,
     event_tx: &mpsc::Sender<ProviderEvent>,
     cancel: CancellationToken,
@@ -28,6 +29,11 @@ pub async fn run_codex_turn(
         .ok();
 
     let mut args: Vec<String> = vec!["exec".to_string(), "--json".to_string()];
+    args.extend(codex_policy_args(policy));
+    for attachment in &input.attachments {
+        args.push("--image".to_string());
+        args.push(attachment.path.display().to_string());
+    }
     args.extend_from_slice(extra_args);
     args.push("-".to_string());
     let plan = build_subprocess_invocation_plan(original_command, command, &args);
@@ -154,4 +160,50 @@ pub async fn run_codex_turn(
     };
 
     Ok(build_turn_result(response_text, &output, "codex"))
+}
+
+fn codex_policy_args(policy: &ExecutionPolicy) -> Vec<String> {
+    let mut args = Vec::new();
+    let mode = match policy.effective_sandbox_mode() {
+        EffectiveSandboxMode::ReadOnly => "read-only",
+        EffectiveSandboxMode::WorkspaceWrite => "workspace-write",
+        EffectiveSandboxMode::DangerFullAccess => "danger-full-access",
+    };
+    args.push("--sandbox".to_string());
+    args.push(mode.to_string());
+
+    for path in policy.additional_allowed_paths() {
+        args.push("--add-dir".to_string());
+        args.push(path.display().to_string());
+    }
+
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn codex_policy_args_map_effective_modes_and_extra_dirs() {
+        let read_only = ExecutionPolicy::read_only("/repo");
+        assert_eq!(
+            codex_policy_args(&read_only),
+            vec!["--sandbox", "read-only"]
+        );
+
+        let workspace =
+            ExecutionPolicy::workspace_write("/repo").add_allowed_paths([PathBuf::from("/shared")]);
+        assert_eq!(
+            codex_policy_args(&workspace),
+            vec!["--sandbox", "workspace-write", "--add-dir", "/shared"]
+        );
+
+        let danger = ExecutionPolicy::danger_full_access("/repo");
+        assert_eq!(
+            codex_policy_args(&danger),
+            vec!["--sandbox", "danger-full-access"]
+        );
+    }
 }

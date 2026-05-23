@@ -114,11 +114,12 @@ pub fn check_auth_error(stdout: &str, stderr: &str, provider_name: &str) -> Opti
 /// wraps it with section markers so the model sees structured context.
 /// Without system_prompt, passes user_message unchanged.
 pub fn compose_prompt(input: &switchyard_provider_api::TurnInput) -> String {
+    let user_message = input.user_message_with_attachment_references();
     match &input.system_prompt {
         Some(sp) if !sp.is_empty() => {
-            format!("[Context]\n{sp}\n\n[Task]\n{}", input.user_message)
+            format!("[Context]\n{sp}\n\n[Task]\n{user_message}")
         }
-        _ => input.user_message.clone(),
+        _ => user_message,
     }
 }
 

@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use switchyard_config::SwitchyardConfig;
 use switchyard_provider_api::{
-    DelegateRequest, PeerCatalog, Provider, extract_sentinel_blocks, render_delegate_result_block,
-    strip_sentinel_blocks, LiveInstanceRegistry,
+    DelegateRequest, ExecutionPolicy, InputAttachment, LiveInstanceRegistry, PeerCatalog, Provider,
+    TurnInput, extract_sentinel_blocks, render_delegate_result_block, strip_sentinel_blocks,
 };
 use switchyard_session::{InboxDeliveryMode, InboxEntry, Session, TurnStatus};
 use switchyard_store::CanonicalStore;
@@ -309,7 +309,7 @@ pub async fn run_routed_turn<S: CanonicalStore + ?Sized>(
     core_provider: &dyn Provider,
     peer_catalog: &PeerCatalog,
     resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
-    registry: Option<&dyn LiveInstanceRegistry>,
+    registry: Option<std::sync::Arc<dyn LiveInstanceRegistry>>,
     user_message: String,
     cwd: PathBuf,
 ) -> Result<RoutedTurnOutput, CoreError> {
@@ -335,12 +335,42 @@ pub async fn run_routed_turn_with_archive(
     core_provider: &dyn Provider,
     peer_catalog: &PeerCatalog,
     resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
-    registry: Option<&dyn LiveInstanceRegistry>,
+    registry: Option<std::sync::Arc<dyn LiveInstanceRegistry>>,
     user_message: String,
     cwd: PathBuf,
     artifact_dir: Option<&std::path::Path>,
 ) -> Result<RoutedTurnOutput, CoreError> {
-    run_routed_turn_observable(
+    let policy = ExecutionPolicy::workspace_write(cwd.clone());
+    run_routed_turn_with_archive_and_policy(
+        store,
+        session,
+        core_provider,
+        peer_catalog,
+        resolve_peer,
+        registry,
+        user_message,
+        cwd,
+        artifact_dir,
+        policy,
+    )
+    .await
+}
+
+/// Routed turn with optional raw output archiving and explicit sandbox policy.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_routed_turn_with_archive_and_policy(
+    store: &mut (impl CanonicalStore + ?Sized),
+    session: &mut Session,
+    core_provider: &dyn Provider,
+    peer_catalog: &PeerCatalog,
+    resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
+    registry: Option<std::sync::Arc<dyn LiveInstanceRegistry>>,
+    user_message: String,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    policy: ExecutionPolicy,
+) -> Result<RoutedTurnOutput, CoreError> {
+    run_routed_turn_observable_with_policy(
         store,
         session,
         core_provider,
@@ -352,6 +382,7 @@ pub async fn run_routed_turn_with_archive(
         artifact_dir,
         None,
         switchyard_provider_api::CancellationToken::new(),
+        policy,
     )
     .await
 }
@@ -365,16 +396,96 @@ pub async fn run_routed_turn_observable(
     core_provider: &dyn Provider,
     peer_catalog: &PeerCatalog,
     resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
-    registry: Option<&dyn LiveInstanceRegistry>,
+    registry: Option<std::sync::Arc<dyn LiveInstanceRegistry>>,
     user_message: String,
     cwd: PathBuf,
     artifact_dir: Option<&std::path::Path>,
     runtime_tx: Option<&tokio::sync::mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
     cancel: switchyard_provider_api::CancellationToken,
 ) -> Result<RoutedTurnOutput, CoreError> {
+    let policy = ExecutionPolicy::workspace_write(cwd.clone());
+    run_routed_turn_observable_with_policy(
+        store,
+        session,
+        core_provider,
+        peer_catalog,
+        resolve_peer,
+        registry,
+        user_message,
+        cwd,
+        artifact_dir,
+        runtime_tx,
+        cancel,
+        policy,
+    )
+    .await
+}
+
+/// Full observable routed turn with explicit sandbox policy. Emits RuntimeEvent
+/// through `runtime_tx` so the TUI can display live state without polling the
+/// store.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_routed_turn_observable_with_policy(
+    store: &mut (impl CanonicalStore + ?Sized),
+    session: &mut Session,
+    core_provider: &dyn Provider,
+    peer_catalog: &PeerCatalog,
+    resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
+    registry: Option<std::sync::Arc<dyn LiveInstanceRegistry>>,
+    user_message: String,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    runtime_tx: Option<&tokio::sync::mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    cancel: switchyard_provider_api::CancellationToken,
+    base_policy: ExecutionPolicy,
+) -> Result<RoutedTurnOutput, CoreError> {
+    run_routed_turn_observable_with_policy_and_attachments(
+        store,
+        session,
+        core_provider,
+        peer_catalog,
+        resolve_peer,
+        registry,
+        user_message,
+        Vec::new(),
+        cwd,
+        artifact_dir,
+        runtime_tx,
+        cancel,
+        base_policy,
+    )
+    .await
+}
+
+/// Full observable routed turn with explicit sandbox policy and local
+/// attachments. Attachments are delivered to the first Core provider turn and
+/// are also rendered as path references in the stored user message so history
+/// and non-native providers retain useful context.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_routed_turn_observable_with_policy_and_attachments(
+    store: &mut (impl CanonicalStore + ?Sized),
+    session: &mut Session,
+    core_provider: &dyn Provider,
+    peer_catalog: &PeerCatalog,
+    resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
+    registry: Option<std::sync::Arc<dyn LiveInstanceRegistry>>,
+    user_message: String,
+    attachments: Vec<InputAttachment>,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    runtime_tx: Option<&tokio::sync::mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    cancel: switchyard_provider_api::CancellationToken,
+    base_policy: ExecutionPolicy,
+) -> Result<RoutedTurnOutput, CoreError> {
     let mut last_output: Option<TurnOutput> = None;
     let mut delegated = false;
     let mut inject_context: Option<String> = None;
+    let user_turn_input = TurnInput {
+        user_message,
+        system_prompt: None,
+        attachments: attachments.clone(),
+    };
+    let stored_user_message = user_turn_input.user_message_with_attachment_references();
     let continuation_hint = build_hyard_continuation_hint(&cwd);
     let session_hint = build_hyard_session_hint(session.session_id);
     let mut callback_receipts = collect_callback_receipts_for_injection(store, session.session_id)?;
@@ -385,13 +496,37 @@ pub async fn run_routed_turn_observable(
         callback_hint.as_deref(),
     ]);
 
+    // Resolve config once for retry policy + per-provider env lookup. Helpers
+    // that resolve their own copy (e.g. build_hyard_continuation_hint) keep
+    // doing so for now — duplication is cheap, refactoring is out of scope.
+    let routed_config = SwitchyardConfig::resolve(&cwd).unwrap_or_default();
+    let retry_policy = Some(switchyard_orchestrator::RetryPolicy::from_config(
+        &routed_config.orchestrator.worker_retry,
+    ));
+    let provider_envs: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = routed_config
+        .providers
+        .iter()
+        .map(|(name, pc)| (name.clone(), pc.env.clone()))
+        .collect();
+
     for iteration in 0..MAX_ROUTER_LOOPS {
         let message = if iteration == 0 {
             // First iteration: user message + peer catalog + optional HYARD continuity state.
-            build_initial_router_message(&user_message, peer_catalog, initial_hint.as_deref())
+            build_initial_router_message(
+                &stored_user_message,
+                peer_catalog,
+                initial_hint.as_deref(),
+            )
         } else if let Some(ref ctx) = inject_context {
             // Finalization: original task + delegate result + explicit instruction
-            build_finalization_router_message(&user_message, ctx, continuation_hint.as_deref())
+            build_finalization_router_message(
+                &stored_user_message,
+                ctx,
+                continuation_hint.as_deref(),
+            )
         } else {
             break;
         };
@@ -407,7 +542,8 @@ pub async fn run_routed_turn_observable(
             return Err(CoreError::Runner("cancelled by user".to_string()));
         }
 
-        if iteration == 0 && !callback_receipts.is_empty()
+        if iteration == 0
+            && !callback_receipts.is_empty()
             && let Some(tx) = runtime_tx
         {
             tx.send(
@@ -421,21 +557,23 @@ pub async fn run_routed_turn_observable(
         }
 
         let output = if iteration == 0 {
-            crate::turn_runner::run_turn_phased_with_messages(
+            crate::turn_runner::run_turn_phased_with_messages_policy_and_attachments(
                 store,
                 session,
                 core_provider,
-                user_message.clone(),
+                stored_user_message.clone(),
                 message,
                 cwd.clone(),
                 artifact_dir,
                 runtime_tx,
                 phase,
                 cancel.clone(),
+                attachments.clone(),
+                base_policy.clone(),
             )
             .await
         } else {
-            crate::turn_runner::run_turn_phased(
+            crate::turn_runner::run_turn_phased_with_policy(
                 store,
                 session,
                 core_provider,
@@ -445,6 +583,7 @@ pub async fn run_routed_turn_observable(
                 runtime_tx,
                 phase,
                 cancel.clone(),
+                base_policy.clone(),
             )
             .await
         };
@@ -505,30 +644,17 @@ pub async fn run_routed_turn_observable(
                 }
             }
 
-            if let Some(r) = registry {
-                let config = SwitchyardConfig::resolve(&cwd).unwrap_or_default();
-                for task in &request.requests {
-                    if !r.has_live_instance(&task.provider) {
-                        if let Some(peer_p) = resolve_peer(&task.provider) {
-                            if let Some(persistent) = peer_p.as_persistent() {
-                                let env = config
-                                    .providers
-                                    .get(&task.provider)
-                                    .map(|c| c.env.clone())
-                                    .unwrap_or_default();
-                                if let Ok(inst) = persistent.start_persistent_instance(env).await {
-                                    r.register_instance(&task.provider, inst);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Slice 4: peer pre-spawning moved into WorkerSupervisor, which is
+            // invoked by execute_delegate per task. Router no longer pre-pops
+            // workers — leaving the legacy block out also avoids the
+            // LabelConflict that double-registration would cause.
+            let _ = registry.as_ref();
 
             let mut all_resolved = true;
             for task in &request.requests {
                 let has_registry_instance = registry
-                    .map(|r| r.has_live_instance(&task.provider))
+                    .as_ref()
+                    .map(|r| r.has_live_instance(&task.provider, session.session_id))
                     .unwrap_or(false);
                 let peer = resolve_peer(&task.provider);
                 if peer.is_none() && !has_registry_instance {
@@ -547,7 +673,22 @@ pub async fn run_routed_turn_observable(
             // Build observer to forward peer events as RuntimeEvents
             let observer: Option<Box<switchyard_orchestrator::PeerEventObserver>> =
                 runtime_tx.map(|tx| {
+                    // The peer observer is a synchronous callback invoked while
+                    // orchestrator drains provider events. Use an unbounded
+                    // in-process hop here, then await the real runtime sender in
+                    // one ordered forwarding task. This avoids silent
+                    // `try_send` drops without blocking the orchestrator thread.
+                    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<
+                        crate::runtime_events::RuntimeEvent,
+                    >();
                     let tx = tx.clone();
+                    tokio::spawn(async move {
+                        while let Some(evt) = live_rx.recv().await {
+                            if tx.send(evt).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
                     Box::new(move |pe: &switchyard_provider_api::ProviderEvent| {
                         let peer = pe.provider.clone();
                         let event = if let Some(execution) =
@@ -564,6 +705,7 @@ pub async fn run_routed_turn_observable(
                             switchyard_provider_api::extract_hyard_job_observation(&pe.payload)
                         {
                             Some(crate::runtime_events::RuntimeEvent::HyardJobObserved {
+                                turn_id: pe.turn_id,
                                 source_provider: pe.provider.clone(),
                                 observed_at: pe.timestamp.to_rfc3339(),
                                 job,
@@ -585,15 +727,24 @@ pub async fn run_routed_turn_observable(
                                         provider: peer.clone(),
                                     })
                                 }
-                                switchyard_provider_api::EventType::ItemUpdated => {
-                                    pe.display_text_or_summary().map(|text| {
-                                        crate::runtime_events::RuntimeEvent::PeerItemUpdated {
+                                switchyard_provider_api::EventType::ItemStarted
+                                | switchyard_provider_api::EventType::ItemUpdated
+                                | switchyard_provider_api::EventType::ItemCompleted
+                                | switchyard_provider_api::EventType::ArtifactReady => {
+                                    if switchyard_provider_api::is_empty_reasoning_payload(
+                                        &pe.payload,
+                                    ) {
+                                        None
+                                    } else {
+                                        let item_text = pe.display_text_or_summary();
+                                        Some(crate::runtime_events::RuntimeEvent::PeerItemUpdated {
                                             turn_id: pe.turn_id,
                                             provider: peer.clone(),
-                                            text,
+                                            event_type: pe.event_type.to_string(),
+                                            text: item_text.unwrap_or_default(),
                                             payload: Some(pe.payload.clone()),
-                                        }
-                                    })
+                                        })
+                                    }
                                 }
                                 switchyard_provider_api::EventType::TurnCompleted => {
                                     Some(crate::runtime_events::RuntimeEvent::PeerOutputCompleted {
@@ -605,20 +756,108 @@ pub async fn run_routed_turn_observable(
                             }
                         };
                         if let Some(evt) = event {
-                            tx.try_send(evt).ok();
+                            live_tx.send(evt).ok();
                         }
                     }) as Box<switchyard_orchestrator::PeerEventObserver>
                 });
             let obs_ref = observer.as_deref();
 
-            // Execute delegate through orchestrator
+            // Wire the supervisor's lifecycle observer through the existing
+            // runtime_tx so the GUI/TUI can drop its polling and react to
+            // worker spawn/state/retry/terminate events in real time.
+            let supervisor_observer: Option<
+                std::sync::Arc<switchyard_orchestrator::supervisor::SupervisorObserver>,
+            > = runtime_tx.map(|tx| {
+                let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<
+                    crate::runtime_events::RuntimeEvent,
+                >();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    while let Some(evt) = live_rx.recv().await {
+                        if tx.send(evt).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                std::sync::Arc::new(
+                    move |event: switchyard_orchestrator::supervisor::SupervisorLifecycleEvent| {
+                        let runtime_event = match event {
+                            switchyard_orchestrator::supervisor::SupervisorLifecycleEvent::Spawned {
+                                session_id,
+                                instance_id,
+                                provider,
+                                label,
+                                kind,
+                                spawned_at,
+                            } => crate::runtime_events::RuntimeEvent::WorkerSpawned {
+                                session_id,
+                                instance_id,
+                                provider,
+                                label,
+                                kind,
+                                spawned_at,
+                            },
+                            switchyard_orchestrator::supervisor::SupervisorLifecycleEvent::StateChanged {
+                                session_id,
+                                instance_id,
+                                state,
+                                in_flight_turn_id,
+                            } => crate::runtime_events::RuntimeEvent::WorkerStateChanged {
+                                session_id,
+                                instance_id,
+                                state,
+                                in_flight_turn_id,
+                            },
+                            switchyard_orchestrator::supervisor::SupervisorLifecycleEvent::Retrying {
+                                session_id,
+                                instance_id,
+                                provider,
+                                label,
+                                attempt,
+                                last_error,
+                            } => crate::runtime_events::RuntimeEvent::WorkerRetrying {
+                                session_id,
+                                instance_id,
+                                provider,
+                                label,
+                                attempt,
+                                last_error,
+                            },
+                            switchyard_orchestrator::supervisor::SupervisorLifecycleEvent::Terminated {
+                                session_id,
+                                instance_id,
+                                provider,
+                                label,
+                                reason,
+                            } => crate::runtime_events::RuntimeEvent::WorkerTerminated {
+                                session_id,
+                                instance_id,
+                                provider,
+                                label,
+                                reason,
+                            },
+                        };
+                        let _ = live_tx.send(runtime_event);
+                    },
+                )
+                    as std::sync::Arc<
+                        switchyard_orchestrator::supervisor::SupervisorObserver,
+                    >
+            });
+
+            // Execute delegate through orchestrator. retry_policy + per-
+            // provider env are derived from SwitchyardConfig at the top of
+            // this function so each iteration shares the same view.
             match switchyard_orchestrator::execute_delegate(
                 &request,
                 session,
                 store,
                 peer_catalog,
                 resolve_peer,
-                registry,
+                registry.clone(),
+                retry_policy.clone(),
+                provider_envs.clone(),
+                supervisor_observer,
                 core_turn_id,
                 obs_ref,
                 cancel.clone(),
