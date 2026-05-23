@@ -3,7 +3,132 @@ import { Terminal } from 'lucide-react';
 import type { Turn } from '../../types';
 import { ToolCard } from './ToolCard';
 
-export function renderMessageBody(text: string | null, style?: React.CSSProperties) {
+/// Heuristic: does this inline-code content look enough like a file
+/// path that the Canvas should offer to open it?
+/// We accept anything containing a slash AND a known code extension,
+/// or a bare filename like `auth.ts` whose extension is recognised.
+/// Strings with whitespace / parens / semicolons are rejected to avoid
+/// turning code fragments (like `if (x)`) into "click to open".
+const CODE_EXTENSIONS = [
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
+  'rs', 'py', 'go', 'java', 'kt', 'kts',
+  'rb', 'php', 'swift', 'cs',
+  'c', 'h', 'cpp', 'cc', 'cxx', 'hpp', 'hh',
+  'json', 'toml', 'yaml', 'yml',
+  'md', 'markdown',
+  'html', 'htm', 'css', 'scss', 'sass',
+  'sh', 'bash', 'zsh', 'ps1',
+  'sql', 'xml', 'graphql',
+];
+
+const FILE_REFERENCE_LEADING_PUNCT_RE = /^[<([{"'“‘]+/;
+const FILE_REFERENCE_TRAILING_PUNCT_RE = /[>\])}"'“”‘’.,;:!?]+$/;
+
+export function normalizeFileReferenceForOpen(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^file:\/\//i, '')
+    .replace(FILE_REFERENCE_LEADING_PUNCT_RE, '')
+    .replace(FILE_REFERENCE_TRAILING_PUNCT_RE, '')
+    .replace(/#L\d+(?:-L?\d+)?$/i, '')
+    .replace(/:\d+(?::\d+)?$/, '');
+}
+
+export function looksLikeFilePath(s: string): boolean {
+  const normalized = normalizeFileReferenceForOpen(s);
+  if (!normalized || normalized.length < 3 || normalized.length > 260) return false;
+  if (/^https?:\/\//i.test(normalized)) return false;
+  if (/[\s(){}[\];,]/.test(normalized)) return false;
+  const hasSlash = normalized.includes('/') || normalized.includes('\\');
+  const dotIdx = normalized.lastIndexOf('.');
+  const ext = dotIdx > 0 && dotIdx < normalized.length - 1
+    ? normalized.slice(dotIdx + 1).toLowerCase()
+    : '';
+  const knownExt = !!ext && CODE_EXTENSIONS.includes(ext);
+  return hasSlash || knownExt;
+}
+
+function renderFileReference(
+  displayText: string,
+  openPath: string,
+  key: React.Key,
+  asCode = false,
+  onOpenFile?: (path: string) => void,
+): React.ReactNode {
+  const title = `Open ${openPath} in Canvas`;
+  const handleClick = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onOpenFile?.(openPath);
+  };
+  if (asCode) {
+    return (
+      <code
+        key={key}
+        className="inline-file-reference inline-file-reference-code"
+        onClick={handleClick}
+        title={title}
+      >
+        {displayText}
+      </code>
+    );
+  }
+  return (
+    <button
+      key={key}
+      type="button"
+      className="inline-file-reference"
+      onClick={handleClick}
+      title={title}
+    >
+      {displayText}
+    </button>
+  );
+}
+
+function renderPlainTextWithFileReferences(
+  text: string,
+  keyPrefix: string,
+  onOpenFile?: (path: string) => void,
+): React.ReactNode[] {
+  if (!onOpenFile || !text) return [text];
+
+  return text.split(/(\s+)/).map((token, tokenIdx) => {
+    if (!token || /^\s+$/.test(token)) return token;
+
+    const leading = token.match(FILE_REFERENCE_LEADING_PUNCT_RE)?.[0] ?? '';
+    const withoutLeading = token.slice(leading.length);
+    const trailing = withoutLeading.match(FILE_REFERENCE_TRAILING_PUNCT_RE)?.[0] ?? '';
+    const candidate = withoutLeading.slice(
+      0,
+      trailing ? withoutLeading.length - trailing.length : withoutLeading.length,
+    );
+    const openPath = normalizeFileReferenceForOpen(candidate);
+    if (!looksLikeFilePath(openPath)) return token;
+
+    return (
+      <React.Fragment key={`${keyPrefix}-file-${tokenIdx}`}>
+        {leading}
+        {renderFileReference(candidate, openPath, 'ref', false, onOpenFile)}
+        {trailing}
+      </React.Fragment>
+    );
+  });
+}
+
+export function renderMessageBody(
+  text: string | null,
+  style?: React.CSSProperties,
+  onOpenFile?: (path: string) => void,
+  // `onProposeForCanvas` was an older affordance that copied AI chat
+  // code blocks into the Canvas as a "proposed change" for the user to
+  // apply. That direction was wrong — the AI applies changes itself
+  // via Codex/Claude tool calls, and Canvas surfaces the resulting
+  // unified diff via the PostToolUse-hook capture pipeline. The
+  // parameter is kept in the signature for callsite compatibility but
+  // ignored.
+  _onProposeForCanvas?: (path: string, content: string) => void,
+) {
   if (!text) return null;
 
   // Check if it contains a delegate JSON block
@@ -92,25 +217,35 @@ export function renderMessageBody(text: string | null, style?: React.CSSProperti
     <div className="message-body" style={style}>
       {parts.map((part, idx) => {
         if (part.startsWith('```') && part.endsWith('```')) {
-          // It's a code block
-          const match = part.match(/^```(\w*)\n?([\s\S]*?)```$/);
-          const language = match ? match[1] : '';
+          // Renders a plain code block. We no longer offer an
+          // "Apply to Canvas" affordance on chat code blocks — the
+          // AI applies its own changes via Codex/Claude tools, and
+          // Canvas surfaces the resulting unified diff automatically.
+          const match = part.match(/^```([^\n]*)\n?([\s\S]*?)```$/);
+          const infoString = match ? match[1].trim() : '';
+          const language = infoString.split(/\s+/)[0] ?? '';
           const codeContent = match ? match[2] : part.slice(3, -3);
-          
+
           return (
-            <div key={idx} className="code-block-container" style={{ margin: '8px 0', position: 'relative' }}>
+            <div
+              key={idx}
+              className="code-block-container"
+              style={{ margin: '8px 0', position: 'relative' }}
+            >
               {language && (
-                <div style={{
-                  position: 'absolute',
-                  top: '8px',
-                  right: '12px',
-                  fontSize: '11px',
-                  color: 'var(--text-muted)',
-                  textTransform: 'uppercase',
-                  fontWeight: 'bold',
-                  letterSpacing: '0.5px',
-                  userSelect: 'none'
-                }}>
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 8,
+                    right: 12,
+                    fontSize: 11,
+                    color: 'var(--text-muted)',
+                    textTransform: 'uppercase',
+                    fontWeight: 'bold',
+                    letterSpacing: '0.5px',
+                    userSelect: 'none',
+                  }}
+                >
                   {language}
                 </div>
               )}
@@ -126,11 +261,21 @@ export function renderMessageBody(text: string | null, style?: React.CSSProperti
             <span key={idx}>
               {inlineParts.map((subPart, subIdx) => {
                 if (subPart.startsWith('`') && subPart.endsWith('`')) {
-                  return (
-                    <code key={subIdx}>
-                      {subPart.slice(1, -1)}
-                    </code>
-                  );
+                  const codeText = subPart.slice(1, -1);
+                  // When the inline-code looks like a file path AND we
+                  // have a Canvas open-file handler in scope, render it
+                  // as a clickable link that opens a tab. Otherwise
+                  // render the plain `<code>` element.
+                  if (onOpenFile && looksLikeFilePath(codeText)) {
+                    return renderFileReference(
+                      codeText,
+                      normalizeFileReferenceForOpen(codeText),
+                      subIdx,
+                      true,
+                      onOpenFile,
+                    );
+                  }
+                  return <code key={subIdx}>{codeText}</code>;
                 }
 
                 // Check for bold parts
@@ -139,11 +284,19 @@ export function renderMessageBody(text: string | null, style?: React.CSSProperti
                   if (boldPart.startsWith('**') && boldPart.endsWith('**')) {
                     return (
                       <strong key={boldIdx}>
-                        {boldPart.slice(2, -2)}
+                        {renderPlainTextWithFileReferences(
+                          boldPart.slice(2, -2),
+                          `${idx}-${subIdx}-${boldIdx}-strong`,
+                          onOpenFile,
+                        )}
                       </strong>
                     );
                   }
-                  return boldPart;
+                  return renderPlainTextWithFileReferences(
+                    boldPart,
+                    `${idx}-${subIdx}-${boldIdx}`,
+                    onOpenFile,
+                  );
                 });
               })}
             </span>
@@ -173,27 +326,329 @@ export function isSystemStatusText(text: string): boolean {
   return false;
 }
 
+type ToolStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+interface ToolDisplay {
+  id: string;
+  name: string;
+  input: any;
+  status: ToolStatus;
+  output: any;
+}
+
+const CALL_ITEM_TYPES = new Set([
+  'tool_use',
+  'tool_call',
+  'function_call',
+  'custom_tool_call',
+  'mcp_tool_call',
+  'local_shell_call',
+]);
+
+const RESULT_ITEM_TYPES = new Set([
+  'tool_result',
+  'tool_response',
+  'function_call_output',
+  'custom_tool_call_output',
+  'mcp_tool_call_output',
+  'local_shell_call_output',
+]);
+
+const PROVIDER_ITEM_EVENT_TYPES = new Set([
+  'item_started',
+  'item_updated',
+  'item_completed',
+  'artifact_ready',
+]);
+
+function firstPresent<T = any>(...values: T[]): T | undefined {
+  return values.find((value) => value !== undefined && value !== null && !(typeof value === 'string' && value.length === 0));
+}
+
+function hasMeaningfulDisplayValue(value: any): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (Array.isArray(value)) return value.some(hasMeaningfulDisplayValue);
+  if (typeof value === 'object') {
+    return Object.entries(value).some(([key, nested]) => {
+      if (['type', 'role', 'status', 'id', 'index', 'encrypted_content'].includes(key)) {
+        return false;
+      }
+      return hasMeaningfulDisplayValue(nested);
+    });
+  }
+  return false;
+}
+
+function firstMeaningful<T = any>(...values: T[]): T | undefined {
+  return values.find(hasMeaningfulDisplayValue);
+}
+
+function asString(value: any): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return typeof value === 'string' ? value : String(value);
+}
+
+function normalizeProviderEventType(value: any): string {
+  const text = asString(value)?.trim();
+  if (!text) return '';
+  return text
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[./\s-]+/g, '_')
+    .toLowerCase();
+}
+
+function itemTypeFromLooseValue(value: any): string | undefined {
+  const text = asString(value);
+  if (!text) return undefined;
+  // Provider protocol envelopes often use values such as `item.started`,
+  // `item/started`, or `turn.completed` in `payload.type`. Those are lifecycle
+  // markers, not renderable item kinds. Treat slash/dot values as protocol
+  // kinds unless they came from an actual nested `item.type`.
+  return text.includes('.') || text.includes('/') ? undefined : text;
+}
+
+function executionCommand(execution: any): string | undefined {
+  return asString(firstPresent(
+    execution?.actual_display,
+    execution?.actual_command,
+    execution?.resolved_command,
+    execution?.original_command,
+    execution?.command,
+  ));
+}
+
+function commandArgsSuffix(args: any): string {
+  if (args === undefined || args === null) return '';
+  if (Array.isArray(args)) return args.length > 0 ? ` ${args.join(' ')}` : '';
+  const text = String(args);
+  return text ? ` ${text}` : '';
+}
+
+function getPayloadItem(payload: any): any {
+  return (
+    payload?.item ||
+    payload?.params?.item ||
+    payload?.event?.item ||
+    payload?.msg?.item ||
+    payload?.message?.item ||
+    payload?.data?.item ||
+    payload?.params ||
+    payload?.event ||
+    payload?.msg ||
+    payload ||
+    {}
+  );
+}
+
+function getItemType(payload: any, item: any): string {
+  return (
+    asString(payload?.item_type) ||
+    asString(payload?.params?.item_type) ||
+    itemTypeFromLooseValue(item?.type) ||
+    itemTypeFromLooseValue(payload?.params?.type) ||
+    itemTypeFromLooseValue(payload?.type) ||
+    ''
+  );
+}
+
+function getProtocolKind(payload: any): string {
+  return asString(payload?.method) || asString(payload?.params?.method) || asString(payload?.type) || '';
+}
+
+function isProviderItemEvent(event: any): boolean {
+  return PROVIDER_ITEM_EVENT_TYPES.has(normalizeProviderEventType(event?.event_type));
+}
+
+function normalizeStatus(payload: any, item: any, eventType?: string): ToolStatus {
+  const lifecycle = normalizeProviderEventType(eventType);
+  const protocol = [getProtocolKind(payload), lifecycle]
+    .join('.')
+    .toLowerCase()
+    .replace(/\//g, '.');
+  const raw = asString(firstPresent(
+    item?.status,
+    payload?.status,
+    payload?.decision?.decision,
+    payload?.decision,
+  ))?.toLowerCase();
+
+  if (raw) {
+    if (['failed', 'failure', 'error', 'errored', 'rejected', 'deny', 'denied'].includes(raw)) return 'failed';
+    if (['cancelled', 'canceled', 'aborted', 'skipped'].includes(raw)) return 'cancelled';
+  }
+
+  const exitCode = firstPresent(item?.exit_code, payload?.exit_code);
+  if (protocol.includes('failed') || protocol.includes('error')) return 'failed';
+  if (protocol.includes('cancel')) return 'cancelled';
+  if (protocol.includes('completed') || protocol.includes('complete') || protocol.includes('artifact_ready') || protocol.includes('output')) {
+    return exitCode !== undefined && Number(exitCode) !== 0 ? 'failed' : 'completed';
+  }
+  if (raw) {
+    if (['pending', 'queued'].includes(raw)) return 'pending';
+    if (['in_progress', 'in-progress', 'running', 'started', 'streaming'].includes(raw)) return 'running';
+    if (['completed', 'complete', 'success', 'succeeded', 'done', 'finished', 'approved', 'approve'].includes(raw)) return 'completed';
+  }
+  if (protocol.includes('started') || protocol.includes('updated')) return 'running';
+  return 'running';
+}
+
+function commandInput(payload: any, item: any): any {
+  const execution = firstPresent(item?.execution, payload?.execution);
+  const executionDisplay = executionCommand(execution);
+  if (executionDisplay) return executionDisplay;
+
+  const command = firstPresent(item?.command, payload?.command, item?.cmd, payload?.cmd);
+  if (command) return command;
+  const args = firstPresent(item?.args, payload?.args, item?.arguments, payload?.arguments);
+  if (Array.isArray(args)) return args.join(' ');
+  return args;
+}
+
+function toolInput(payload: any, item: any, type: string): any {
+  if (type === 'command_execution' || type === 'local_shell_call') {
+    return commandInput(payload, item);
+  }
+  return firstPresent(
+    item?.input,
+    payload?.input,
+    item?.arguments,
+    payload?.arguments,
+    item?.args,
+    payload?.args,
+    item?.params,
+    payload?.params,
+    item?.path,
+    payload?.path,
+    item?.command,
+    payload?.command,
+  );
+}
+
+function toolOutput(payload: any, item: any): any {
+  const explicit = firstPresent(
+    item?.aggregated_output,
+    payload?.aggregated_output,
+    item?.output,
+    payload?.output,
+    item?.result,
+    payload?.result,
+    item?.content,
+    payload?.content,
+    item?.error,
+    payload?.error,
+  );
+  if (explicit !== undefined) return explicit;
+
+  const stdout = firstPresent(item?.stdout, payload?.stdout);
+  const stderr = firstPresent(item?.stderr, payload?.stderr);
+  if (stdout || stderr) {
+    return [stdout, stderr].filter(Boolean).join('\n');
+  }
+
+  const exitCode = firstPresent(item?.exit_code, payload?.exit_code);
+  return exitCode !== undefined ? `Exit Code: ${exitCode}` : null;
+}
+
+function toolName(payload: any, item: any, type: string): string {
+  const explicit = asString(firstPresent(
+    item?.name,
+    payload?.name,
+    item?.tool_name,
+    payload?.tool_name,
+    item?.function?.name,
+    payload?.function?.name,
+  ));
+  if (explicit && explicit.trim()) return explicit;
+
+  if (type === 'command_execution' || type === 'local_shell_call') return 'Execute Command';
+  if (type === 'file_change' || type === 'diff_ready') return 'Edit File';
+  if (type === 'todo_list') return 'Task Planning (Codex)';
+  if (type === 'approval_decision') return 'Tool Approval Decision';
+  if (type === 'reasoning') return 'Reasoning';
+  if (type.includes('mcp')) {
+    const server = asString(firstPresent(item?.server, payload?.server, item?.server_name, payload?.server_name));
+    const mcpTool = asString(firstPresent(item?.tool, payload?.tool, item?.tool_name, payload?.tool_name));
+    const combined = [server, mcpTool].filter(Boolean).join(' / ');
+    return combined || 'MCP Tool';
+  }
+  if (type === 'function_call' || type === 'function_call_output') return 'Function Call';
+  if (type === 'custom_tool_call' || type === 'custom_tool_call_output') return 'Custom Tool Call';
+  if (type === 'tool_result' || type === 'tool_response') return 'Tool Result';
+  return 'Tool Call';
+}
+
+function stableToolId(turnId: string, event: any, index: number, payload: any, item: any, type: string, name: string): string {
+  if (type === 'reasoning') {
+    return `${turnId}:reasoning`;
+  }
+  const natural = firstPresent(
+    item?.id,
+    payload?.id,
+    item?.call_id,
+    payload?.call_id,
+    item?.tool_call_id,
+    payload?.tool_call_id,
+    item?.request_id,
+    payload?.request_id,
+    commandInput(payload, item),
+    item?.path,
+    payload?.path,
+  );
+  if (natural !== undefined) {
+    return `${turnId}:${type || 'tool'}:${String(natural)}`;
+  }
+  return `${turnId}:${type || 'tool'}:${name}:${event.event_id || index}`;
+}
+
+function mergeTool(toolCalls: ToolDisplay[], next: ToolDisplay) {
+  const existing = toolCalls.find(
+    (tool) =>
+      tool.id === next.id ||
+      (tool.name === next.name && (tool.status === 'running' || tool.status === 'pending') && !tool.output),
+  );
+  if (!existing) {
+    toolCalls.push(next);
+    return;
+  }
+  existing.status = next.status || existing.status;
+  if (next.input !== undefined && next.input !== null) existing.input = next.input;
+  if (next.output !== undefined && next.output !== null) existing.output = next.output;
+}
+
 export function renderTurnEvents(
-  turnId: string, 
-  events: any[], 
-  turns: Turn[], 
-  realtimeLines?: string[], 
+  turnId: string,
+  events: any[],
+  turns: Turn[],
+  realtimeLines?: string[],
   hyardJobs?: Record<string, any>
 ) {
   // Filter events for this turn
   const turnEvents = events.filter((e) => e.turn_id === turnId);
-  
+
   // Find execution telemetry event
-  const telemetryEvent = turnEvents.find(
-    (e) => e.event_type === 'item_updated' && e.payload?.item_type === 'execution_telemetry'
-  );
-  let commandLine = telemetryEvent?.payload?.execution?.command;
-  let commandArgs = telemetryEvent?.payload?.execution?.args;
-  
+  const telemetryEvent = turnEvents.find((e) => {
+    if (!isProviderItemEvent(e)) return false;
+    const item = getPayloadItem(e.payload);
+    return getItemType(e.payload, item) === 'execution_telemetry';
+  });
+  const telemetryPayload = telemetryEvent?.payload;
+  const telemetryItem = telemetryPayload ? getPayloadItem(telemetryPayload) : null;
+  const telemetryExecution = firstPresent(telemetryPayload?.execution, telemetryItem?.execution);
+  let commandLine = executionCommand(telemetryExecution);
+  let commandArgs = telemetryExecution?.args;
+
   // Gather terminal outputs from db events
   const dbTerminalLines = turnEvents
-    .filter((e) => e.event_type === 'item_updated' && e.payload?.item_type === 'terminal_output')
-    .map((e) => e.payload?.line)
+    .filter((e) => {
+      if (!isProviderItemEvent(e)) return false;
+      const item = getPayloadItem(e.payload);
+      return getItemType(e.payload, item) === 'terminal_output';
+    })
+    .map((e) => {
+      const item = getPayloadItem(e.payload);
+      return firstPresent(e.payload?.line, item?.line);
+    })
     .filter(Boolean);
 
   let combinedTerminal = [...dbTerminalLines, ...(realtimeLines || [])];
@@ -204,109 +659,122 @@ export function renderTurnEvents(
       combinedTerminal = job.last_output_preview.split('\n');
     }
     if (job.execution && !commandLine) {
-      commandLine = job.execution.command;
+      commandLine = executionCommand(job.execution);
       commandArgs = job.execution.args;
     }
   }
 
   // Extract tool calls and delegate sub-agents
-  const toolCalls: any[] = [];
+  const toolCalls: ToolDisplay[] = [];
 
   // 1. Gather child delegate turns
   const delegates = turns.filter((t) => t.delegated_by === turnId);
   delegates.forEach((d) => {
-    toolCalls.push({
+    mergeTool(toolCalls, {
       id: d.turn_id,
       name: `Delegation to ${d.provider} (${d.role})`,
       input: d.user_message,
-      status: d.status,
+      status: normalizeStatus({ status: d.status }, {}),
       output: d.provider_response || d.error_message,
     });
   });
 
-  // 2. Gather standard tool use and result events, plus Codex specific protocol items
-  turnEvents.forEach((e) => {
-    if (e.event_type === 'item_updated') {
-      const payload = e.payload;
-      if (!payload) return;
+  // 2. Gather standard tool use and result events, plus Codex specific protocol items.
+  turnEvents.forEach((e, index) => {
+    if (!isProviderItemEvent(e)) return;
+    const payload = e.payload;
+    if (!payload) return;
 
-      const item = payload.item || payload;
-      const type = item.type || payload.type;
-      const id = item.id || payload.id || Math.random().toString();
+    const item = getPayloadItem(payload);
+    const type = getItemType(payload, item);
+    const protocol = getProtocolKind(payload).toLowerCase().replace(/\//g, '.');
+    const itemType = type.toLowerCase();
 
-      if (type === 'tool_use' || type === 'tool_call') {
-        const name = payload.name || item.name;
-        if (name && name.trim()) {
-          toolCalls.push({
-            id,
-            name,
-            input: payload.input || item.input || payload.arguments || item.arguments,
-            status: 'running',
-            output: null,
-          });
-        }
-      } else if (type === 'tool_result' || type === 'tool_response') {
-        const name = payload.name || item.name;
-        const existing = toolCalls.find((tc) => tc.id === id || (name && tc.name === name && tc.status === 'running'));
-        if (existing) {
-          existing.status = 'completed';
-          existing.output = payload.output || item.output || payload.content || item.content;
-        } else if (name && name.trim()) {
-          toolCalls.push({
-            id,
-            name,
-            status: 'completed',
-            output: payload.output || item.output || payload.content || item.content,
-          });
-        }
-      } else if (type === 'todo_list') {
-        const existing = toolCalls.find((tc) => tc.id === id);
-        if (!existing) {
-          toolCalls.push({
-            id,
-            name: 'Task Planning (Codex)',
-            input: item.items,
-            status: 'completed',
-            output: null,
-          });
-        }
-      } else if (type === 'command_execution') {
-        const existing = toolCalls.find((tc) => tc.id === id);
-        const statusMap: Record<string, string> = {
-          'in_progress': 'running',
-          'completed': 'completed',
-          'failed': 'failed',
-        };
-        const status = statusMap[item.status] || 'running';
-        const output = item.aggregated_output || item.error || (item.exit_code !== undefined ? `Exit Code: ${item.exit_code}` : null);
-        
-        if (existing) {
-          existing.status = status;
-          if (output) existing.output = output;
-        } else {
-          toolCalls.push({
-            id,
-            name: 'Execute Command',
-            input: item.command,
-            status,
-            output,
-          });
-        }
-      } else if (type === 'file_change') {
-        const existing = toolCalls.find((tc) => tc.id === id);
-        const status = (payload.type === 'item.completed' || item.status === 'completed') ? 'completed' : 'running';
-        if (existing) {
-            existing.status = status;
-            if (item.diff) existing.output = item.diff;
-        } else {
-            toolCalls.push({
-                id,
-                name: 'Edit File',
-                input: item.path,
-                status,
-                output: item.diff || null,
-            });
-        }
+    if (itemType === 'agent_message' || itemType === 'assistant' || itemType === 'terminal_output' || itemType === 'execution_telemetry') {
+      return;
+    }
+
+    const name = toolName(payload, item, itemType);
+    const id = stableToolId(turnId, e, index, payload, item, itemType, name);
+
+    if (itemType === 'approval_decision') {
+      const decisionTag = payload.decision_tag || payload.tag;
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: payload.request,
+        status: String(decisionTag || '').startsWith('deny') ? 'failed' : 'completed',
+        output: decisionTag || payload.decision,
+      });
+    } else if (CALL_ITEM_TYPES.has(itemType)) {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: toolInput(payload, item, itemType),
+        status: normalizeStatus(payload, item, e.event_type),
+        output: toolOutput(payload, item),
+      });
+    } else if (RESULT_ITEM_TYPES.has(itemType)) {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: toolInput(payload, item, itemType),
+        status: normalizeStatus({ ...payload, type: payload.type || 'item.completed' }, item, e.event_type),
+        output: toolOutput(payload, item),
+      });
+    } else if (itemType === 'command_execution') {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: commandInput(payload, item),
+        status: normalizeStatus(payload, item, e.event_type),
+        output: toolOutput(payload, item),
+      });
+    } else if (itemType === 'file_change' || itemType === 'diff_ready') {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: firstPresent(item?.path, payload?.path, item?.file, payload?.file),
+        status: normalizeStatus(payload, item, e.event_type),
+        output: firstPresent(item?.diff, payload?.diff, item?.patch, payload?.patch, item?.summary, payload?.summary),
+      });
+    } else if (itemType === 'todo_list') {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: firstPresent(item?.items, payload?.items),
+        status: 'completed',
+        output: null,
+      });
+    } else if (itemType === 'reasoning') {
+      const summary = firstMeaningful(
+        item?.summary,
+        payload?.summary,
+        payload?.params?.summary,
+        item?.text,
+        payload?.text,
+        payload?.params?.text,
+        item?.content,
+        payload?.content,
+        payload?.params?.content,
+        item?.delta?.summary,
+        payload?.delta?.summary,
+        payload?.params?.delta?.summary,
+        item?.delta?.text,
+        payload?.delta?.text,
+        payload?.params?.delta?.text,
+        item?.delta?.content,
+        payload?.delta?.content,
+        payload?.params?.delta?.content,
+      );
+      if (summary !== undefined) {
+        mergeTool(toolCalls, {
+          id,
+          name,
+          input: null,
+          status: protocol.includes('completed') ? 'completed' : 'running',
+          output: summary,
+        });
       }
     }
   });
@@ -315,24 +783,42 @@ export function renderTurnEvents(
     return null;
   }
 
+  const hasRunningTool = toolCalls.some((tool) => tool.status === 'running' || tool.status === 'pending');
+  const hasLiveTerminal = (realtimeLines?.length ?? 0) > 0;
+
   return (
     <div className="execution-details-accordion" style={{ marginTop: '10px', fontSize: '12px' }}>
-      <details style={{ background: 'rgba(0,0,0,0.15)', borderRadius: '4px', border: '1px solid var(--border-muted)', overflow: 'hidden' }}>
+      <details
+        open={hasRunningTool || hasLiveTerminal}
+        style={{ background: 'rgba(0,0,0,0.15)', borderRadius: '4px', border: '1px solid var(--border-muted)', overflow: 'hidden' }}
+      >
         <summary style={{ padding: '8px 12px', cursor: 'pointer', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px', userSelect: 'none', background: 'rgba(255,255,255,0.02)' }}>
           <Terminal size={14} style={{ color: 'var(--color-secondary)' }} />
           <span>Execution Details & Logs</span>
-          {toolCalls.length > 0 && (
-            <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(6, 182, 212, 0.1)', color: 'var(--color-secondary)', borderRadius: '3px', marginLeft: 'auto' }}>
-              {toolCalls.length} Tool{toolCalls.length > 1 ? 's' : ''}
-            </span>
-          )}
+          <span style={{ marginLeft: 'auto', display: 'flex', gap: '6px', alignItems: 'center' }}>
+            {hasRunningTool && (
+              <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(245, 158, 11, 0.1)', color: 'var(--color-warning)', borderRadius: '3px' }}>
+                Running
+              </span>
+            )}
+            {toolCalls.length > 0 && (
+              <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(6, 182, 212, 0.1)', color: 'var(--color-secondary)', borderRadius: '3px' }}>
+                {toolCalls.length} Tool{toolCalls.length > 1 ? 's' : ''}
+              </span>
+            )}
+            {combinedTerminal.length > 0 && (
+              <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-primary)', borderRadius: '3px' }}>
+                {combinedTerminal.length} Log{combinedTerminal.length > 1 ? 's' : ''}
+              </span>
+            )}
+          </span>
         </summary>
         <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '10px', borderTop: '1px solid var(--border-muted)' }}>
           {commandLine && (
             <div>
               <div style={{ fontWeight: 'bold', color: 'var(--text-secondary)', marginBottom: '4px' }}>Subprocess Command:</div>
               <code style={{ display: 'block', padding: '6px 10px', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '4px', wordBreak: 'break-all', fontFamily: 'monospace' }}>
-                {commandLine} {commandArgs ? commandArgs.join(' ') : ''}
+                {commandLine}{commandArgsSuffix(commandArgs)}
               </code>
             </div>
           )}

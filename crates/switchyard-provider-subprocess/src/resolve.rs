@@ -21,18 +21,75 @@ use std::path::{Path, PathBuf};
 /// On Windows, searches PATH plus common install locations with PATHEXT
 /// extensions (`.cmd`, `.exe`, `.bat`, etc.). On Unix, returns the input
 /// unchanged (the OS handles PATH lookup).
+///
+/// **Alias fallback**: provider CLIs occasionally drop or pick up a
+/// `-cli` suffix in newer releases (OpenAI's `codex-cli` → `codex`,
+/// Anthropic's `claude-cli` → `claude`, etc.). When the configured
+/// name isn't on PATH we try the alias forms before giving up, so an
+/// outdated `switchyard.toml` doesn't break detection on a machine
+/// that has the freshly-renamed binary installed. Logged via the
+/// `SWITCHYARD_DEBUG_RESOLVE` env var.
 pub fn resolve_command(cmd: &str) -> String {
     if contains_path_separator(cmd) {
         return cmd.to_string();
     }
 
-    if cfg!(windows)
-        && let Some(resolved) = find_on_path(cmd)
-    {
-        return resolved;
+    if cfg!(windows) {
+        if let Some(resolved) = find_on_path(cmd) {
+            return resolved;
+        }
+        for alias in alias_candidates(cmd) {
+            if let Some(resolved) = find_on_path(&alias) {
+                if std::env::var("SWITCHYARD_DEBUG_RESOLVE").as_deref() == Ok("1") {
+                    eprintln!(
+                        "[switchyard] '{cmd}' not found on PATH; using alias '{alias}' → {resolved}"
+                    );
+                }
+                return resolved;
+            }
+        }
     }
 
     cmd.to_string()
+}
+
+/// Likely alternative names for a provider CLI, in priority order.
+/// Each upstream tool that renamed its binary gets one entry pair
+/// (old ↔ new). Generic `-cli` suffix toggling acts as a catch-all
+/// for any other tool that follows the same pattern.
+fn alias_candidates(cmd: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let lower = cmd.to_ascii_lowercase();
+
+    // Explicit upstream-rename pairs first — narrow matches so we
+    // don't fabricate a fake `git-cli` from `git`.
+    match lower.as_str() {
+        "codex" => out.push("codex-cli".to_string()),
+        "codex-cli" => out.push("codex".to_string()),
+        "claude" => {
+            out.push("claude-cli".to_string());
+            out.push("claude-code".to_string());
+        }
+        "claude-cli" | "claude-code" => out.push("claude".to_string()),
+        "gemini" => out.push("gemini-cli".to_string()),
+        "gemini-cli" => out.push("gemini".to_string()),
+        "agy" => out.push("antigravity".to_string()),
+        "antigravity" => out.push("agy".to_string()),
+        _ => {
+            // Generic fallback for any other tool the user might
+            // configure: try toggling the `-cli` suffix.
+            if let Some(stripped) = cmd.strip_suffix("-cli") {
+                out.push(stripped.to_string());
+            } else {
+                out.push(format!("{cmd}-cli"));
+            }
+        }
+    }
+
+    // De-dup while preserving order; drop entries matching the input.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|s| s != cmd && seen.insert(s.clone()));
+    out
 }
 
 /// Search PATH for a command, checking PATHEXT extensions on Windows.
@@ -308,6 +365,50 @@ mod tests {
     fn resolve_preserves_paths_with_separators() {
         assert_eq!(resolve_command("/usr/bin/codex"), "/usr/bin/codex");
         assert_eq!(resolve_command("C:\\bin\\codex.exe"), "C:\\bin\\codex.exe");
+    }
+
+    #[test]
+    fn alias_candidates_handle_known_renames() {
+        // codex-cli was renamed to codex upstream — both directions
+        // should fall back so users with either configured can still
+        // find a binary the other way around.
+        assert_eq!(alias_candidates("codex-cli"), vec!["codex".to_string()]);
+        assert_eq!(alias_candidates("codex"), vec!["codex-cli".to_string()]);
+
+        assert!(alias_candidates("claude").contains(&"claude-cli".to_string()));
+        assert!(alias_candidates("claude").contains(&"claude-code".to_string()));
+        assert_eq!(alias_candidates("claude-code"), vec!["claude".to_string()]);
+
+        assert_eq!(alias_candidates("gemini-cli"), vec!["gemini".to_string()]);
+        assert_eq!(alias_candidates("gemini"), vec!["gemini-cli".to_string()]);
+
+        assert_eq!(alias_candidates("antigravity"), vec!["agy".to_string()]);
+        assert_eq!(alias_candidates("agy"), vec!["antigravity".to_string()]);
+    }
+
+    #[test]
+    fn alias_candidates_generic_cli_suffix() {
+        // Unknown tools fall through to the generic `-cli` toggle.
+        assert_eq!(
+            alias_candidates("custom-tool"),
+            vec!["custom-tool-cli".to_string()]
+        );
+        assert_eq!(
+            alias_candidates("custom-tool-cli"),
+            vec!["custom-tool".to_string()]
+        );
+    }
+
+    #[test]
+    fn alias_candidates_never_returns_input() {
+        // Sanity check — alias_candidates shouldn't suggest the input
+        // back to itself; that would loop in the resolver.
+        for name in ["codex", "codex-cli", "claude", "gemini", "agy", "weird"] {
+            assert!(
+                !alias_candidates(name).iter().any(|s| s == name),
+                "alias_candidates({name:?}) suggested itself"
+            );
+        }
     }
 
     #[test]

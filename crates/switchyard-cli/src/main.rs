@@ -1,14 +1,19 @@
 mod host;
+mod host_hook;
 mod store_cmd;
 
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use switchyard_config::SwitchyardConfig;
-use switchyard_core::{ProviderRegistry, build_peer_catalog_probed, run_routed_turn_with_archive};
+use switchyard_config::{SandboxMode, SwitchyardConfig};
+use switchyard_core::{
+    ProviderRegistry, build_peer_catalog_probed, execution_policy_from_config_with_overrides,
+    run_routed_turn_with_archive_and_policy,
+};
+use switchyard_provider_antigravity::AntigravityProvider;
 use switchyard_provider_api::{HostSurfaceProbe, Provider};
 use switchyard_provider_claude::ClaudeProvider;
 use switchyard_provider_codex::CodexProvider;
@@ -30,6 +35,24 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum CliSandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl From<CliSandboxMode> for SandboxMode {
+    fn from(value: CliSandboxMode) -> Self {
+        match value {
+            CliSandboxMode::ReadOnly => SandboxMode::ReadOnly,
+            CliSandboxMode::WorkspaceWrite => SandboxMode::WorkspaceWrite,
+            CliSandboxMode::DangerFullAccess => SandboxMode::DangerFullAccess,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run a single turn against a provider.
@@ -45,6 +68,14 @@ enum Commands {
         /// Working directory.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
+
+        /// Override sandbox mode for this turn.
+        #[arg(long, value_enum)]
+        sandbox: Option<CliSandboxMode>,
+
+        /// Additional path that providers may access/write in workspace-write mode.
+        #[arg(long = "allow-path")]
+        allow_paths: Vec<PathBuf>,
     },
     /// Launch the interactive TUI.
     Tui {
@@ -201,8 +232,41 @@ enum HostAction {
         #[arg(long)]
         job_id: String,
     },
+    /// Manage Switchyard hooks for Codex / Claude.
+    Hook {
+        #[command(subcommand)]
+        action: HookCli,
+    },
     /// Print available /hyard commands and their usage.
     Help,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum HookCli {
+    /// Receive a hook event from a CLI and record it in the canonical store.
+    /// Called from `~/.codex/config.toml` / `~/.claude/hooks.json` entries
+    /// that Switchyard's installer writes. Reads the hook payload from stdin
+    /// and `$SWITCHYARD_SESSION_ID` from the environment.
+    Fire {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        event: String,
+    },
+    /// Write Switchyard hook entries into the provider's hook config.
+    Install {
+        /// One of `codex`, `claude`, `all`.
+        #[arg(long, default_value = "all")]
+        provider: String,
+    },
+    /// Remove Switchyard's managed hook entries from the provider's config.
+    /// User-added entries are left untouched.
+    Uninstall {
+        #[arg(long, default_value = "all")]
+        provider: String,
+    },
+    /// Print JSON describing which events have Switchyard hooks installed.
+    Status,
 }
 
 /// Build the provider registry with all known adapters.
@@ -216,6 +280,8 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                 "codex"
             } else if name.contains("claude") {
                 "claude"
+            } else if name.contains("antigravity") || name.contains("agy") {
+                "antigravity"
             } else if name.contains("gemini") {
                 "gemini"
             } else {
@@ -229,7 +295,12 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                     Box::new(|cfg| {
                         let p: Box<dyn Provider> = match cfg {
                             Some(c) => Box::new(CodexProvider::from_config(c)),
-                            None => Box::new(CodexProvider::new("codex", vec![], std::collections::HashMap::new(), 900)),
+                            None => Box::new(CodexProvider::new(
+                                "codex",
+                                vec![],
+                                std::collections::HashMap::new(),
+                                900,
+                            )),
                         };
                         p
                     }),
@@ -241,7 +312,12 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                     Box::new(|cfg| {
                         let p: Box<dyn Provider> = match cfg {
                             Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                            None => Box::new(ClaudeProvider::new("claude", vec![], std::collections::HashMap::new(), 900)),
+                            None => Box::new(ClaudeProvider::new(
+                                "claude",
+                                vec![],
+                                std::collections::HashMap::new(),
+                                900,
+                            )),
                         };
                         p
                     }),
@@ -253,7 +329,29 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                     Box::new(|cfg| {
                         let p: Box<dyn Provider> = match cfg {
                             Some(c) => Box::new(GeminiProvider::from_config(c)),
-                            None => Box::new(GeminiProvider::new("gemini", vec![], std::collections::HashMap::new(), 900)),
+                            None => Box::new(GeminiProvider::new(
+                                "gemini",
+                                vec![],
+                                std::collections::HashMap::new(),
+                                900,
+                            )),
+                        };
+                        p
+                    }),
+                );
+            }
+            "antigravity" => {
+                registry.register(
+                    name.clone(),
+                    Box::new(|cfg| {
+                        let p: Box<dyn Provider> = match cfg {
+                            Some(c) => Box::new(AntigravityProvider::from_config(c)),
+                            None => Box::new(AntigravityProvider::new(
+                                "agy",
+                                vec![],
+                                std::collections::HashMap::new(),
+                                900,
+                            )),
                         };
                         p
                     }),
@@ -270,7 +368,12 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
             Box::new(|cfg| {
                 let p: Box<dyn Provider> = match cfg {
                     Some(c) => Box::new(CodexProvider::from_config(c)),
-                    None => Box::new(CodexProvider::new("codex", vec![], std::collections::HashMap::new(), 900)),
+                    None => Box::new(CodexProvider::new(
+                        "codex",
+                        vec![],
+                        std::collections::HashMap::new(),
+                        900,
+                    )),
                 };
                 p
             }),
@@ -282,7 +385,12 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
             Box::new(|cfg| {
                 let p: Box<dyn Provider> = match cfg {
                     Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                    None => Box::new(ClaudeProvider::new("claude", vec![], std::collections::HashMap::new(), 900)),
+                    None => Box::new(ClaudeProvider::new(
+                        "claude",
+                        vec![],
+                        std::collections::HashMap::new(),
+                        900,
+                    )),
                 };
                 p
             }),
@@ -294,7 +402,29 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
             Box::new(|cfg| {
                 let p: Box<dyn Provider> = match cfg {
                     Some(c) => Box::new(GeminiProvider::from_config(c)),
-                    None => Box::new(GeminiProvider::new("gemini", vec![], std::collections::HashMap::new(), 900)),
+                    None => Box::new(GeminiProvider::new(
+                        "gemini",
+                        vec![],
+                        std::collections::HashMap::new(),
+                        900,
+                    )),
+                };
+                p
+            }),
+        );
+    }
+    if !registry.has("antigravity") {
+        registry.register(
+            "antigravity",
+            Box::new(|cfg| {
+                let p: Box<dyn Provider> = match cfg {
+                    Some(c) => Box::new(AntigravityProvider::from_config(c)),
+                    None => Box::new(AntigravityProvider::new(
+                        "agy",
+                        vec![],
+                        std::collections::HashMap::new(),
+                        900,
+                    )),
                 };
                 p
             }),
@@ -305,7 +435,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
 }
 
 /// Known CLI command names for auto-discovery.
-const KNOWN_CLIS: &[&str] = &["codex", "claude", "gemini"];
+const KNOWN_CLIS: &[&str] = &["codex", "claude", "gemini", "agy"];
 
 #[derive(Clone, Serialize)]
 struct CheckEntry {
@@ -341,48 +471,64 @@ async fn main() {
             provider,
             message,
             cwd: work_dir,
+            sandbox,
+            allow_paths,
         } => {
-            let provider = provider.unwrap_or_else(|| config.core.default_provider.clone());
+            let run_cwd = resolve_work_dir(&cwd, &work_dir);
+            let run_config = SwitchyardConfig::resolve(&run_cwd).unwrap_or_else(|_| config.clone());
+            let registry = build_registry(&run_config);
+            let provider = provider.unwrap_or_else(|| run_config.core.default_provider.clone());
 
-            let issues = config.validate();
+            let issues = run_config.validate();
             for issue in &issues {
                 eprintln!("config warning: {issue}");
             }
 
-            let mut store = StoreHandle::open(config.store_backend(&cwd), config.store_path(&cwd))
-                .unwrap_or_else(|e| {
-                    eprintln!("failed to open store: {e}");
-                    process::exit(1);
-                });
+            let mut store = StoreHandle::open(
+                run_config.store_backend(&run_cwd),
+                run_config.store_path(&run_cwd),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("failed to open store: {e}");
+                process::exit(1);
+            });
             let mut session = Session::new(provider.clone());
             store.save_session(&session).unwrap_or_else(|e| {
                 eprintln!("failed to create session: {e}");
                 process::exit(1);
             });
 
-            let provider_impl = match registry.create(&provider, config.providers.get(&provider)) {
-                Some(p) => p,
-                None => {
-                    eprintln!("unsupported provider: {provider}");
-                    eprintln!("available: {}", registry.names().join(", "));
-                    process::exit(1);
-                }
-            };
+            let provider_impl =
+                match registry.create(&provider, run_config.providers.get(&provider)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("unsupported provider: {provider}");
+                        eprintln!("available: {}", registry.names().join(", "));
+                        process::exit(1);
+                    }
+                };
 
             let peer_catalog =
-                build_peer_catalog_probed(&provider, &registry, &config.providers).await;
-            let artifact_dir = config.artifact_dir(&cwd);
+                build_peer_catalog_probed(&provider, &registry, &run_config.providers).await;
+            let artifact_dir = run_config.artifact_dir(&run_cwd);
+            let policy = execution_policy_from_config_with_overrides(
+                &run_config,
+                &run_cwd,
+                sandbox.map(Into::into),
+                &allow_paths,
+            );
 
-            match run_routed_turn_with_archive(
+            match run_routed_turn_with_archive_and_policy(
                 &mut store,
                 &mut session,
                 provider_impl.as_ref(),
                 &peer_catalog,
-                &|name| registry.create(name, config.providers.get(name)),
+                &|name| registry.create(name, run_config.providers.get(name)),
                 None,
                 message,
-                work_dir,
+                run_cwd,
                 Some(&artifact_dir),
+                policy,
             )
             .await
             {
@@ -749,6 +895,22 @@ async fn main() {
             }
             HostAction::Worker { job_id } => {
                 host::host_worker(&registry, &config, &job_id, &cwd).await;
+            }
+            HostAction::Hook { action } => {
+                let code = host_hook::run(match action {
+                    HookCli::Fire { provider, event } => {
+                        host_hook::HookAction::Fire { provider, event }
+                    }
+                    HookCli::Install { provider } => host_hook::HookAction::Install { provider },
+                    HookCli::Uninstall { provider } => {
+                        host_hook::HookAction::Uninstall { provider }
+                    }
+                    HookCli::Status => host_hook::HookAction::Status,
+                })
+                .await;
+                if code != 0 {
+                    process::exit(code);
+                }
             }
             HostAction::Help => {
                 host::host_help();

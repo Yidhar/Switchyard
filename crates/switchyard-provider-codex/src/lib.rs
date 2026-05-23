@@ -1,5 +1,8 @@
+mod app_server;
 mod probe;
 mod turn;
+
+pub use app_server::CodexAppServerInstance;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +28,12 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
-    pub fn new(command: impl Into<String>, args: Vec<String>, env: HashMap<String, String>, timeout_secs: u64) -> Self {
+    pub fn new(
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        timeout_secs: u64,
+    ) -> Self {
         let original_command = command.into();
         let command = resolve_command(&original_command);
         Self {
@@ -39,7 +47,12 @@ impl CodexProvider {
     }
 
     pub fn from_config(cfg: &switchyard_config::ProviderConfig) -> Self {
-        Self::new(cfg.command.clone(), cfg.args.clone(), cfg.env.clone(), cfg.timeout_secs)
+        Self::new(
+            cfg.command.clone(),
+            cfg.args.clone(),
+            cfg.env.clone(),
+            cfg.timeout_secs,
+        )
     }
 }
 
@@ -67,6 +80,7 @@ impl Provider for CodexProvider {
             &input,
             timeout_secs,
             Some(&self.env),
+            &policy,
             Some(&policy.cwd),
             &event_tx,
             cancel,
@@ -97,27 +111,37 @@ impl Provider for CodexProvider {
 impl PersistentProvider for CodexProvider {
     async fn start_persistent_instance(
         &self,
+        cwd: std::path::PathBuf,
         envs: HashMap<String, String>,
     ) -> Result<Box<dyn LiveInstance>, ProviderError> {
-        use std::process::Stdio;
-        use switchyard_provider_subprocess::{build_subprocess_invocation_plan, SubprocessLiveInstance};
+        // Persistent path is now Codex's official JSON-RPC IPC daemon
+        // (`codex app-server`). Replaces the old SubprocessLiveInstance
+        // sentinel protocol which never actually worked against real codex.
+        let instance =
+            CodexAppServerInstance::spawn(&self.command, &self.args, envs, Some(&cwd)).await?;
+        Ok(Box::new(instance))
+    }
 
-        let plan = build_subprocess_invocation_plan(&self.original_command, &self.command, &self.args);
-        let mut cmd = tokio::process::Command::new(&plan.command);
-        cmd.args(&plan.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-
-        let child = cmd.spawn().map_err(|e| {
-            ProviderError::ExecutionFailed(format!("Failed to spawn persistent Codex CLI: {e}"))
-        })?;
-
-        let instance = SubprocessLiveInstance::new("codex", child)?;
+    async fn start_persistent_instance_resumed(
+        &self,
+        cwd: std::path::PathBuf,
+        envs: HashMap<String, String>,
+        resume_token: Option<String>,
+    ) -> Result<Box<dyn LiveInstance>, ProviderError> {
+        // Codex's `app-server` JSON-RPC layer exposes `thread/resume {threadId}`
+        // for warm continuation. If `resume_token` is None we land on a
+        // fresh `thread/start`. If Some but the daemon refuses (token
+        // expired, format change), `spawn_with_resume` transparently falls
+        // back to `thread/start` so the call never fails just because the
+        // token went stale.
+        let instance = CodexAppServerInstance::spawn_with_resume(
+            &self.command,
+            &self.args,
+            envs,
+            Some(&cwd),
+            resume_token.as_deref(),
+        )
+        .await?;
         Ok(Box::new(instance))
     }
 }

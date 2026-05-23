@@ -5,10 +5,10 @@
 
 pub mod context_render;
 pub mod helpers;
+pub mod live;
 pub mod probe;
 pub mod resolve;
 pub mod runner;
-pub mod live;
 pub use live::SubprocessLiveInstance;
 
 pub use context_render::render_context_bundle;

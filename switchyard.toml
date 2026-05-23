@@ -1,0 +1,61 @@
+[core]
+default_provider = "codex"
+default_peers = [
+    "claude",
+    "gemini",
+    "codex",
+]
+
+[providers.codex]
+command = "codex"
+args = []
+timeout_secs = 900
+backend = "codex"
+
+[providers.codex.env]
+
+[providers.antigravity]
+command = "agy"
+args = []
+timeout_secs = 900
+backend = "antigravity"
+
+[providers.antigravity.env]
+
+[providers.gemini]
+command = "gemini"
+args = []
+timeout_secs = 900
+backend = "gemini"
+
+[providers.gemini.env]
+
+[providers.claude]
+command = "claude"
+args = []
+timeout_secs = 900
+backend = "claude"
+
+[providers.claude.env]
+
+[sandbox]
+mode = "danger-full-access"
+allowed_paths = []
+
+[session]
+directory = '.switchyard\sessions'
+
+[store]
+backend = "sqlite"
+
+[ui]
+show_diff = true
+show_artifacts = true
+
+[orchestrator.worker_retry]
+max_attempts = 3
+backoff_ms = [
+    2000,
+    5000,
+    10000,
+]

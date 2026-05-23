@@ -19,11 +19,76 @@ pub struct SwitchyardConfig {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
+    pub sandbox: SandboxConfig,
+    #[serde(default)]
     pub session: SessionConfig,
     #[serde(default)]
     pub store: StoreConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub orchestrator: OrchestratorConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    #[serde(default)]
+    pub mode: SandboxMode,
+    #[serde(default)]
+    pub allowed_paths: Vec<PathBuf>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::WorkspaceWrite,
+            allowed_paths: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    ReadOnly,
+    #[default]
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OrchestratorConfig {
+    #[serde(default)]
+    pub worker_retry: WorkerRetryConfig,
+}
+
+/// Retry policy applied by the WorkerSupervisor when a worker dies mid-turn.
+/// `max_attempts` includes the original attempt — `max_attempts=3` means up
+/// to 2 retries after the initial try. `backoff_ms` lengths beyond
+/// `max_attempts-1` are ignored; shorter lists pad with the last value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRetryConfig {
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_backoff_ms")]
+    pub backoff_ms: Vec<u64>,
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
+fn default_backoff_ms() -> Vec<u64> {
+    vec![2000, 5000, 10000]
+}
+
+impl Default for WorkerRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_max_attempts(),
+            backoff_ms: default_backoff_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +261,23 @@ impl SwitchyardConfig {
         project_root.join(DOT_DIR).join("artifacts")
     }
 
+    /// Additional sandbox allow-list paths resolved relative to
+    /// `project_root`. The primary workspace directory is not included here;
+    /// core policy builders add it automatically for `workspace-write`.
+    pub fn sandbox_allowed_paths(&self, project_root: &Path) -> Vec<PathBuf> {
+        self.sandbox
+            .allowed_paths
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    project_root.join(path)
+                }
+            })
+            .collect()
+    }
+
     /// Resolved HYARD job directory.
     ///
     /// When the session directory looks like `.../sessions`, job manifests live
@@ -324,6 +406,8 @@ mod tests {
         let cfg = SwitchyardConfig::default();
         assert_eq!(cfg.core.default_provider, "codex");
         assert!(cfg.core.default_peers.is_empty());
+        assert_eq!(cfg.sandbox.mode, SandboxMode::WorkspaceWrite);
+        assert!(cfg.sandbox.allowed_paths.is_empty());
         assert_eq!(cfg.store.backend, StoreBackendConfig::Auto);
         assert_eq!(
             cfg.store_backend(Path::new("/project")),
@@ -355,6 +439,10 @@ timeout_secs = 120
 command = "codex"
 args = ["--quiet"]
 
+[sandbox]
+mode = "read-only"
+allowed_paths = ["../shared", "/tmp/cache"]
+
 [session]
 directory = ".my-sessions"
 
@@ -372,6 +460,11 @@ show_artifacts = false
         assert_eq!(cfg.providers["claude"].command, "claude");
         assert_eq!(cfg.providers["claude"].timeout_secs, 120);
         assert_eq!(cfg.providers["codex"].timeout_secs, 900); // default
+        assert_eq!(cfg.sandbox.mode, SandboxMode::ReadOnly);
+        assert_eq!(
+            cfg.sandbox.allowed_paths,
+            vec![PathBuf::from("../shared"), PathBuf::from("/tmp/cache")]
+        );
         assert_eq!(cfg.store.backend, StoreBackendConfig::Sqlite);
         assert_eq!(
             cfg.store.path,
@@ -391,6 +484,41 @@ show_artifacts = false
         let cfg = SwitchyardConfig::default();
         let dir = cfg.session_dir(Path::new("/project"));
         assert_eq!(dir, PathBuf::from("/project/.switchyard/sessions"));
+    }
+
+    #[test]
+    fn parse_sandbox_modes_and_allowed_paths() {
+        let cfg = SwitchyardConfig::parse_toml(
+            r#"
+[sandbox]
+mode = "danger-full-access"
+allowed_paths = ["../shared", "scratch"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.sandbox.mode, SandboxMode::DangerFullAccess);
+        assert_eq!(
+            cfg.sandbox.allowed_paths,
+            vec![PathBuf::from("../shared"), PathBuf::from("scratch")]
+        );
+    }
+
+    #[test]
+    fn sandbox_allowed_paths_resolve_relative_to_project_root() {
+        let mut cfg = SwitchyardConfig::default();
+        cfg.sandbox.allowed_paths = vec![
+            PathBuf::from("../shared"),
+            PathBuf::from("/absolute/cache"),
+            PathBuf::from("scratch"),
+        ];
+        assert_eq!(
+            cfg.sandbox_allowed_paths(Path::new("/project/app")),
+            vec![
+                PathBuf::from("/project/app/../shared"),
+                PathBuf::from("/absolute/cache"),
+                PathBuf::from("/project/app/scratch"),
+            ]
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use switchyard_core::{
     ProviderRegistry, RuntimeEvent, build_peer_catalog, build_peer_catalog_probed,
-    run_routed_turn_observable,
+    execution_policy_from_config, run_routed_turn_observable_with_policy,
 };
 use switchyard_provider_api::{HostSurfaceProbe, PeerCatalog};
 use switchyard_provider_subprocess::resize_registered_pty;
@@ -1130,7 +1130,8 @@ impl App {
                         let running_session_id = session.session_id;
                         let mut running_ui_store =
                             StoreHandle::open(self.store_backend, self.store_path.clone())?;
-                        let turn_fut = run_routed_turn_observable(
+                        let policy = execution_policy_from_config(config, &cwd);
+                        let turn_fut = run_routed_turn_observable_with_policy(
                             store,
                             session,
                             p.as_ref(),
@@ -1142,6 +1143,7 @@ impl App {
                             Some(&artifact_dir),
                             Some(&runtime_tx),
                             cancel,
+                            policy,
                         );
                         tokio::pin!(turn_fut);
 
@@ -1671,7 +1673,8 @@ impl App {
     fn handle_runtime_event(&mut self, evt: RuntimeEvent, peer_catalog: &PeerCatalog) {
         if matches!(
             evt,
-            RuntimeEvent::CoreTurnStarted { .. }
+            RuntimeEvent::TurnPreparing { .. }
+                | RuntimeEvent::CoreTurnStarted { .. }
                 | RuntimeEvent::PeerTurnStarted { .. }
                 | RuntimeEvent::FinalizationStarted { .. }
         ) {
@@ -2047,11 +2050,7 @@ impl App {
                     .border_style(Style::default().fg(border_color)),
             )
             .style(Style::default().fg(COLOR_MUTED))
-            .highlight_style(
-                Style::default()
-                    .fg(accent)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
             .divider(Span::raw(" | "));
 
         f.render_widget(tabs, area);
@@ -4139,6 +4138,7 @@ mod tests {
         runtime.apply(&RuntimeEvent::CoreItemUpdated {
             turn_id: core_turn_id,
             provider: "codex".to_string(),
+            event_type: "item_updated".to_string(),
             text: "planning".to_string(),
             payload: None,
         });
@@ -4155,6 +4155,7 @@ mod tests {
         runtime.apply(&RuntimeEvent::PeerItemUpdated {
             turn_id: peer_turn_id,
             provider: "claude".to_string(),
+            event_type: "item_updated".to_string(),
             text: "[assistant]".to_string(),
             payload: None,
         });
@@ -4240,6 +4241,7 @@ mod tests {
         runtime.apply(&RuntimeEvent::CoreItemUpdated {
             turn_id: Uuid::now_v7(),
             provider: "codex".to_string(),
+            event_type: "item_updated".to_string(),
             text: "timeline entry".to_string(),
             payload: None,
         });

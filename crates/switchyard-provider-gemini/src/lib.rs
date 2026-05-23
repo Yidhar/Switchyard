@@ -25,7 +25,12 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
-    pub fn new(command: impl Into<String>, args: Vec<String>, env: HashMap<String, String>, timeout_secs: u64) -> Self {
+    pub fn new(
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        timeout_secs: u64,
+    ) -> Self {
         let original_command = command.into();
         let command = resolve_command(&original_command);
         Self {
@@ -39,7 +44,12 @@ impl GeminiProvider {
     }
 
     pub fn from_config(cfg: &switchyard_config::ProviderConfig) -> Self {
-        Self::new(cfg.command.clone(), cfg.args.clone(), cfg.env.clone(), cfg.timeout_secs)
+        Self::new(
+            cfg.command.clone(),
+            cfg.args.clone(),
+            cfg.env.clone(),
+            cfg.timeout_secs,
+        )
     }
 }
 
@@ -65,6 +75,7 @@ impl Provider for GeminiProvider {
             &self.command,
             &self.args,
             &input,
+            &policy,
             timeout_secs,
             Some(&self.env),
             Some(&policy.cwd),
@@ -97,17 +108,22 @@ impl Provider for GeminiProvider {
 impl PersistentProvider for GeminiProvider {
     async fn start_persistent_instance(
         &self,
+        cwd: std::path::PathBuf,
         envs: HashMap<String, String>,
     ) -> Result<Box<dyn LiveInstance>, ProviderError> {
         use std::process::Stdio;
-        use switchyard_provider_subprocess::{build_subprocess_invocation_plan, SubprocessLiveInstance};
+        use switchyard_provider_subprocess::{
+            SubprocessLiveInstance, build_subprocess_invocation_plan,
+        };
 
-        let plan = build_subprocess_invocation_plan(&self.original_command, &self.command, &self.args);
+        let plan =
+            build_subprocess_invocation_plan(&self.original_command, &self.command, &self.args);
         let mut cmd = tokio::process::Command::new(&plan.command);
         cmd.args(&plan.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .current_dir(&cwd);
 
         for (k, v) in envs {
             cmd.env(k, v);

@@ -129,9 +129,9 @@ impl SqliteStore {
 
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        
+
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        
+
         let store = Self { conn };
         if user_version < SQLITE_SCHEMA_VERSION {
             store.initialize_schema()?;
@@ -330,7 +330,10 @@ impl SessionRepository for SqliteStore {
         tx.execute("DELETE FROM turns_log WHERE session_id = ?1", params![sid])?;
         tx.execute("DELETE FROM events WHERE session_id = ?1", params![sid])?;
         tx.execute("DELETE FROM artifacts WHERE session_id = ?1", params![sid])?;
-        tx.execute("DELETE FROM session_inbox WHERE session_id = ?1", params![sid])?;
+        tx.execute(
+            "DELETE FROM session_inbox WHERE session_id = ?1",
+            params![sid],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -378,6 +381,54 @@ impl TurnRepository for SqliteStore {
             turns.push(serde_json::from_str::<Turn>(&json)?);
         }
         Ok(collapse_turns(turns))
+    }
+
+    fn delete_turn_tail(&mut self, turn_id: Uuid) -> Result<(), StoreError> {
+        // Look up the smallest sequence_id for this turn (in case the row was
+        // appended more than once across edits) plus its session. The
+        // aggregate query always returns one row, even when the turn doesn't
+        // exist — both columns come back NULL, hence the `Option` types.
+        let row: (Option<i64>, Option<String>) = self.conn.query_row(
+            "SELECT MIN(sequence_id), session_id \
+             FROM turns_log WHERE turn_id = ?1",
+            params![turn_id.to_string()],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )?;
+        let (Some(min_seq), Some(session_id_str)) = row else {
+            return Ok(()); // unknown turn — no-op
+        };
+
+        let tx = self.conn.transaction()?;
+
+        // Capture the set of turn_ids in the tail before deleting anything
+        // from turns_log — we need them to scrub events/artifacts/index.
+        let tail_turn_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT turn_id FROM turns_log \
+                 WHERE session_id = ?1 AND sequence_id >= ?2",
+            )?;
+            let rows =
+                stmt.query_map(params![session_id_str, min_seq], |r| r.get::<_, String>(0))?;
+            let mut ids = Vec::new();
+            for r in rows {
+                ids.push(r?);
+            }
+            ids
+        };
+
+        for tid in &tail_turn_ids {
+            tx.execute("DELETE FROM events WHERE turn_id = ?1", params![tid])?;
+            tx.execute("DELETE FROM artifacts WHERE turn_id = ?1", params![tid])?;
+            tx.execute("DELETE FROM turn_index WHERE turn_id = ?1", params![tid])?;
+        }
+
+        tx.execute(
+            "DELETE FROM turns_log WHERE session_id = ?1 AND sequence_id >= ?2",
+            params![session_id_str, min_seq],
+        )?;
+
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -631,6 +682,62 @@ mod tests {
         assert_eq!(turns[0].turn_id, turn_id);
         assert_eq!(turns[0].status, TurnStatus::Completed);
         assert_eq!(turns[0].provider_response.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn delete_turn_tail_drops_target_and_descendants() {
+        let (path, _dir) = temp_db_path();
+        let mut store = SqliteStore::new(path).unwrap();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let t1 = Turn::new(session.session_id, "codex", TurnRole::Core, "first");
+        let t2 = Turn::new(session.session_id, "codex", TurnRole::Core, "second");
+        let t3 = Turn::new(session.session_id, "codex", TurnRole::Core, "third");
+        store.append_turn(&t1).unwrap();
+        store.append_turn(&t2).unwrap();
+        store.append_turn(&t3).unwrap();
+
+        for t in [&t1, &t2, &t3] {
+            store
+                .append_event(&Event::new(
+                    t.turn_id,
+                    EventType::TurnStarted,
+                    "codex",
+                    serde_json::json!({}),
+                ))
+                .unwrap();
+        }
+        store
+            .save_artifact(&Artifact::new(
+                t2.turn_id,
+                ArtifactType::RawProviderOutput,
+                "raw",
+            ))
+            .unwrap();
+
+        store.delete_turn_tail(t2.turn_id).unwrap();
+
+        let surviving = store.list_turns(session.session_id).unwrap();
+        assert_eq!(surviving.len(), 1, "only t1 should remain");
+        assert_eq!(surviving[0].turn_id, t1.turn_id);
+        assert_eq!(store.list_events(t1.turn_id).unwrap().len(), 1);
+        assert!(store.list_events(t2.turn_id).unwrap().is_empty());
+        assert!(store.list_events(t3.turn_id).unwrap().is_empty());
+        assert!(store.list_artifacts(t2.turn_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_turn_tail_unknown_id_is_noop() {
+        let (path, _dir) = temp_db_path();
+        let mut store = SqliteStore::new(path).unwrap();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+        let t1 = Turn::new(session.session_id, "codex", TurnRole::Core, "only");
+        store.append_turn(&t1).unwrap();
+
+        store.delete_turn_tail(Uuid::now_v7()).unwrap();
+        assert_eq!(store.list_turns(session.session_id).unwrap().len(), 1);
     }
 
     #[test]

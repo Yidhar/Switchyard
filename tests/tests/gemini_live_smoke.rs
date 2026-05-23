@@ -42,6 +42,7 @@ async fn gemini_minimal_turn() {
     let input = switchyard_provider_api::TurnInput {
         user_message: "Say exactly: hello switchyard".to_string(),
         system_prompt: None,
+        attachments: Vec::new(),
     };
     let policy = switchyard_provider_api::ExecutionPolicy {
         timeout_secs: 120,

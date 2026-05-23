@@ -174,7 +174,10 @@ impl SessionRepository for JsonlStore {
         if dir.exists() {
             fs::remove_dir_all(dir)?;
         }
-        self.index.borrow_mut().map.retain(|_, &mut sid| sid != session_id);
+        self.index
+            .borrow_mut()
+            .map
+            .retain(|_, &mut sid| sid != session_id);
         Ok(())
     }
 }
@@ -192,6 +195,55 @@ impl TurnRepository for JsonlStore {
         let path = self.session_dir(session_id).join("turns.jsonl");
         let raw: Vec<Turn> = read_jsonl(&path)?;
         Ok(collapse_turns(raw))
+    }
+
+    fn delete_turn_tail(&mut self, turn_id: Uuid) -> Result<(), StoreError> {
+        let session_id = match self.resolve_turn(turn_id) {
+            Ok(sid) => sid,
+            Err(_) => return Ok(()), // unknown — no-op
+        };
+        let dir = self.session_dir(session_id);
+        let turns_path = dir.join("turns.jsonl");
+        let events_path = dir.join("events.jsonl");
+        let artifacts_path = dir.join("artifacts.jsonl");
+
+        // Find the FIRST occurrence of `turn_id` in the raw (uncollapsed) log
+        // and drop the suffix. Anything appended after that physically
+        // represents history that came later in time.
+        let all_turns: Vec<Turn> = read_jsonl(&turns_path)?;
+        let Some(cut_idx) = all_turns.iter().position(|t| t.turn_id == turn_id) else {
+            return Ok(());
+        };
+
+        let (head_turns, tail_turns) = all_turns.split_at(cut_idx);
+        let dropped_turn_ids: std::collections::HashSet<Uuid> =
+            tail_turns.iter().map(|t| t.turn_id).collect();
+
+        rewrite_jsonl(&turns_path, head_turns)?;
+
+        // Filter events / artifacts to those still referenced by a surviving turn.
+        let all_events: Vec<Event> = read_jsonl(&events_path)?;
+        let kept_events: Vec<&Event> = all_events
+            .iter()
+            .filter(|e| !dropped_turn_ids.contains(&e.turn_id))
+            .collect();
+        rewrite_jsonl(&events_path, kept_events)?;
+
+        let all_artifacts: Vec<Artifact> = read_jsonl(&artifacts_path)?;
+        let kept_artifacts: Vec<&Artifact> = all_artifacts
+            .iter()
+            .filter(|a| !dropped_turn_ids.contains(&a.turn_id))
+            .collect();
+        rewrite_jsonl(&artifacts_path, kept_artifacts)?;
+
+        // Drop the deleted turn_ids from the in-memory index.
+        {
+            let mut idx = self.index.borrow_mut();
+            for tid in &dropped_turn_ids {
+                idx.map.remove(tid);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -300,6 +352,37 @@ fn append_jsonl<T: serde::Serialize>(path: &Path, item: &T) -> Result<(), StoreE
     Ok(())
 }
 
+/// Atomically replace `path` with a fresh JSONL file containing `items`.
+/// Writes to a sibling `*.tmp` then `rename`s — partial truncation leaves the
+/// original intact on filesystems that honour `rename` atomicity.
+fn rewrite_jsonl<I, T>(path: &Path, items: I) -> Result<(), StoreError>
+where
+    I: IntoIterator<Item = T>,
+    T: serde::Serialize,
+{
+    if !path.exists() {
+        // Nothing to rewrite. Bail out early so we don't accidentally create
+        // an empty file where none existed (e.g. artifacts.jsonl for a
+        // session that never produced artifacts).
+        return Ok(());
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        for item in items {
+            let line = serde_json::to_string(&item)?;
+            writeln!(file, "{line}")?;
+        }
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, StoreError> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
@@ -360,6 +443,69 @@ mod tests {
         let (store, _dir) = temp_store();
         let result = store.load_session(Uuid::now_v7()).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_turn_tail_drops_target_and_descendants() {
+        let (mut store, _dir) = temp_store();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let t1 = Turn::new(session.session_id, "codex", TurnRole::Core, "first");
+        let t2 = Turn::new(session.session_id, "codex", TurnRole::Core, "second");
+        let t3 = Turn::new(session.session_id, "codex", TurnRole::Core, "third");
+        store.append_turn(&t1).unwrap();
+        store.append_turn(&t2).unwrap();
+        store.append_turn(&t3).unwrap();
+
+        // One event under each turn, plus an artifact under t2 to verify
+        // cross-table cleanup.
+        for t in [&t1, &t2, &t3] {
+            store
+                .append_event(&Event::new(
+                    t.turn_id,
+                    EventType::TurnStarted,
+                    "codex",
+                    serde_json::json!({}),
+                ))
+                .unwrap();
+        }
+        store
+            .save_artifact(&Artifact::new(
+                t2.turn_id,
+                ArtifactType::RawProviderOutput,
+                "raw output",
+            ))
+            .unwrap();
+
+        store.delete_turn_tail(t2.turn_id).unwrap();
+
+        let surviving = store.list_turns(session.session_id).unwrap();
+        assert_eq!(surviving.len(), 1, "only t1 should remain");
+        assert_eq!(surviving[0].turn_id, t1.turn_id);
+
+        // Events for t2 and t3 are gone; t1's still there.
+        assert_eq!(store.list_events(t1.turn_id).unwrap().len(), 1);
+        assert!(
+            store.list_events(t2.turn_id).is_err()
+                || store.list_events(t2.turn_id).unwrap().is_empty()
+        );
+        assert!(
+            store.list_events(t3.turn_id).is_err()
+                || store.list_events(t3.turn_id).unwrap().is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_turn_tail_unknown_id_is_noop() {
+        let (mut store, _dir) = temp_store();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+        let t1 = Turn::new(session.session_id, "codex", TurnRole::Core, "only");
+        store.append_turn(&t1).unwrap();
+
+        store.delete_turn_tail(Uuid::now_v7()).unwrap();
+        assert_eq!(store.list_turns(session.session_id).unwrap().len(), 1);
     }
 
     #[test]

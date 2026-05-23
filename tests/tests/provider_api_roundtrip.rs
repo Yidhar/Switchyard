@@ -137,6 +137,7 @@ fn turn_input_roundtrip() {
     let input = TurnInput {
         user_message: "fix the bug".to_string(),
         system_prompt: Some("you are a coder".to_string()),
+        attachments: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: TurnInput = serde_json::from_str(&json).unwrap();

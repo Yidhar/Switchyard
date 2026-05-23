@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Terminal, Users, Network, Search, ChevronLeft, RefreshCw, ClipboardList, FileText, Trash2, Edit } from 'lucide-react';
-import type { Turn, TelemetryLog, ProviderStatus, Session } from '../types';
+import { Terminal, Users, Network, Search, ChevronLeft, RefreshCw, ClipboardList, FileText, Trash2, Edit, Power } from 'lucide-react';
+import type { Turn, TelemetryLog, ProviderStatus, Session, InstanceMetadata } from '../types';
 import { TopologyGraph } from './ui/TopologyGraph';
 
 interface ChecklistItem {
@@ -32,9 +32,8 @@ interface ControlCenterProps {
   providerStatusLoading: boolean;
   providerStatusError: string | null;
   refreshProviderStatuses: () => void;
-  activePersistentInstances: string[];
-  onStartPersistentInstance: (provider: string) => Promise<void>;
-  onStopPersistentInstance: (provider: string) => Promise<void>;
+  sessionWorkers: InstanceMetadata[];
+  onResetCore: () => Promise<void>;
   selectedSession: Session | null;
   onUpdateSessionSummary: (sessionId: string, summary: string | null) => Promise<void>;
   onUpdateSessionChecklist: (sessionId: string, checklistJson: string) => Promise<void>;
@@ -65,17 +64,16 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   providerStatusLoading,
   providerStatusError,
   refreshProviderStatuses,
-  activePersistentInstances,
-  onStartPersistentInstance,
-  onStopPersistentInstance,
+  sessionWorkers,
+  onResetCore,
   selectedSession,
   onUpdateSessionSummary,
   onUpdateSessionChecklist,
 }) => {
-  const [activeTab, setActiveTab] = useState<TabType>('topology');
+  const [activeTab, setActiveTab] = useState<TabType>('agents');
   const [logSearch, setLogSearch] = useState('');
   const [selectedLogTag, setSelectedLogTag] = useState<'all' | 'core' | 'peer' | 'sys' | 'info'>('all');
-  const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
+  const [resetCoreLoading, setResetCoreLoading] = useState(false);
   
   const [editingSummary, setEditingSummary] = useState(false);
   const [summaryText, setSummaryText] = useState('');
@@ -136,18 +134,60 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
     }
   };
 
-  const handleTogglePersistent = async (providerId: string, active: boolean) => {
-    setActionLoading(prev => ({ ...prev, [providerId]: true }));
+  const handleResetCoreClick = async () => {
+    if (resetCoreLoading) return;
+    if (!confirm('Reset the Core instance? Any in-flight Core turn will be killed; the next message will respawn a fresh process.')) {
+      return;
+    }
+    setResetCoreLoading(true);
     try {
-      if (active) {
-        await onStopPersistentInstance(providerId);
-      } else {
-        await onStartPersistentInstance(providerId);
-      }
+      await onResetCore();
     } catch (e) {
       alert(e);
     } finally {
-      setActionLoading(prev => ({ ...prev, [providerId]: false }));
+      setResetCoreLoading(false);
+    }
+  };
+
+  // Split sessionWorkers into Core vs Worker views; format uptime/state for display.
+  const coreInstances = sessionWorkers.filter((w) => w.kind === 'core');
+  const teamWorkers = sessionWorkers.filter((w) => w.kind === 'worker');
+
+  // Tick `now` once a second so uptime displays advance without depending on
+  // the 3-second worker polling cadence. Keeps formatUptime pure relative to
+  // a render (no Date.now() at render time).
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const handle = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(handle);
+  }, []);
+
+  const formatUptime = (spawnedAt: string): string => {
+    const ms = now - new Date(spawnedAt).getTime();
+    if (ms < 1000) return 'just now';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${m % 60}m`;
+  };
+
+  const stateBadgeColor = (state: InstanceMetadata['state']): string => {
+    switch (state) {
+      case 'idle':
+        return 'var(--color-success)';
+      case 'busy':
+        return 'var(--color-primary)';
+      case 'spawning':
+        return 'var(--color-warning)';
+      case 'retrying':
+        return 'var(--color-warning)';
+      case 'dying':
+      case 'dead':
+        return 'var(--color-error)';
+      default:
+        return 'var(--text-muted)';
     }
   };
   
@@ -251,37 +291,15 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   return (
     <div className="control-panel glass-panel" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       {/* Tabs Header */}
-      <div 
-        style={{ 
-          display: 'flex', 
-          borderBottom: '1px solid var(--border-muted)', 
-          background: 'rgba(0,0,0,0.1)', 
-          padding: '4px' 
+      <div
+        style={{
+          display: 'flex',
+          borderBottom: '1px solid var(--border-muted)',
+          background: 'rgba(0,0,0,0.1)',
+          padding: '4px',
         }}
       >
-        <button 
-          onClick={() => setActiveTab('topology')}
-          style={{
-            flex: 1,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: '6px',
-            padding: '8px 4px',
-            fontSize: '11px',
-            fontWeight: '600',
-            borderRadius: '4px',
-            background: activeTab === 'topology' ? 'rgba(59, 130, 246, 0.1)' : 'transparent',
-            color: activeTab === 'topology' ? 'var(--color-primary)' : 'var(--text-secondary)',
-            border: 'none',
-            cursor: 'pointer',
-            transition: 'all 0.2s',
-          }}
-        >
-          <Network size={13} />
-          Topology
-        </button>
-        <button 
+        <button
           onClick={() => setActiveTab('agents')}
           style={{
             flex: 1,
@@ -303,7 +321,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
           <Users size={13} />
           Agents ({agents.length})
         </button>
-        <button 
+        <button
           onClick={() => setActiveTab('checklist')}
           style={{
             flex: 1,
@@ -325,7 +343,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
           <ClipboardList size={13} />
           Checklist ({checklistItems.filter(i => !i.completed).length})
         </button>
-        <button 
+        <button
           onClick={() => setActiveTab('summary')}
           style={{
             flex: 1,
@@ -347,7 +365,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
           <FileText size={13} />
           Summary
         </button>
-        <button 
+        <button
           onClick={() => setActiveTab('telemetry')}
           style={{
             flex: 1,
@@ -368,6 +386,31 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
         >
           <Terminal size={13} />
           Telemetry
+        </button>
+        {/* Topology is decorative — kept available but visually muted and moved last. */}
+        <button
+          onClick={() => setActiveTab('topology')}
+          title="Topology view (decorative)"
+          style={{
+            flex: 0.6,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '4px',
+            padding: '8px 4px',
+            fontSize: '10px',
+            fontWeight: '500',
+            borderRadius: '4px',
+            background: activeTab === 'topology' ? 'rgba(59, 130, 246, 0.08)' : 'transparent',
+            color: activeTab === 'topology' ? 'var(--color-primary)' : 'var(--text-muted)',
+            opacity: activeTab === 'topology' ? 1 : 0.65,
+            border: 'none',
+            cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+        >
+          <Network size={11} />
+          Topology
         </button>
       </div>
 
@@ -497,6 +540,209 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
             ) : (
               // Agent Cards List View
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                {/* Core status card — the session's main provider instance. */}
+                <div
+                  className="glass-panel"
+                  style={{
+                    padding: '12px',
+                    borderLeft: `3px solid ${coreInstances.length > 0 ? 'var(--color-primary)' : 'var(--text-muted)'}`,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '8px',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 'bold', color: 'var(--text-primary)' }}>
+                      Core: <span style={{ textTransform: 'capitalize' }}>{selectedSession?.active_core || '—'}</span>
+                    </div>
+                    <button
+                      onClick={handleResetCoreClick}
+                      disabled={resetCoreLoading || coreInstances.length === 0}
+                      title={
+                        coreInstances.length === 0
+                          ? 'No live Core instance to reset'
+                          : 'Terminate the current Core process; next message respawns it'
+                      }
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        padding: '4px 10px',
+                        fontSize: '10px',
+                        fontWeight: 600,
+                        borderRadius: '3px',
+                        border: '1px solid var(--border-muted)',
+                        background:
+                          coreInstances.length === 0 ? 'transparent' : 'rgba(244, 63, 94, 0.1)',
+                        color:
+                          coreInstances.length === 0 ? 'var(--text-muted)' : '#f43f5e',
+                        cursor:
+                          coreInstances.length === 0 || resetCoreLoading
+                            ? 'not-allowed'
+                            : 'pointer',
+                        opacity: coreInstances.length === 0 ? 0.5 : 1,
+                      }}
+                    >
+                      <Power size={11} />
+                      {resetCoreLoading ? 'Resetting…' : 'Reset Core'}
+                    </button>
+                  </div>
+                  {coreInstances.length === 0 ? (
+                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                      No live Core instance. The next message in this session will spawn one.
+                    </div>
+                  ) : (
+                    coreInstances.map((core) => (
+                      <div
+                        key={core.instance_id}
+                        style={{
+                          display: 'flex',
+                          gap: '12px',
+                          alignItems: 'center',
+                          fontSize: '11px',
+                          color: 'var(--text-secondary)',
+                        }}
+                      >
+                        <span
+                          style={{
+                            width: '6px',
+                            height: '6px',
+                            borderRadius: '50%',
+                            backgroundColor: stateBadgeColor(core.state),
+                            boxShadow: `0 0 6px ${stateBadgeColor(core.state)}`,
+                          }}
+                        />
+                        <span style={{ textTransform: 'uppercase', fontWeight: 600 }}>
+                          {core.state}
+                          {core.in_flight_turn_id && ` · turn ${core.in_flight_turn_id.slice(0, 8)}`}
+                        </span>
+                        <span style={{ color: 'var(--text-muted)' }}>
+                          uptime {formatUptime(core.spawned_at)}
+                        </span>
+                        <span
+                          style={{
+                            color: 'var(--text-muted)',
+                            fontFamily: 'monospace',
+                            fontSize: '10px',
+                          }}
+                          title={core.instance_id}
+                        >
+                          {core.instance_id.slice(0, 8)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {/* Team Workers panel — peer instances spawned by the Core for parallel delegations. */}
+                <div
+                  className="glass-panel"
+                  style={{
+                    padding: '12px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '8px',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 'bold', color: 'var(--text-primary)' }}>
+                      Team Workers ({teamWorkers.length})
+                    </div>
+                    <span
+                      style={{
+                        fontSize: '10px',
+                        color: 'var(--text-muted)',
+                        fontStyle: 'italic',
+                      }}
+                      title="Workers are spawned and managed by the Core. No manual controls."
+                    >
+                      Core-managed
+                    </span>
+                  </div>
+                  {teamWorkers.length === 0 ? (
+                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                      None. The Core will spawn workers when it delegates.
+                    </div>
+                  ) : (
+                    teamWorkers.map((w) => (
+                      <div
+                        key={w.instance_id}
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: '6px 1fr auto auto auto',
+                          gap: '8px',
+                          alignItems: 'center',
+                          padding: '6px 8px',
+                          background: 'rgba(255, 255, 255, 0.02)',
+                          borderRadius: '3px',
+                          fontSize: '11px',
+                        }}
+                      >
+                        <span
+                          style={{
+                            width: '6px',
+                            height: '6px',
+                            borderRadius: '50%',
+                            backgroundColor: stateBadgeColor(w.state),
+                          }}
+                        />
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontWeight: 600, textTransform: 'capitalize' }}>{w.provider}</div>
+                          {w.label && (
+                            <div
+                              style={{
+                                fontSize: '10px',
+                                color: 'var(--text-muted)',
+                                whiteSpace: 'nowrap',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                              }}
+                              title={w.label}
+                            >
+                              {w.label}
+                            </div>
+                          )}
+                        </div>
+                        <span
+                          style={{
+                            fontSize: '10px',
+                            textTransform: 'uppercase',
+                            color: stateBadgeColor(w.state),
+                            fontWeight: 600,
+                          }}
+                        >
+                          {w.state}
+                          {w.in_flight_turn_id && ` · ${w.in_flight_turn_id.slice(0, 6)}`}
+                        </span>
+                        <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
+                          {formatUptime(w.spawned_at)}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: '10px',
+                            color: 'var(--text-muted)',
+                            fontFamily: 'monospace',
+                          }}
+                          title={w.instance_id}
+                        >
+                          {w.instance_id.slice(0, 8)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                <div
+                  style={{
+                    borderTop: '1px solid var(--border-muted)',
+                    paddingTop: '10px',
+                    fontSize: '11px',
+                    color: 'var(--text-muted)',
+                    fontStyle: 'italic',
+                  }}
+                >
+                  Active Delegations (turn-level view)
+                </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   {agents.map((agent) => (
                     <div 
@@ -633,48 +879,8 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                               )}
                             </div>
                             
-                            {status.backend === 'codex' && (
-                              <div style={{
-                                marginTop: '8px',
-                                borderTop: '1px dashed rgba(255, 255, 255, 0.05)',
-                                paddingTop: '8px',
-                                display: 'flex',
-                                justifyContent: 'space-between',
-                                alignItems: 'center'
-                              }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                  <span style={{
-                                    width: '6px',
-                                    height: '6px',
-                                    borderRadius: '50%',
-                                    backgroundColor: activePersistentInstances.includes(status.provider_id) ? 'var(--color-success)' : 'var(--text-muted)',
-                                    boxShadow: activePersistentInstances.includes(status.provider_id) ? '0 0 8px var(--color-success)' : 'none'
-                                  }} />
-                                  <span style={{ fontSize: '10px', color: activePersistentInstances.includes(status.provider_id) ? 'var(--color-success)' : 'var(--text-secondary)' }}>
-                                    {activePersistentInstances.includes(status.provider_id) ? 'Connected (Idle)' : 'Persistent Standby'}
-                                  </span>
-                                </div>
-                                <button
-                                  onClick={() => handleTogglePersistent(status.provider_id, activePersistentInstances.includes(status.provider_id))}
-                                  disabled={actionLoading[status.provider_id] || !status.available}
-                                  style={{
-                                    padding: '2px 8px',
-                                    fontSize: '9px',
-                                    fontWeight: '600',
-                                    borderRadius: '3px',
-                                    border: '1px solid var(--border-muted)',
-                                    cursor: 'pointer',
-                                    background: activePersistentInstances.includes(status.provider_id) ? 'rgba(244, 63, 94, 0.1)' : 'rgba(59, 130, 246, 0.1)',
-                                    color: activePersistentInstances.includes(status.provider_id) ? '#f43f5e' : 'var(--color-primary)',
-                                    borderColor: activePersistentInstances.includes(status.provider_id) ? '#f43f5e' : 'var(--color-primary)',
-                                    opacity: status.available ? 1 : 0.5,
-                                    transition: 'all 0.2s'
-                                  }}
-                                >
-                                  {actionLoading[status.provider_id] ? '...' : activePersistentInstances.includes(status.provider_id) ? 'Disconnect' : 'Connect'}
-                                </button>
-                              </div>
-                            )}
+                            {/* Connect/Disconnect removed — instances are now Core-managed.
+                                See Core / Team Workers panels above for live state. */}
                           </div>
                         );
                       })}

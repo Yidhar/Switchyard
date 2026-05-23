@@ -11,4 +11,3 @@ pub enum ConfigError {
     #[error("config serialization error: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
-

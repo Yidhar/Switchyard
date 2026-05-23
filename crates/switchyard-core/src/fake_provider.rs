@@ -221,6 +221,7 @@ mod tests {
                 TurnInput {
                     user_message: "hi".to_string(),
                     system_prompt: None,
+                    attachments: Vec::new(),
                 },
                 ExecutionPolicy {
                     timeout_secs: 30,
@@ -268,6 +269,7 @@ mod tests {
                 TurnInput {
                     user_message: "crash".to_string(),
                     system_prompt: None,
+                    attachments: Vec::new(),
                 },
                 ExecutionPolicy {
                     timeout_secs: 30,
@@ -312,6 +314,7 @@ mod tests {
                 TurnInput {
                     user_message: "slow".to_string(),
                     system_prompt: None,
+                    attachments: Vec::new(),
                 },
                 ExecutionPolicy {
                     timeout_secs: 1,

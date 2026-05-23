@@ -1,9 +1,17 @@
 //! Claude Code CLI adapter.
 //!
-//! Non-interactive mode: `claude -p --output-format stream-json "prompt"`
+//! Two execution modes:
+//! - Per-turn: `claude -p --output-format stream-json "prompt"` (see `turn`)
+//! - Persistent: long-running `claude --print --input-format stream-json
+//!   --output-format stream-json --session-id <uuid> --include-partial-messages
+//!   --verbose` driven via stdin (see `live`)
 
+mod live;
 mod probe;
+mod stream_json;
 mod turn;
+
+pub use live::ClaudeLiveInstance;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +33,12 @@ pub struct ClaudeProvider {
 }
 
 impl ClaudeProvider {
-    pub fn new(command: impl Into<String>, args: Vec<String>, env: HashMap<String, String>, timeout_secs: u64) -> Self {
+    pub fn new(
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        timeout_secs: u64,
+    ) -> Self {
         let original_command = command.into();
         let command = resolve_command(&original_command);
         Self {
@@ -39,7 +52,12 @@ impl ClaudeProvider {
     }
 
     pub fn from_config(cfg: &switchyard_config::ProviderConfig) -> Self {
-        Self::new(cfg.command.clone(), cfg.args.clone(), cfg.env.clone(), cfg.timeout_secs)
+        Self::new(
+            cfg.command.clone(),
+            cfg.args.clone(),
+            cfg.env.clone(),
+            cfg.timeout_secs,
+        )
     }
 }
 
@@ -67,6 +85,7 @@ impl Provider for ClaudeProvider {
             &input,
             timeout_secs,
             Some(&self.env),
+            &policy,
             Some(&policy.cwd),
             &event_tx,
             cancel,
@@ -97,27 +116,33 @@ impl Provider for ClaudeProvider {
 impl PersistentProvider for ClaudeProvider {
     async fn start_persistent_instance(
         &self,
+        cwd: std::path::PathBuf,
         envs: HashMap<String, String>,
     ) -> Result<Box<dyn LiveInstance>, ProviderError> {
-        use std::process::Stdio;
-        use switchyard_provider_subprocess::{build_subprocess_invocation_plan, SubprocessLiveInstance};
+        let instance =
+            ClaudeLiveInstance::spawn(&self.command, &self.args, envs, Some(&cwd)).await?;
+        Ok(Box::new(instance))
+    }
 
-        let plan = build_subprocess_invocation_plan(&self.original_command, &self.command, &self.args);
-        let mut cmd = tokio::process::Command::new(&plan.command);
-        cmd.args(&plan.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-
-        let child = cmd.spawn().map_err(|e| {
-            ProviderError::ExecutionFailed(format!("Failed to spawn persistent Claude CLI: {e}"))
-        })?;
-
-        let instance = SubprocessLiveInstance::new("claude", child)?;
+    async fn start_persistent_instance_resumed(
+        &self,
+        cwd: std::path::PathBuf,
+        envs: HashMap<String, String>,
+        resume_token: Option<String>,
+    ) -> Result<Box<dyn LiveInstance>, ProviderError> {
+        // Pass the prior `--session-id` through. When the on-disk transcript
+        // exists, claude resumes the conversation seamlessly; when it's
+        // missing (project moved, transcript deleted), claude still spawns
+        // with the same id but no prior context. Either way the call never
+        // fails because of a stale token, matching the Codex G semantics.
+        let instance = ClaudeLiveInstance::spawn_with_resume(
+            &self.command,
+            &self.args,
+            envs,
+            Some(&cwd),
+            resume_token.as_deref(),
+        )
+        .await?;
         Ok(Box::new(instance))
     }
 }

@@ -7,9 +7,12 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use switchyard_context::ContextComposer;
-use switchyard_provider_api::{ContextBundle, ExecutionPolicy, Provider, TurnInput};
+use switchyard_provider_api::{
+    ContextBundle, ExecutionPolicy, InputAttachment, Provider, TurnInput,
+};
 use switchyard_provider_api::{
     extract_execution_telemetry, extract_hyard_job_observation, extract_terminal_output,
+    is_empty_reasoning_payload,
 };
 use switchyard_session::{Session, Turn, TurnRole, TurnStatus};
 use switchyard_store::CanonicalStore;
@@ -76,7 +79,33 @@ pub async fn run_turn_full<S: CanonicalStore + ?Sized>(
     artifact_dir: Option<&std::path::Path>,
     runtime_tx: Option<&mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
 ) -> Result<TurnOutput, CoreError> {
-    run_turn_phased(
+    let policy = ExecutionPolicy::workspace_write(cwd.clone());
+    run_turn_full_with_policy(
+        store,
+        session,
+        provider,
+        user_message,
+        cwd,
+        artifact_dir,
+        runtime_tx,
+        policy,
+    )
+    .await
+}
+
+/// Full turn execution with explicit sandbox / approval policy.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_full_with_policy<S: CanonicalStore + ?Sized>(
+    store: &mut S,
+    session: &mut Session,
+    provider: &dyn Provider,
+    user_message: String,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    runtime_tx: Option<&mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    policy: ExecutionPolicy,
+) -> Result<TurnOutput, CoreError> {
+    run_turn_phased_with_policy(
         store,
         session,
         provider,
@@ -86,6 +115,60 @@ pub async fn run_turn_full<S: CanonicalStore + ?Sized>(
         runtime_tx,
         TurnPhase::Normal,
         switchyard_provider_api::CancellationToken::new(),
+        policy,
+    )
+    .await
+}
+
+/// Full turn execution with explicit sandbox / approval policy.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_with_policy<S: CanonicalStore + ?Sized>(
+    store: &mut S,
+    session: &mut Session,
+    provider: &dyn Provider,
+    user_message: String,
+    cwd: PathBuf,
+    policy: ExecutionPolicy,
+) -> Result<TurnOutput, CoreError> {
+    run_turn_full_with_policy(
+        store,
+        session,
+        provider,
+        user_message,
+        cwd,
+        None,
+        None,
+        policy,
+    )
+    .await
+}
+
+/// Full turn execution with explicit phase, cancellation and policy support.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_phased_with_policy(
+    store: &mut (impl CanonicalStore + ?Sized),
+    session: &mut Session,
+    provider: &dyn Provider,
+    user_message: String,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    runtime_tx: Option<&mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    phase: TurnPhase,
+    cancel: switchyard_provider_api::CancellationToken,
+    policy: ExecutionPolicy,
+) -> Result<TurnOutput, CoreError> {
+    run_turn_phased_with_messages_and_policy(
+        store,
+        session,
+        provider,
+        user_message.clone(),
+        user_message,
+        cwd,
+        artifact_dir,
+        runtime_tx,
+        phase,
+        cancel,
+        policy,
     )
     .await
 }
@@ -103,17 +186,18 @@ pub async fn run_turn_phased(
     phase: TurnPhase,
     cancel: switchyard_provider_api::CancellationToken,
 ) -> Result<TurnOutput, CoreError> {
-    run_turn_phased_with_messages(
+    let policy = ExecutionPolicy::workspace_write(cwd.clone());
+    run_turn_phased_with_policy(
         store,
         session,
         provider,
-        user_message.clone(),
         user_message,
         cwd,
         artifact_dir,
         runtime_tx,
         phase,
         cancel,
+        policy,
     )
     .await
 }
@@ -123,6 +207,7 @@ pub async fn run_turn_phased(
 /// This lets the router inject internal prompt context for the provider without
 /// polluting the persisted user turn that appears in session history.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) async fn run_turn_phased_with_messages(
     store: &mut (impl CanonicalStore + ?Sized),
     session: &mut Session,
@@ -135,6 +220,79 @@ pub(crate) async fn run_turn_phased_with_messages(
     phase: TurnPhase,
     cancel: switchyard_provider_api::CancellationToken,
 ) -> Result<TurnOutput, CoreError> {
+    let policy = ExecutionPolicy::workspace_write(cwd.clone());
+    run_turn_phased_with_messages_and_policy(
+        store,
+        session,
+        provider,
+        stored_user_message,
+        provider_user_message,
+        cwd,
+        artifact_dir,
+        runtime_tx,
+        phase,
+        cancel,
+        policy,
+    )
+    .await
+}
+
+/// Full turn execution with distinct stored and provider-facing user messages.
+///
+/// This lets the router inject internal prompt context for the provider without
+/// polluting the persisted user turn that appears in session history.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_turn_phased_with_messages_and_policy(
+    store: &mut (impl CanonicalStore + ?Sized),
+    session: &mut Session,
+    provider: &dyn Provider,
+    stored_user_message: String,
+    provider_user_message: String,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    runtime_tx: Option<&mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    phase: TurnPhase,
+    cancel: switchyard_provider_api::CancellationToken,
+    policy: ExecutionPolicy,
+) -> Result<TurnOutput, CoreError> {
+    run_turn_phased_with_messages_policy_and_attachments(
+        store,
+        session,
+        provider,
+        stored_user_message,
+        provider_user_message,
+        cwd,
+        artifact_dir,
+        runtime_tx,
+        phase,
+        cancel,
+        Vec::new(),
+        policy,
+    )
+    .await
+}
+
+/// Full turn execution with distinct stored/provider-facing messages and
+/// optional local input attachments. Attachments are passed only to the
+/// provider-facing [`TurnInput`]; the caller is responsible for including any
+/// desired attachment reference note in `stored_user_message`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
+    store: &mut (impl CanonicalStore + ?Sized),
+    session: &mut Session,
+    provider: &dyn Provider,
+    stored_user_message: String,
+    provider_user_message: String,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    runtime_tx: Option<&mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    phase: TurnPhase,
+    cancel: switchyard_provider_api::CancellationToken,
+    attachments: Vec<InputAttachment>,
+    mut policy: ExecutionPolicy,
+) -> Result<TurnOutput, CoreError> {
+    policy.cwd = cwd;
+
     // 1. Create Turn
     let turn = match phase {
         TurnPhase::Normal => Turn::new(
@@ -197,14 +355,6 @@ pub(crate) async fn run_turn_phased_with_messages(
             .collect(),
     };
 
-    let policy = ExecutionPolicy {
-        // 0 = use the provider's configured default timeout.
-        timeout_secs: 0,
-        write_access: true,
-        cwd,
-        allowed_paths: vec![],
-    };
-
     let rendered_context = switchyard_provider_subprocess::render_context_bundle(&context);
     let input = TurnInput {
         user_message: provider_user_message,
@@ -213,6 +363,7 @@ pub(crate) async fn run_turn_phased_with_messages(
         } else {
             Some(rendered_context)
         },
+        attachments,
     };
 
     // Bounded channel prevents backpressure deadlock when provider emits faster than we drain.
@@ -235,30 +386,38 @@ pub(crate) async fn run_turn_phased_with_messages(
         if pe.event_type == switchyard_provider_api::EventType::TurnFailed {
             *failed = true;
         }
+        let empty_reasoning_payload = is_empty_reasoning_payload(&pe.payload);
         if let Some(tx) = runtime_tx {
             if let Some(execution) = extract_execution_telemetry(&pe.payload) {
-                let _ = tx.try_send(
-                    crate::runtime_events::RuntimeEvent::CoreExecutionTelemetry {
-                        turn_id: pe.turn_id,
-                        provider: pe.provider.clone(),
-                        execution,
-                    },
-                );
+                let _ = tx
+                    .send(
+                        crate::runtime_events::RuntimeEvent::CoreExecutionTelemetry {
+                            turn_id: pe.turn_id,
+                            provider: pe.provider.clone(),
+                            execution,
+                        },
+                    )
+                    .await;
             }
             if let Some(job) = extract_hyard_job_observation(&pe.payload) {
-                let _ = tx.try_send(crate::runtime_events::RuntimeEvent::HyardJobObserved {
-                    source_provider: pe.provider.clone(),
-                    observed_at: pe.timestamp.to_rfc3339(),
-                    job,
-                });
+                let _ = tx
+                    .send(crate::runtime_events::RuntimeEvent::HyardJobObserved {
+                        turn_id: pe.turn_id,
+                        source_provider: pe.provider.clone(),
+                        observed_at: pe.timestamp.to_rfc3339(),
+                        job,
+                    })
+                    .await;
             }
             if let Some(terminal) = extract_terminal_output(&pe.payload) {
-                let _ = tx.try_send(crate::runtime_events::RuntimeEvent::CoreTerminalOutput {
-                    turn_id: pe.turn_id,
-                    provider: pe.provider.clone(),
-                    text: terminal.line,
-                    transport: terminal.transport,
-                });
+                let _ = tx
+                    .send(crate::runtime_events::RuntimeEvent::CoreTerminalOutput {
+                        turn_id: pe.turn_id,
+                        provider: pe.provider.clone(),
+                        text: terminal.line,
+                        transport: terminal.transport,
+                    })
+                    .await;
             }
             if pe.event_type == switchyard_provider_api::EventType::TurnCompleted
                 && !*output_completed
@@ -271,15 +430,46 @@ pub(crate) async fn run_turn_phased_with_messages(
                 .await
                 .ok();
             }
-            // Streaming items: best-effort (droppable). Never block execution.
-            if let Some(text) = pe.display_text_or_summary() {
-                let _ = tx.try_send(crate::runtime_events::RuntimeEvent::CoreItemUpdated {
-                    turn_id: pe.turn_id,
-                    provider: pe.provider.clone(),
-                    text,
-                    payload: Some(pe.payload.clone()),
-                });
+            // Streaming items are user-visible progress. Send them through the
+            // runtime channel reliably; otherwise a small GUI bridge buffer can
+            // make the chat appear silent until the final DB refresh.
+            //
+            // Some provider protocols emit a lifecycle item whose useful data is
+            // only in the JSON payload (for example a tool card with no summary
+            // text yet). Forward those payload-only lifecycle events too so the
+            // GUI can render tool/runtime cards immediately instead of waiting
+            // for a later DB refresh. Terminal output is already mirrored via
+            // CoreTerminalOutput, so do not duplicate terminal-only payloads
+            // into the item stream.
+            let item_text = pe.display_text_or_summary();
+            let is_item_lifecycle = matches!(
+                pe.event_type,
+                switchyard_provider_api::EventType::ItemStarted
+                    | switchyard_provider_api::EventType::ItemUpdated
+                    | switchyard_provider_api::EventType::ItemCompleted
+                    | switchyard_provider_api::EventType::ArtifactReady
+            );
+            let is_terminal_payload =
+                switchyard_provider_api::extract_terminal_output(&pe.payload).is_some();
+            if !empty_reasoning_payload
+                && (item_text.is_some() || (is_item_lifecycle && !is_terminal_payload))
+            {
+                let _ = tx
+                    .send(crate::runtime_events::RuntimeEvent::CoreItemUpdated {
+                        turn_id: pe.turn_id,
+                        provider: pe.provider.clone(),
+                        event_type: pe.event_type.to_string(),
+                        text: item_text.unwrap_or_default(),
+                        payload: Some(pe.payload.clone()),
+                    })
+                    .await;
             }
+        }
+        if empty_reasoning_payload {
+            // Empty reasoning heartbeats are high-frequency protocol noise. They
+            // are not forwarded live and must not be persisted either, or a
+            // later DB refresh will reintroduce the same empty cards into the GUI.
+            return Ok(());
         }
         let canonical = map_provider_event(pe);
         store.append_event(&canonical)?;
@@ -482,16 +672,38 @@ fn is_system_status_line(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.starts_with('[') {
         let prefixes = [
-            "[会话]", "[回合]", "[系统]", "[系统反馈]", "[助手]", "[结果]", "[限额]",
-            "[思考]", "[工具]", "[文件]", "[Diff]", "[待办]", "[委托]",
-            "[错误]", "[执行]", "[exec]", "[HTTP]", "[STDIO]", "[hyard]", "[error]", "[命令]"
+            "[会话]",
+            "[回合]",
+            "[系统]",
+            "[系统反馈]",
+            "[助手]",
+            "[结果]",
+            "[限额]",
+            "[思考]",
+            "[工具]",
+            "[文件]",
+            "[Diff]",
+            "[待办]",
+            "[委托]",
+            "[错误]",
+            "[执行]",
+            "[exec]",
+            "[HTTP]",
+            "[STDIO]",
+            "[hyard]",
+            "[error]",
+            "[命令]",
         ];
         if prefixes.iter().any(|prefix| trimmed.starts_with(prefix)) {
             return true;
         }
         if let Some(end_idx) = trimmed.find(']') {
             let inside = &trimmed[1..end_idx];
-            if !inside.is_empty() && inside.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ':' || c == '/') {
+            if !inside.is_empty()
+                && inside
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ':' || c == '/')
+            {
                 return true;
             }
         }
@@ -500,13 +712,17 @@ fn is_system_status_line(text: &str) -> bool {
 }
 
 fn clean_system_status_lines(text: &str) -> String {
-    let lines: Vec<&str> = text.lines()
+    let lines: Vec<&str> = text
+        .lines()
         .filter(|line| !is_system_status_line(line))
         .collect();
     lines.join("\n")
 }
 
-fn update_accumulated_response(accumulated: &mut String, pe: &switchyard_provider_api::ProviderEvent) {
+fn update_accumulated_response(
+    accumulated: &mut String,
+    pe: &switchyard_provider_api::ProviderEvent,
+) {
     let payload = &pe.payload;
 
     // 1. Check if it's a text message (plain text)
@@ -523,7 +739,11 @@ fn update_accumulated_response(accumulated: &mut String, pe: &switchyard_provide
             accumulated.push_str(t);
             return;
         }
-        if let Some(t) = delta.get("delta").and_then(|d2| d2.get("text")).and_then(|v| v.as_str()) {
+        if let Some(t) = delta
+            .get("delta")
+            .and_then(|d2| d2.get("text"))
+            .and_then(|v| v.as_str())
+        {
             accumulated.push_str(t);
             return;
         }
@@ -531,7 +751,10 @@ fn update_accumulated_response(accumulated: &mut String, pe: &switchyard_provide
 
     // 3. Check for Gemini content
     if let Some(t) = payload.get("content").and_then(|v| v.as_str()) {
-        let is_delta = payload.get("delta").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_delta = payload
+            .get("delta")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if is_delta {
             accumulated.push_str(t);
         } else {
@@ -577,12 +800,165 @@ fn update_accumulated_response(accumulated: &mut String, pe: &switchyard_provide
 mod tests {
     use super::*;
     use crate::fake_provider::FakeProvider;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use switchyard_session::EventType;
     use switchyard_store::{ArtifactStore, EventLog, SessionRepository, TurnRepository};
 
     fn temp_store() -> (JsonlStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         (JsonlStore::new(dir.path().to_path_buf()), dir)
+    }
+
+    struct PolicyCaptureProvider {
+        seen: Arc<tokio::sync::Mutex<Option<ExecutionPolicy>>>,
+        results: Arc<
+            tokio::sync::Mutex<
+                HashMap<
+                    Uuid,
+                    (
+                        switchyard_provider_api::TurnResult,
+                        switchyard_provider_api::ArtifactBundle,
+                    ),
+                >,
+            >,
+        >,
+    }
+
+    impl PolicyCaptureProvider {
+        fn new() -> Self {
+            Self {
+                seen: Arc::new(tokio::sync::Mutex::new(None)),
+                results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PolicyCaptureProvider {
+        async fn probe(
+            &self,
+        ) -> Result<switchyard_provider_api::ProbeResult, switchyard_provider_api::ProviderError>
+        {
+            Ok(switchyard_provider_api::ProbeResult {
+                version: None,
+                available: true,
+                capabilities: Default::default(),
+                issues: vec![],
+                ..Default::default()
+            })
+        }
+
+        async fn start_turn(
+            &self,
+            turn_id: Uuid,
+            _input: TurnInput,
+            policy: ExecutionPolicy,
+            _context: ContextBundle,
+            event_tx: mpsc::Sender<switchyard_provider_api::ProviderEvent>,
+            _cancel: switchyard_provider_api::CancellationToken,
+        ) -> Result<(), switchyard_provider_api::ProviderError> {
+            *self.seen.lock().await = Some(policy);
+            event_tx
+                .send(switchyard_provider_api::ProviderEvent::turn_started(
+                    turn_id,
+                    "policy-capture",
+                ))
+                .await
+                .ok();
+            event_tx
+                .send(switchyard_provider_api::ProviderEvent::turn_completed(
+                    turn_id,
+                    "policy-capture",
+                ))
+                .await
+                .ok();
+            self.results.lock().await.insert(
+                turn_id,
+                (
+                    switchyard_provider_api::TurnResult {
+                        response_text: "ok".into(),
+                        exit_code: Some(0),
+                        stderr: None,
+                        metadata: HashMap::new(),
+                    },
+                    switchyard_provider_api::ArtifactBundle { artifacts: vec![] },
+                ),
+            );
+            Ok(())
+        }
+
+        async fn finalize_turn(
+            &self,
+            turn_id: Uuid,
+        ) -> Result<
+            (
+                switchyard_provider_api::TurnResult,
+                switchyard_provider_api::ArtifactBundle,
+            ),
+            switchyard_provider_api::ProviderError,
+        > {
+            self.results.lock().await.remove(&turn_id).ok_or(
+                switchyard_provider_api::ProviderError::ExecutionFailed("no result".into()),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_default_policy_is_workspace_write_not_permissive() {
+        let (mut store, _dir) = temp_store();
+        let mut session = Session::new("policy-capture".to_string());
+        store.save_session(&session).unwrap();
+        let provider = PolicyCaptureProvider::new();
+        let cwd = PathBuf::from(".");
+
+        run_turn(
+            &mut store,
+            &mut session,
+            &provider,
+            "capture policy".to_string(),
+            cwd.clone(),
+        )
+        .await
+        .unwrap();
+
+        let seen = provider.seen.lock().await.clone().expect("policy captured");
+        assert!(seen.write_access);
+        assert_eq!(seen.cwd, cwd);
+        assert_eq!(seen.allowed_paths, vec![cwd]);
+        assert_eq!(
+            seen.effective_sandbox_mode(),
+            switchyard_provider_api::EffectiveSandboxMode::WorkspaceWrite
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_with_policy_passes_read_only_policy_through() {
+        let (mut store, _dir) = temp_store();
+        let mut session = Session::new("policy-capture".to_string());
+        store.save_session(&session).unwrap();
+        let provider = PolicyCaptureProvider::new();
+        let cwd = PathBuf::from(".");
+
+        run_turn_with_policy(
+            &mut store,
+            &mut session,
+            &provider,
+            "capture policy".to_string(),
+            cwd.clone(),
+            ExecutionPolicy::read_only(cwd.clone()),
+        )
+        .await
+        .unwrap();
+
+        let seen = provider.seen.lock().await.clone().expect("policy captured");
+        assert!(!seen.write_access);
+        assert_eq!(seen.cwd, cwd);
+        assert!(seen.allowed_paths.is_empty());
+        assert_eq!(
+            seen.effective_sandbox_mode(),
+            switchyard_provider_api::EffectiveSandboxMode::ReadOnly
+        );
     }
 
     #[tokio::test]
@@ -617,6 +993,133 @@ mod tests {
 
         let artifacts = store.list_artifacts(turn_id).unwrap();
         assert_eq!(artifacts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_turn_forwards_payload_only_lifecycle_items_to_runtime() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use switchyard_provider_api::*;
+
+        struct PayloadOnlyProvider {
+            results: Arc<tokio::sync::Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for PayloadOnlyProvider {
+            async fn probe(&self) -> Result<ProbeResult, ProviderError> {
+                Ok(ProbeResult {
+                    version: None,
+                    available: true,
+                    capabilities: Default::default(),
+                    issues: vec![],
+                    ..Default::default()
+                })
+            }
+
+            async fn start_turn(
+                &self,
+                turn_id: Uuid,
+                _input: TurnInput,
+                _policy: ExecutionPolicy,
+                _context: ContextBundle,
+                event_tx: mpsc::Sender<ProviderEvent>,
+                _cancel: CancellationToken,
+            ) -> Result<(), ProviderError> {
+                event_tx
+                    .send(ProviderEvent::turn_started(turn_id, "payload-only"))
+                    .await
+                    .ok();
+                event_tx
+                    .send(ProviderEvent::new(
+                        turn_id,
+                        switchyard_provider_api::EventType::ItemStarted,
+                        "payload-only",
+                        serde_json::json!({ "opaque": { "phase": "tool-starting" } }),
+                    ))
+                    .await
+                    .ok();
+                event_tx
+                    .send(ProviderEvent::turn_completed(turn_id, "payload-only"))
+                    .await
+                    .ok();
+
+                self.results.lock().await.insert(
+                    turn_id,
+                    (
+                        TurnResult {
+                            response_text: "ok".into(),
+                            exit_code: Some(0),
+                            stderr: None,
+                            metadata: HashMap::new(),
+                        },
+                        ArtifactBundle { artifacts: vec![] },
+                    ),
+                );
+                Ok(())
+            }
+
+            async fn finalize_turn(
+                &self,
+                turn_id: Uuid,
+            ) -> Result<(TurnResult, ArtifactBundle), ProviderError> {
+                self.results
+                    .lock()
+                    .await
+                    .remove(&turn_id)
+                    .ok_or(ProviderError::ExecutionFailed("no result".into()))
+            }
+        }
+
+        let (mut store, _dir) = temp_store();
+        let mut session = Session::new("payload-only".to_string());
+        store.save_session(&session).unwrap();
+
+        let provider = PayloadOnlyProvider {
+            results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        };
+        let (tx, mut rx) = mpsc::channel::<crate::runtime_events::RuntimeEvent>(16);
+
+        run_turn_full(
+            &mut store,
+            &mut session,
+            &provider,
+            "trigger tool".to_string(),
+            PathBuf::from("."),
+            None,
+            Some(&tx),
+        )
+        .await
+        .unwrap();
+
+        drop(tx);
+        let mut runtime_events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            runtime_events.push(event);
+        }
+
+        let payload_only_item = runtime_events.iter().find_map(|event| match event {
+            crate::runtime_events::RuntimeEvent::CoreItemUpdated {
+                event_type,
+                text,
+                payload,
+                ..
+            } if event_type == "item_started"
+                && text.is_empty()
+                && payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("opaque"))
+                    .is_some() =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+
+        assert!(
+            payload_only_item.is_some(),
+            "payload-only item_started should be forwarded to runtime; events: {runtime_events:?}"
+        );
     }
 
     #[tokio::test]
@@ -877,7 +1380,9 @@ mod tests {
 
     #[test]
     fn test_system_status_line_filtering() {
-        assert!(is_system_status_line("[命令] 开始执行: \"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command ..."));
+        assert!(is_system_status_line(
+            "[命令] 开始执行: \"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command ..."
+        ));
         assert!(is_system_status_line("[exec] running task"));
         assert!(is_system_status_line("[HTTP] GET /status"));
         assert!(is_system_status_line("[system:info] memory level high"));

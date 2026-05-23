@@ -1,4 +1,13 @@
-//! Claude headless turn execution via `claude -p --output-format stream-json`.
+//! Claude headless turn execution via `claude -p --output-format stream-json
+//! --include-partial-messages --verbose`.
+//!
+//! The `--include-partial-messages` flag is what makes the UI feel like a
+//! real streaming chat: without it, Claude only emits the final consolidated
+//! `assistant` message once the turn completes and the user sees
+//! "Loading… → wall of text". With it, every `content_block_delta` arrives
+//! incrementally, which we relay as [`ProviderEvent::text_message`] events
+//! so the chat ticker can append tokens as they arrive — matching what the
+//! persistent [`crate::live::ClaudeLiveInstance`] path already does.
 
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -9,6 +18,8 @@ use switchyard_provider_subprocess::{
     compose_prompt, emit_completion_event, handle_subprocess_error, run_subprocess_streaming,
 };
 
+use crate::stream_json::extract_delta_text;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_claude_turn(
     turn_id: Uuid,
@@ -18,6 +29,7 @@ pub async fn run_claude_turn(
     input: &TurnInput,
     timeout_secs: u64,
     env: Option<&std::collections::HashMap<String, String>>,
+    policy: &ExecutionPolicy,
     cwd: Option<&std::path::Path>,
     event_tx: &mpsc::Sender<ProviderEvent>,
     cancel: CancellationToken,
@@ -27,13 +39,18 @@ pub async fn run_claude_turn(
         .await
         .ok();
 
-    // Claude requires --verbose for stream-json output format
+    // Claude requires --verbose for stream-json output format.
+    // --include-partial-messages unlocks token-by-token deltas — without
+    // it the CLI batches everything into a single trailing `assistant`
+    // block and the chat ticker can't render progress.
     let mut args: Vec<String> = vec![
         "-p".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
+        "--include-partial-messages".to_string(),
         "--verbose".to_string(),
     ];
+    args.extend(claude_policy_args(policy));
     args.extend_from_slice(extra_args);
     args.push(compose_prompt(input));
     let plan = build_subprocess_invocation_plan(original_command, command, &args);
@@ -62,7 +79,13 @@ pub async fn run_claude_turn(
 
     let event_tx_clone = event_tx.clone();
     let consumer = tokio::spawn(async move {
+        // `assistant_message` is the buffered "best response we've seen so
+        // far", surfaced as the final TurnResult.response_text. `streamed_any`
+        // tracks whether we emitted at least one delta — used to decide
+        // whether to honour later consolidated `assistant`/`result` payloads
+        // (avoids double-counting their text).
         let mut assistant_message = String::new();
+        let mut streamed_any = false;
         while let Some(output_line) = line_rx.recv().await {
             let line = output_line.text;
             let protocol_line = line.trim_end_matches(['\r', '\n']);
@@ -81,25 +104,31 @@ pub async fn run_claude_turn(
             }
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(protocol_line) {
                 let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                // 1. Streaming text deltas — emit a text_message so the chat
+                //    ticker can render token-by-token. Handles both the
+                //    wrapped `stream_event` shape (with --include-partial-messages)
+                //    and the unwrapped form (without).
+                if let Some(delta_text) = extract_delta_text(&json, msg_type)
+                    && !delta_text.is_empty()
+                {
+                    assistant_message.push_str(delta_text);
+                    streamed_any = true;
+                    event_tx_clone
+                        .send(ProviderEvent::text_message(turn_id, "claude", delta_text))
+                        .await
+                        .ok();
+                }
+
                 match msg_type {
-                    "content_block_delta" => {
-                        if let Some(delta) = json.get("delta")
-                            && delta.get("type").and_then(|t| t.as_str()) == Some("text_delta")
-                            && let Some(text) = delta.get("text").and_then(|t| t.as_str())
-                        {
-                            assistant_message.push_str(text);
-                        }
-                    }
-                    // {"type":"result","result":"hello switchyard",...}
-                    "result" => {
-                        if let Some(text) = json.get("result").and_then(|r| r.as_str())
-                            && assistant_message.is_empty()
-                        {
-                            assistant_message = text.to_string();
-                        }
-                    }
-                    // {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
-                    "assistant" => {
+                    // 2. Consolidated `assistant` block — Claude emits this
+                    //    AFTER the deltas finish (with --include-partial-messages
+                    //    on). If we already streamed the body, drop it on
+                    //    the floor so we don't double-render. If deltas
+                    //    didn't arrive (e.g. user disabled the flag via
+                    //    extra_args), fall back to using the consolidated
+                    //    text as the response body.
+                    "assistant" if !streamed_any => {
                         if let Some(content) = json
                             .get("message")
                             .and_then(|m| m.get("content"))
@@ -115,8 +144,22 @@ pub async fn run_claude_turn(
                             }
                         }
                     }
+                    // 3. `result` is the turn-boundary marker carrying usage
+                    //    / cost / num_turns. Take its `result` field only
+                    //    when nothing else gave us a response body (e.g.
+                    //    a tool-only turn with no assistant text).
+                    "result" => {
+                        if let Some(text) = json.get("result").and_then(|r| r.as_str())
+                            && assistant_message.is_empty()
+                        {
+                            assistant_message = text.to_string();
+                        }
+                    }
                     _ => {}
                 }
+
+                // 4. Pass the raw JSON through as ItemUpdated for the
+                //    diagnostics drawer and any downstream observability.
                 event_tx_clone
                     .send(ProviderEvent::new(
                         turn_id,
@@ -127,6 +170,8 @@ pub async fn run_claude_turn(
                     .await
                     .ok();
             } else if !protocol_line.trim().is_empty() {
+                // Non-JSON line — surface as plain text so debugging is
+                // possible when claude prints something unexpected.
                 event_tx_clone
                     .send(ProviderEvent::text_message(
                         turn_id,
@@ -158,4 +203,54 @@ pub async fn run_claude_turn(
     };
 
     Ok(build_turn_result(response_text, &output, "claude"))
+}
+
+fn claude_policy_args(policy: &ExecutionPolicy) -> Vec<String> {
+    let mut args = Vec::new();
+    match policy.effective_sandbox_mode() {
+        EffectiveSandboxMode::ReadOnly => {
+            args.push("--permission-mode".to_string());
+            args.push("plan".to_string());
+        }
+        EffectiveSandboxMode::WorkspaceWrite => {
+            args.push("--permission-mode".to_string());
+            args.push("acceptEdits".to_string());
+        }
+        EffectiveSandboxMode::DangerFullAccess => {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+    }
+
+    for path in policy.additional_allowed_paths() {
+        args.push("--add-dir".to_string());
+        args.push(path.display().to_string());
+    }
+
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn claude_policy_args_map_modes_and_extra_dirs() {
+        assert_eq!(
+            claude_policy_args(&ExecutionPolicy::read_only("/repo")),
+            vec!["--permission-mode", "plan"]
+        );
+
+        let workspace =
+            ExecutionPolicy::workspace_write("/repo").add_allowed_paths([PathBuf::from("/shared")]);
+        assert_eq!(
+            claude_policy_args(&workspace),
+            vec!["--permission-mode", "acceptEdits", "--add-dir", "/shared"]
+        );
+
+        assert_eq!(
+            claude_policy_args(&ExecutionPolicy::danger_full_access("/repo")),
+            vec!["--dangerously-skip-permissions"]
+        );
+    }
 }
