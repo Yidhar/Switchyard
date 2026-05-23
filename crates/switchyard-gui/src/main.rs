@@ -2004,6 +2004,30 @@ fn cancel_turn(state: tauri::State<'_, ActiveTurnState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn resolve_tool_approval(
+    request_id: String,
+    decision: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let normalized = decision.trim().to_ascii_lowercase();
+    let decision = match normalized.as_str() {
+        "approve" | "approved" | "allow" | "yes" => {
+            switchyard_provider_codex::ToolApprovalDecision::Approve
+        }
+        "deny" | "denied" | "reject" | "rejected" | "no" => {
+            switchyard_provider_codex::ToolApprovalDecision::Deny
+        }
+        other => {
+            return Err(format!(
+                "unsupported approval decision '{other}', expected approve or deny"
+            ));
+        }
+    };
+
+    switchyard_provider_codex::submit_tool_approval_decision(&request_id, decision, reason).await
+}
+
+#[tauri::command]
 async fn update_session_peers(
     workspace_state: tauri::State<'_, WorkspaceState>,
     session_id: String,
@@ -2696,6 +2720,7 @@ fn main() {
             get_session_events,
             run_turn,
             cancel_turn,
+            resolve_tool_approval,
             update_session_peers,
             list_artifacts,
             read_artifact,

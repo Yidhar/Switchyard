@@ -39,6 +39,14 @@ export const runTurn = (
   return invoke<string>('run_turn', { sessionId, message, provider, sandboxMode, imagePaths });
 };
 
+export const resolveToolApproval = (
+  requestId: string,
+  decision: 'approve' | 'deny',
+  reason?: string,
+): Promise<void> => {
+  return invoke<void>('resolve_tool_approval', { requestId, decision, reason });
+};
+
 export const cancelTurn = (): Promise<void> => {
   return invoke<void>('cancel_turn');
 };

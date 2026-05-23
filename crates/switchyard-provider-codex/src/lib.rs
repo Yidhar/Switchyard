@@ -2,7 +2,7 @@ mod app_server;
 mod probe;
 mod turn;
 
-pub use app_server::CodexAppServerInstance;
+pub use app_server::{CodexAppServerInstance, ToolApprovalDecision, submit_tool_approval_decision};
 
 use std::collections::HashMap;
 use std::sync::Arc;

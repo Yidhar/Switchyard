@@ -544,6 +544,15 @@ fn summarize_item_activity(
         "local_shell_call_output" => with_label("[命令] 本地 Shell 输出已返回"),
         "file_change" => "[文件] 正在修改".to_string(),
         "diff_ready" => "[Diff] 已生成差异".to_string(),
+        "approval_request" => "[权限] 等待用户确认".to_string(),
+        "approval_decision" => {
+            let tag = item
+                .get("decision_tag")
+                .or_else(|| payload.get("decision_tag"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("resolved");
+            format!("[权限] 已处理：{tag}")
+        }
         "todo_list" => "[待办] 已更新".to_string(),
         "delegate_request" => "[委托] 已生成请求".to_string(),
         "delegate_result" => "[委托] 已返回结果".to_string(),

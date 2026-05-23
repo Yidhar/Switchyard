@@ -1,12 +1,22 @@
 import React, { useState } from 'react';
 import { Terminal, Code, CheckCircle2, AlertTriangle, Eye, EyeOff } from 'lucide-react';
 
+interface ToolAction {
+  id?: string;
+  label: string;
+  tone?: 'primary' | 'danger' | 'secondary';
+  title?: string;
+  disabled?: boolean;
+  onClick: () => void | Promise<void>;
+}
+
 interface ToolCall {
   id: string;
   name: string;
   input: any;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
   output: any;
+  actions?: ToolAction[];
 }
 
 interface ToolCardProps {
@@ -16,6 +26,7 @@ interface ToolCardProps {
 export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
   const [showInput, setShowInput] = useState(false);
   const [showOutput, setShowOutput] = useState(true);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -107,6 +118,41 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
   const hasInput = tool.input && formatData(tool.input).length > 0;
   const hasOutput = tool.output && formatData(tool.output).length > 0;
   const outputIsDiff = hasOutput && typeof tool.output === 'string' && isDiffContent(tool.output);
+  const hasActions = Array.isArray(tool.actions) && tool.actions.length > 0;
+
+  const actionStyle = (tone: ToolAction['tone'] = 'secondary'): React.CSSProperties => {
+    if (tone === 'primary') {
+      return {
+        background: 'rgba(34, 197, 94, 0.16)',
+        border: '1px solid rgba(34, 197, 94, 0.45)',
+        color: 'var(--color-success)',
+      };
+    }
+    if (tone === 'danger') {
+      return {
+        background: 'rgba(239, 68, 68, 0.14)',
+        border: '1px solid rgba(239, 68, 68, 0.42)',
+        color: 'var(--color-error)',
+      };
+    }
+    return {
+      background: 'rgba(255, 255, 255, 0.04)',
+      border: '1px solid var(--border-muted)',
+      color: 'var(--text-secondary)',
+    };
+  };
+
+  const runAction = async (action: ToolAction) => {
+    const id = action.id || action.label;
+    setBusyAction(id);
+    try {
+      await action.onClick();
+    } catch (error) {
+      console.error('Tool action failed:', error);
+    } finally {
+      setBusyAction((current) => (current === id ? null : current));
+    }
+  };
 
   // Auto detect icon
   const getIcon = () => {
@@ -240,6 +286,43 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
                 </pre>
               )
             )}
+          </div>
+        )}
+
+        {hasActions && (
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'flex-end',
+              gap: '8px',
+              paddingTop: hasInput || hasOutput ? '4px' : 0,
+              borderTop: hasInput || hasOutput ? '1px solid rgba(255,255,255,0.04)' : 'none',
+            }}
+          >
+            {tool.actions!.map((action) => {
+              const id = action.id || action.label;
+              const disabled = Boolean(action.disabled || busyAction);
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  title={action.title}
+                  disabled={disabled}
+                  onClick={() => void runAction(action)}
+                  style={{
+                    ...actionStyle(action.tone),
+                    cursor: disabled ? 'not-allowed' : 'pointer',
+                    opacity: disabled ? 0.55 : 1,
+                    borderRadius: '6px',
+                    padding: '5px 10px',
+                    fontSize: '11px',
+                    fontWeight: 700,
+                  }}
+                >
+                  {busyAction === id ? 'Sending…' : action.label}
+                </button>
+              );
+            })}
           </div>
         )}
       </div>

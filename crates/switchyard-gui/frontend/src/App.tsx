@@ -31,6 +31,7 @@ import { parseSlash, type SlashContext } from './components/slashCommands';
 // ArtifactDrawer is no longer rendered — its bottom-bar UX didn't fit
 // the new layout. The import + state are dropped along with the bar.
 import { renderMessageBody, isSystemStatusText, renderTurnEvents } from './components/ui/RenderHelpers';
+import { resolveToolApproval } from './services/api';
 
 const RUNTIME_ITEM_EVENT_FALLBACK = 'item_updated';
 const DEBUG_RUNTIME_EVENTS = false;
@@ -1474,6 +1475,38 @@ function App() {
     addLogs([{ timestamp: time, tag, message }]);
   };
 
+  const handleResolveToolApproval = async (
+    requestId: string,
+    decision: 'approve' | 'deny',
+    reason?: string,
+  ) => {
+    try {
+      await resolveToolApproval(requestId, decision, reason);
+      addLog(
+        new Date().toLocaleTimeString(),
+        'sys',
+        `Tool approval ${decision}: ${requestId}`,
+      );
+    } catch (error) {
+      addLog(
+        new Date().toLocaleTimeString(),
+        'sys',
+        `Failed to resolve tool approval ${requestId}: ${error}`,
+      );
+      throw error;
+    }
+  };
+
+  const renderTurnEventsWithActions = (
+    turnId: string,
+    eventList: any[],
+    turnList: Turn[],
+    realtimeLines?: string[],
+    jobs?: Record<string, any>,
+  ) => renderTurnEvents(turnId, eventList, turnList, realtimeLines, jobs, {
+    onResolveApproval: handleResolveToolApproval,
+  });
+
   const enqueueQueuedMessage = (payload: SendPayload) => {
     const next = [...messageQueueRef.current, payload];
     messageQueueRef.current = next;
@@ -2415,7 +2448,7 @@ function App() {
               realtimeTerminalLines={realtimeTerminalLines}
               hyardJobs={hyardJobs}
               renderMessageBody={renderMessageBody}
-              renderTurnEvents={renderTurnEvents}
+              renderTurnEvents={renderTurnEventsWithActions}
               queuedMessages={messageQueue}
               onClearQueue={handleClearQueue}
               sandboxMode={config?.sandbox?.mode ?? DEFAULT_SANDBOX_MODE}
@@ -2554,7 +2587,7 @@ function App() {
             activePeerTurnId={activePeerTurnId}
             activePeerText={activePeerText}
             activeCoreText={activeCoreText}
-            renderTurnEvents={renderTurnEvents}
+            renderTurnEvents={renderTurnEventsWithActions}
             providerStatuses={providerStatuses}
             providerStatusLoading={providerStatusLoading}
             providerStatusError={providerStatusError}

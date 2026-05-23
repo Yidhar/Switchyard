@@ -23,24 +23,155 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 use switchyard_provider_api::{
-    ContextBundle, EventType, ExecutionPolicy, LiveInstance, ProviderError, ProviderEvent,
-    TurnInput,
+    ContextBundle, EffectiveSandboxMode, EventType, ExecutionPolicy, LiveInstance, ProviderError,
+    ProviderEvent, TurnInput,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+type PendingApprovalMap = HashMap<String, oneshot::Sender<ResolvedApproval>>;
+
+static PENDING_APPROVALS: OnceLock<Arc<Mutex<PendingApprovalMap>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalDecision {
+    Approve,
+    Deny,
+}
+
+impl ToolApprovalDecision {
+    fn codex_result(self) -> Value {
+        match self {
+            ToolApprovalDecision::Approve => json!({ "decision": "approve" }),
+            ToolApprovalDecision::Deny => json!({ "decision": "deny" }),
+        }
+    }
+
+    fn audit_tag(self) -> &'static str {
+        match self {
+            ToolApprovalDecision::Approve => "approve:user",
+            ToolApprovalDecision::Deny => "deny:user",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedApproval {
+    decision: ToolApprovalDecision,
+    reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct ApprovalResolution {
+    decision: Value,
+    audit_tag: String,
+    reason: Option<String>,
+    status: &'static str,
+}
+
+fn approval_registry() -> &'static Arc<Mutex<PendingApprovalMap>> {
+    PENDING_APPROVALS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+async fn register_pending_approval(request_id: String) -> oneshot::Receiver<ResolvedApproval> {
+    let (tx, rx) = oneshot::channel();
+    approval_registry().lock().await.insert(request_id, tx);
+    rx
+}
+
+async fn forget_pending_approval(request_id: &str) {
+    approval_registry().lock().await.remove(request_id);
+}
+
+/// Resolve a pending Codex app-server approval request.
+///
+/// The GUI calls this through a Tauri command after rendering the structured
+/// `approval_request` item from the session stream. The matching drain task is
+/// blocked on a one-shot receiver and will forward the selected decision back
+/// to Codex's JSON-RPC request.
+pub async fn submit_tool_approval_decision(
+    request_id: &str,
+    decision: ToolApprovalDecision,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let sender = approval_registry()
+        .lock()
+        .await
+        .remove(request_id)
+        .ok_or_else(|| {
+            "approval request not found; it may have already been resolved or timed out".to_string()
+        })?;
+    sender
+        .send(ResolvedApproval { decision, reason })
+        .map_err(|_| "approval request receiver is no longer active".to_string())
+}
+
+async fn wait_for_gui_approval(
+    request_id: &str,
+    approval_rx: oneshot::Receiver<ResolvedApproval>,
+    event_tx: &mpsc::Sender<ProviderEvent>,
+) -> ApprovalResolution {
+    tokio::select! {
+        resolved = approval_rx => match resolved {
+            Ok(resolved) => ApprovalResolution {
+                decision: resolved.decision.codex_result(),
+                audit_tag: resolved.decision.audit_tag().to_string(),
+                reason: resolved.reason,
+                status: if resolved.decision == ToolApprovalDecision::Approve {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            },
+            Err(_closed) => ApprovalResolution {
+                decision: json!({ "decision": "deny" }),
+                audit_tag: "deny:approval_channel_closed".to_string(),
+                reason: Some(
+                    "approval request was canceled before a GUI decision arrived".to_string(),
+                ),
+                status: "failed",
+            },
+        },
+        _ = sleep(APPROVAL_TIMEOUT) => {
+            forget_pending_approval(request_id).await;
+            ApprovalResolution {
+                decision: json!({ "decision": "deny" }),
+                audit_tag: "deny:timeout_waiting_for_user".to_string(),
+                reason: Some(format!(
+                    "timed out after {} seconds waiting for approve/deny",
+                    APPROVAL_TIMEOUT.as_secs()
+                )),
+                status: "failed",
+            }
+        },
+        _ = event_tx.closed() => {
+            forget_pending_approval(request_id).await;
+            ApprovalResolution {
+                decision: json!({ "decision": "deny" }),
+                audit_tag: "deny:approval_stream_closed".to_string(),
+                reason: Some(
+                    "approval stream closed before the user approved or denied the request".to_string(),
+                ),
+                status: "failed",
+            }
+        },
+    }
+}
 
 /// Long-running Codex daemon spoken to over JSON-RPC 2.0 NDJSON on stdio.
 pub struct CodexAppServerInstance {
@@ -251,6 +382,7 @@ impl LiveInstance for CodexAppServerInstance {
         let mut input_items = vec![json!({
             "type": "text",
             "text": input.user_message_with_attachment_references(),
+            "text_elements": [],
         })];
         for attachment in &input.attachments {
             input_items.push(json!({
@@ -258,34 +390,25 @@ impl LiveInstance for CodexAppServerInstance {
                 "path": attachment.path.display().to_string(),
             }));
         }
-        // Send turn/start; response carries the server-side turn id which we
-        // use to filter incoming notifications.
+        // Send turn/start. Do not synchronously wait for its response before
+        // installing the drain task: newer Codex app-server builds can emit
+        // notifications or server-initiated approval requests immediately
+        // after `turn/start`. If we waited here, those frames would either be
+        // discarded by `await_response` or deadlock the turn before the GUI had
+        // an event receiver to render the pending approval card.
         let req_id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let turn_params = turn_start_params(&self.thread_id, input_items, &policy);
         write_frame_arc(
             &self.stdin,
             json!({
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "method": "turn/start",
-                "params": {
-                    "threadId": self.thread_id,
-                    "input": input_items,
-                }
+                "params": turn_params,
             }),
         )
         .await
         .map_err(|e| ProviderError::ExecutionFailed(format!("turn/start write: {e}")))?;
-
-        let turn_reply = await_response(&self.frame_rx, req_id).await?;
-        let server_turn_id = turn_reply
-            .get("result")
-            .and_then(|r| r.get("turn"))
-            .and_then(|t| t.get("id"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ProviderError::ExecutionFailed("missing turn.id in turn/start reply".into())
-            })?
-            .to_string();
 
         let (event_tx, event_rx) = mpsc::channel::<ProviderEvent>(256);
         let rx_lock = Arc::clone(&self.frame_rx);
@@ -296,29 +419,101 @@ impl LiveInstance for CodexAppServerInstance {
         // Switchyard's view: each call gets a fresh logical turn_id, distinct
         // from the codex-server-side turn id we filter by.
         let canonical_turn_id = Uuid::now_v7();
-        let server_turn_id_clone = server_turn_id;
+        let turn_start_req_id = Value::from(req_id);
 
         tokio::spawn(async move {
             let mut rx = rx_lock.lock().await;
+            let mut server_turn_id: Option<String> = None;
             while let Some(frame) = rx.recv().await {
                 // Server-initiated request — codex daemon asking us to
-                // approve a tool/file action. Decision routes through the
-                // policy: permissive (default for `send_message`) always
-                // approves; user-facing flows pass a real policy that gates
-                // writes outside `allowed_paths` or when `write_access`
-                // is false. The decision is surfaced as an ItemUpdated so
-                // the diagnostics drawer / chat ticker can render what
-                // happened.
+                // approve a tool/file action. User-facing flows surface this
+                // as a structured pending item in the session stream and then
+                // block here until the GUI sends approve/deny back through the
+                // approval registry. The legacy no-policy `send_message()`
+                // path still auto-approves to avoid hanging smoke tests and
+                // background worker callers that do not have a GUI.
                 if let (Some(req_id_val), Some(method_val)) = (
                     frame.get("id").cloned(),
                     frame.get("method").and_then(|m| m.as_str()),
                 ) {
+                    let method = method_val.to_string();
                     let params = frame
                         .get("params")
                         .cloned()
                         .unwrap_or_else(|| Value::Object(Default::default()));
 
-                    let (decision, audit_tag) = approval_decision(method_val, &params, &policy);
+                    if !is_approval_method(&method) {
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id_val,
+                            "result": {},
+                        });
+                        if let Err(e) = write_frame_arc(&stdin_lock, reply).await {
+                            let _ = event_tx
+                                .send(ProviderEvent::turn_failed(
+                                    canonical_turn_id,
+                                    "codex",
+                                    format!("server request response write failed: {e}"),
+                                ))
+                                .await;
+                            return;
+                        }
+                        continue;
+                    }
+
+                    let request_id = approval_request_id(canonical_turn_id, &req_id_val, &method);
+                    let (policy_decision, policy_tag) =
+                        approval_decision(&method, &params, &policy);
+
+                    let resolution = if is_legacy_permissive_policy(&policy) {
+                        ApprovalResolution {
+                            decision: policy_decision,
+                            audit_tag: policy_tag.to_string(),
+                            reason: Some(
+                                "legacy non-interactive Codex call used permissive auto-approval"
+                                    .to_string(),
+                            ),
+                            status: "completed",
+                        }
+                    } else {
+                        let approval_rx = register_pending_approval(request_id.clone()).await;
+                        let pending_event = ProviderEvent::new(
+                            canonical_turn_id,
+                            EventType::ItemUpdated,
+                            "codex",
+                            json!({
+                                "item_type": "approval_request",
+                                "request_id": request_id.clone(),
+                                "rpc_id": req_id_val.clone(),
+                                "method": method.clone(),
+                                "status": "pending",
+                                "request": params.clone(),
+                                "policy": approval_policy_payload(&policy),
+                                "policy_decision": {
+                                    "decision_tag": policy_tag,
+                                    "decision": policy_decision.clone(),
+                                },
+                                "timeout_secs": APPROVAL_TIMEOUT.as_secs(),
+                                "created_at_ms": unix_epoch_millis(),
+                                "summary": "Tool permission approval is waiting for the user",
+                            }),
+                        );
+
+                        if event_tx.send(pending_event).await.is_err() {
+                            forget_pending_approval(&request_id).await;
+                            ApprovalResolution {
+                                decision: json!({ "decision": "deny" }),
+                                audit_tag: "deny:approval_stream_closed".to_string(),
+                                reason: Some(
+                                    "approval request could not be delivered to the session stream"
+                                        .to_string(),
+                                ),
+                                status: "failed",
+                            }
+                        } else {
+                            wait_for_gui_approval(&request_id, approval_rx, &event_tx).await
+                        }
+                    };
 
                     let _ = event_tx
                         .send(ProviderEvent::new(
@@ -327,10 +522,16 @@ impl LiveInstance for CodexAppServerInstance {
                             "codex",
                             json!({
                                 "item_type": "approval_decision",
-                                "method": method_val,
-                                "decision_tag": audit_tag,
-                                "decision": decision.clone(),
+                                "request_id": request_id,
+                                "rpc_id": req_id_val.clone(),
+                                "method": method,
+                                "status": resolution.status,
+                                "decision_tag": resolution.audit_tag,
+                                "decision": resolution.decision.clone(),
                                 "request": params,
+                                "reason": resolution.reason,
+                                "policy": approval_policy_payload(&policy),
+                                "resolved_at_ms": unix_epoch_millis(),
                             }),
                         ))
                         .await;
@@ -338,7 +539,7 @@ impl LiveInstance for CodexAppServerInstance {
                     let reply = json!({
                         "jsonrpc": "2.0",
                         "id": req_id_val,
-                        "result": decision,
+                        "result": resolution.decision,
                     });
                     if let Err(e) = write_frame_arc(&stdin_lock, reply).await {
                         // Best-effort: if we can't write the approval, the
@@ -356,19 +557,44 @@ impl LiveInstance for CodexAppServerInstance {
                     continue;
                 }
 
+                // Response to our outbound `turn/start` request. It can race
+                // with notifications and approval requests, so the same drain
+                // task that forwards session stream events also records it.
+                if frame.get("id") == Some(&turn_start_req_id) {
+                    if let Some(err) = frame.get("error") {
+                        let _ = event_tx
+                            .send(ProviderEvent::turn_failed(
+                                canonical_turn_id,
+                                "codex",
+                                format!("turn/start rejected: {err}"),
+                            ))
+                            .await;
+                        return;
+                    }
+                    if let Some(tid) = response_turn_id(&frame) {
+                        server_turn_id = Some(tid.to_string());
+                    }
+                    continue;
+                }
+
                 let method = match frame.get("method").and_then(|m| m.as_str()) {
                     Some(m) => m,
                     None => continue, // unmatched response
                 };
 
                 // Filter to this turn (when params carry turnId).
-                if let Some(tid) = frame
-                    .get("params")
-                    .and_then(|p| p.get("turnId"))
-                    .and_then(|v| v.as_str())
-                    && tid != server_turn_id_clone
-                {
-                    continue;
+                if let Some(tid) = notification_turn_id(&frame) {
+                    if let Some(expected) = server_turn_id.as_deref() {
+                        if tid != expected {
+                            continue;
+                        }
+                    } else {
+                        // Some app-server versions emit turn notifications
+                        // before replying to `turn/start`. In the single-turn
+                        // Switchyard flow this first observed turn id is the
+                        // safest way to avoid dropping early lifecycle events.
+                        server_turn_id = Some(tid.to_string());
+                    }
                 }
 
                 match method {
@@ -573,6 +799,178 @@ fn annotate_protocol_payload(payload: &mut Value, method: &str) {
     }
 }
 
+fn response_turn_id(frame: &Value) -> Option<&str> {
+    frame
+        .get("result")
+        .and_then(|r| r.get("turn"))
+        .and_then(|t| t.get("id"))
+        .and_then(|v| v.as_str())
+}
+
+fn notification_turn_id(frame: &Value) -> Option<&str> {
+    frame
+        .get("params")
+        .and_then(|p| p.get("turnId"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            frame
+                .get("params")
+                .and_then(|p| p.get("turn"))
+                .and_then(|t| t.get("id"))
+                .and_then(|v| v.as_str())
+        })
+}
+
+fn is_approval_method(method: &str) -> bool {
+    method.contains("requestApproval") || method.contains("approval")
+}
+
+fn is_legacy_permissive_policy(policy: &ExecutionPolicy) -> bool {
+    policy.write_access
+        && policy.allowed_paths.is_empty()
+        && lexical_normalize(&policy.cwd) == PathBuf::from(".")
+}
+
+fn approval_request_id(turn_id: Uuid, rpc_id: &Value, method: &str) -> String {
+    let method_slug: String = method
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    format!("codex:{turn_id}:{method_slug}:{}", rpc_id_component(rpc_id))
+}
+
+fn rpc_id_component(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Null => "null".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn unix_epoch_millis() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration
+            .as_secs()
+            .saturating_mul(1_000)
+            .saturating_add(u64::from(duration.subsec_millis())),
+        Err(_) => 0,
+    }
+}
+
+fn sandbox_mode_name(mode: EffectiveSandboxMode) -> &'static str {
+    match mode {
+        EffectiveSandboxMode::ReadOnly => "read-only",
+        EffectiveSandboxMode::WorkspaceWrite => "workspace-write",
+        EffectiveSandboxMode::DangerFullAccess => "danger-full-access",
+    }
+}
+
+fn approval_policy_payload(policy: &ExecutionPolicy) -> Value {
+    json!({
+        "sandbox_mode": sandbox_mode_name(policy.effective_sandbox_mode()),
+        "write_access": policy.write_access,
+        "cwd": policy.cwd.display().to_string(),
+        "allowed_paths": policy.allowed_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+    })
+}
+
+fn turn_start_params(thread_id: &str, input_items: Vec<Value>, policy: &ExecutionPolicy) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": input_items,
+        // Keep Codex's daemon-side working root, approval posture, and
+        // filesystem sandbox aligned with Switchyard's per-turn GUI choice.
+        // Without these overrides the long-lived app-server thread can keep
+        // using stale defaults even after the user switches the quick
+        // permission mode in the composer.
+        "cwd": codex_cwd_payload(policy),
+        "approvalPolicy": codex_approval_policy_payload(policy),
+        "approvalsReviewer": "user",
+        "sandboxPolicy": codex_sandbox_policy_payload(policy),
+    })
+}
+
+fn codex_approval_policy_payload(policy: &ExecutionPolicy) -> Value {
+    match policy.effective_sandbox_mode() {
+        // Full access means there is no Codex-side sandbox escape to review.
+        // Switchyard still handles any explicit approval RPCs defensively, but
+        // the daemon should not auto-route them to guardian/default rejection.
+        EffectiveSandboxMode::DangerFullAccess => json!("never"),
+        // For sandboxed modes the model may request permission escalation; the
+        // request is routed to this JSON-RPC client (`approvalsReviewer=user`)
+        // and then surfaced as an `approval_request` session-stream item.
+        EffectiveSandboxMode::ReadOnly | EffectiveSandboxMode::WorkspaceWrite => {
+            json!("on-request")
+        }
+    }
+}
+
+fn codex_sandbox_policy_payload(policy: &ExecutionPolicy) -> Value {
+    match policy.effective_sandbox_mode() {
+        EffectiveSandboxMode::DangerFullAccess => json!({
+            "type": "dangerFullAccess",
+        }),
+        EffectiveSandboxMode::ReadOnly => json!({
+            "type": "readOnly",
+            // Switchyard currently exposes a filesystem sandbox toggle, not a
+            // network toggle. Preserve the process/network posture instead of
+            // introducing a hidden network-deny side effect when the user only
+            // changes the file permission mode.
+            "networkAccess": true,
+        }),
+        EffectiveSandboxMode::WorkspaceWrite => json!({
+            "type": "workspaceWrite",
+            "writableRoots": codex_writable_roots_payload(policy),
+            "networkAccess": true,
+            "excludeTmpdirEnvVar": false,
+            "excludeSlashTmp": false,
+        }),
+    }
+}
+
+fn codex_cwd_payload(policy: &ExecutionPolicy) -> String {
+    codex_path_payload(&policy.cwd, Path::new("."))
+}
+
+fn codex_writable_roots_payload(policy: &ExecutionPolicy) -> Vec<String> {
+    let source_paths = if policy.allowed_paths.is_empty() {
+        vec![policy.cwd.clone()]
+    } else {
+        policy.allowed_paths.clone()
+    };
+
+    let mut roots = Vec::new();
+    for path in source_paths {
+        let rendered = codex_path_payload(&path, &policy.cwd);
+        if !roots.iter().any(|existing| existing == &rendered) {
+            roots.push(rendered);
+        }
+    }
+
+    if roots.is_empty() {
+        roots.push(codex_cwd_payload(policy));
+    }
+    roots
+}
+
+fn codex_path_payload(path: &Path, cwd: &Path) -> String {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let base = if cwd.is_absolute() {
+            cwd.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|current| current.join(cwd))
+                .unwrap_or_else(|_| PathBuf::from(".").join(cwd))
+        };
+        base.join(path)
+    };
+    lexical_normalize(&resolved).display().to_string()
+}
+
 /// Compute the JSON-RPC response payload + audit tag for a Codex
 /// server-initiated request, gated by an [`ExecutionPolicy`].
 ///
@@ -592,8 +990,7 @@ fn approval_decision(
     params: &Value,
     policy: &ExecutionPolicy,
 ) -> (Value, &'static str) {
-    let is_approval = method.contains("requestApproval") || method.contains("approval");
-    if !is_approval {
+    if !is_approval_method(method) {
         return (json!({}), "noop");
     }
 
@@ -789,6 +1186,117 @@ mod tests {
         assert_eq!(
             payload.get("type").and_then(|v| v.as_str()),
             Some("custom.type")
+        );
+    }
+
+    #[test]
+    fn response_turn_id_reads_turn_start_reply() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": { "turn": { "id": "turn-123" } }
+        });
+
+        assert_eq!(response_turn_id(&frame), Some("turn-123"));
+    }
+
+    #[test]
+    fn notification_turn_id_reads_flat_and_nested_shapes() {
+        assert_eq!(
+            notification_turn_id(&json!({
+                "method": "item/started",
+                "params": { "turnId": "flat-turn" }
+            })),
+            Some("flat-turn")
+        );
+        assert_eq!(
+            notification_turn_id(&json!({
+                "method": "turn/started",
+                "params": { "turn": { "id": "nested-turn" } }
+            })),
+            Some("nested-turn")
+        );
+    }
+
+    #[test]
+    fn turn_start_params_carries_cwd_approval_reviewer_and_sandbox_policy() {
+        let repo = std::env::current_dir()
+            .expect("current dir")
+            .join("target/switchyard-test/repo");
+        let shared = std::env::current_dir()
+            .expect("current dir")
+            .join("target/switchyard-test/shared");
+        let policy =
+            ExecutionPolicy::workspace_write(repo.clone()).add_allowed_paths([shared.clone()]);
+        let params = turn_start_params(
+            "thread-1",
+            vec![json!({"type": "text", "text": "hello", "text_elements": []})],
+            &policy,
+        );
+        let expected_repo = codex_path_payload(&repo, Path::new("."));
+        let expected_shared = codex_path_payload(&shared, &repo);
+
+        assert_eq!(
+            params.get("threadId").and_then(|v| v.as_str()),
+            Some("thread-1")
+        );
+        assert_eq!(
+            params.get("cwd").and_then(|v| v.as_str()),
+            Some(expected_repo.as_str())
+        );
+        assert_eq!(
+            params.get("approvalPolicy").and_then(|v| v.as_str()),
+            Some("on-request")
+        );
+        assert_eq!(
+            params.get("approvalsReviewer").and_then(|v| v.as_str()),
+            Some("user")
+        );
+        let sandbox = params.get("sandboxPolicy").expect("sandbox policy");
+        assert_eq!(
+            sandbox.get("type").and_then(|v| v.as_str()),
+            Some("workspaceWrite")
+        );
+        assert_eq!(
+            sandbox.get("networkAccess").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            sandbox
+                .get("writableRoots")
+                .and_then(|v| v.as_array())
+                .map(|roots| roots
+                    .iter()
+                    .filter_map(|root| root.as_str())
+                    .collect::<Vec<_>>()),
+            Some(vec![expected_repo.as_str(), expected_shared.as_str()])
+        );
+    }
+
+    #[test]
+    fn codex_sandbox_policy_payload_maps_read_only_and_danger_modes() {
+        let read_only = codex_sandbox_policy_payload(&ExecutionPolicy::read_only("/repo"));
+        assert_eq!(
+            read_only.get("type").and_then(|v| v.as_str()),
+            Some("readOnly")
+        );
+        assert_eq!(
+            read_only.get("networkAccess").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            codex_approval_policy_payload(&ExecutionPolicy::read_only("/repo")).as_str(),
+            Some("on-request")
+        );
+
+        let danger = codex_sandbox_policy_payload(&ExecutionPolicy::danger_full_access("/repo"));
+        assert_eq!(
+            danger.get("type").and_then(|v| v.as_str()),
+            Some("dangerFullAccess")
+        );
+        assert_eq!(
+            codex_approval_policy_payload(&ExecutionPolicy::danger_full_access("/repo")).as_str(),
+            Some("never")
         );
     }
 

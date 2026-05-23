@@ -314,7 +314,7 @@ export function isSystemStatusText(text: string): boolean {
     const statusPrefixes = [
       '[会话]', '[回合]', '[系统]', '[助手]', '[结果]', '[限额]', 
       '[思考]', '[工具]', '[文件]', '[Diff]', '[待办]', '[委托]', 
-      '[错误]', '[执行]', '[exec]', '[HTTP]', '[STDIO]', '[hyard]', '[error]', '[命令]'
+      '[错误]', '[执行]', '[exec]', '[HTTP]', '[STDIO]', '[hyard]', '[error]', '[命令]', '[权限]'
     ];
     if (statusPrefixes.some(prefix => trimmed.startsWith(prefix))) {
       return true;
@@ -334,6 +334,22 @@ interface ToolDisplay {
   input: any;
   status: ToolStatus;
   output: any;
+  actions?: Array<{
+    id?: string;
+    label: string;
+    tone?: 'primary' | 'danger' | 'secondary';
+    title?: string;
+    disabled?: boolean;
+    onClick: () => void | Promise<void>;
+  }>;
+}
+
+export interface RenderTurnEventsOptions {
+  onResolveApproval?: (
+    requestId: string,
+    decision: 'approve' | 'deny',
+    reason?: string,
+  ) => void | Promise<void>;
 }
 
 const CALL_ITEM_TYPES = new Set([
@@ -564,7 +580,8 @@ function toolName(payload: any, item: any, type: string): string {
   if (type === 'command_execution' || type === 'local_shell_call') return 'Execute Command';
   if (type === 'file_change' || type === 'diff_ready') return 'Edit File';
   if (type === 'todo_list') return 'Task Planning (Codex)';
-  if (type === 'approval_decision') return 'Tool Approval Decision';
+  if (type === 'approval_request') return '权限确认请求';
+  if (type === 'approval_decision') return '权限处理结果';
   if (type === 'reasoning') return 'Reasoning';
   if (type.includes('mcp')) {
     const server = asString(firstPresent(item?.server, payload?.server, item?.server_name, payload?.server_name));
@@ -581,6 +598,12 @@ function toolName(payload: any, item: any, type: string): string {
 function stableToolId(turnId: string, event: any, index: number, payload: any, item: any, type: string, name: string): string {
   if (type === 'reasoning') {
     return `${turnId}:reasoning`;
+  }
+  if (type === 'approval_request' || type === 'approval_decision') {
+    const approvalRequestId = firstPresent(item?.request_id, payload?.request_id);
+    if (approvalRequestId !== undefined) {
+      return `${turnId}:approval:${String(approvalRequestId)}`;
+    }
   }
   const natural = firstPresent(
     item?.id,
@@ -614,6 +637,7 @@ function mergeTool(toolCalls: ToolDisplay[], next: ToolDisplay) {
   existing.status = next.status || existing.status;
   if (next.input !== undefined && next.input !== null) existing.input = next.input;
   if (next.output !== undefined && next.output !== null) existing.output = next.output;
+  if (next.actions !== undefined) existing.actions = next.actions;
 }
 
 export function renderTurnEvents(
@@ -621,7 +645,8 @@ export function renderTurnEvents(
   events: any[],
   turns: Turn[],
   realtimeLines?: string[],
-  hyardJobs?: Record<string, any>
+  hyardJobs?: Record<string, any>,
+  options: RenderTurnEventsOptions = {},
 ) {
   // Filter events for this turn
   const turnEvents = events.filter((e) => e.turn_id === turnId);
@@ -697,14 +722,65 @@ export function renderTurnEvents(
     const name = toolName(payload, item, itemType);
     const id = stableToolId(turnId, e, index, payload, item, itemType, name);
 
-    if (itemType === 'approval_decision') {
+    if (itemType === 'approval_request') {
+      const requestId = asString(payload.request_id);
+      const timeoutSecs = payload.timeout_secs ? Number(payload.timeout_secs) : null;
+      const policy = payload.policy || {};
+      const policyDecisionTag = asString(firstPresent(
+        payload.policy_decision?.decision_tag,
+        payload.policyDecision?.decisionTag,
+      ));
+      const input = {
+        method: payload.method,
+        sandbox_mode: policy.sandbox_mode,
+        cwd: policy.cwd,
+        allowed_paths: policy.allowed_paths,
+        request: payload.request,
+      };
+      const outputLines = [
+        '正在等待你的批准/拒绝；在你操作或超时之前不会静默发送 deny。',
+        timeoutSecs ? `超时: ${timeoutSecs}s` : null,
+        policyDecisionTag ? `策略预览: ${policyDecisionTag}` : null,
+      ].filter(Boolean);
+      const resolveApproval = options.onResolveApproval;
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input,
+        status: 'pending',
+        output: outputLines.join('\n'),
+        actions: requestId && resolveApproval
+          ? [
+              {
+                id: `${requestId}:approve`,
+                label: '批准',
+                tone: 'primary',
+                title: '批准这次 Codex 工具/文件权限请求',
+                onClick: () => resolveApproval(requestId, 'approve'),
+              },
+              {
+                id: `${requestId}:deny`,
+                label: '拒绝',
+                tone: 'danger',
+                title: '拒绝这次 Codex 工具/文件权限请求',
+                onClick: () => resolveApproval(requestId, 'deny'),
+              },
+            ]
+          : undefined,
+      });
+    } else if (itemType === 'approval_decision') {
       const decisionTag = payload.decision_tag || payload.tag;
+      const decisionText = [
+        asString(decisionTag || payload.decision?.decision || payload.decision),
+        asString(payload.reason),
+      ].filter(Boolean).join('\n');
       mergeTool(toolCalls, {
         id,
         name,
         input: payload.request,
         status: String(decisionTag || '').startsWith('deny') ? 'failed' : 'completed',
-        output: decisionTag || payload.decision,
+        output: decisionText || decisionTag || payload.decision,
+        actions: [],
       });
     } else if (CALL_ITEM_TYPES.has(itemType)) {
       mergeTool(toolCalls, {
