@@ -154,8 +154,10 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({ visible, cwd, onCl
     const panel = panelRef.current;
     const parent = panel?.parentElement;
     if (!panel || !parent) return;
+    const sash = event.currentTarget;
+    const pointerId = event.pointerId;
     event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
+    sash.setPointerCapture(pointerId);
 
     const parentRect = parent.getBoundingClientRect();
     const maxHeight = Math.max(
@@ -171,6 +173,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({ visible, cwd, onCl
 
     let nextHeight = panelHeightRef.current;
     let resizeFrame: number | null = null;
+    let finished = false;
     const applyPendingHeight = () => {
       resizeFrame = null;
       panel.style.setProperty(
@@ -187,9 +190,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({ visible, cwd, onCl
       }
     };
 
-    const handlePointerUp = () => {
+    const finishResize = () => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('pointermove', handlePointerMove);
-      document.removeEventListener('pointerup', handlePointerUp);
+      document.removeEventListener('pointerup', finishResize);
+      document.removeEventListener('pointercancel', finishResize);
+      window.removeEventListener('blur', finishResize);
       if (resizeFrame !== null) {
         cancelAnimationFrame(resizeFrame);
         resizeFrame = null;
@@ -203,10 +210,19 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({ visible, cwd, onCl
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       document.body.classList.remove('is-layout-resizing');
+      try {
+        if (sash.hasPointerCapture(pointerId)) {
+          sash.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // The pointer may already be released after window blur/cancel.
+      }
     };
 
-    document.addEventListener('pointermove', handlePointerMove);
-    document.addEventListener('pointerup', handlePointerUp, { once: true });
+    document.addEventListener('pointermove', handlePointerMove, { passive: true });
+    document.addEventListener('pointerup', finishResize, { once: true });
+    document.addEventListener('pointercancel', finishResize, { once: true });
+    window.addEventListener('blur', finishResize, { once: true });
   };
 
   return (

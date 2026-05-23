@@ -425,7 +425,29 @@ export function renderMessageBody(
   );
 }
 
+function looksLikeExecutionLeakText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+
+  // Raw terminal streams occasionally arrive as generic text before the
+  // provider payload is classified. Keep those out of assistant markdown. The
+  // patterns are intentionally execution-shaped (ANSI SGR, PowerShell table
+  // headers, Codex bootstrap dumps, unified diffs/patches), not normal prose.
+  if (/\x1b\[[0-9;?]*[ -/]*[@-~]/.test(text)) return true;
+  if (/\[[0-9]{1,3}(?:;[0-9]{1,3})*m/.test(text)) return true;
+  if (/^CODEX \((?:CORE|PEER)\)/im.test(trimmed)) return true;
+  if (/^PWD:\s*$/im.test(trimmed) && /^ROOT:\s*$/im.test(trimmed)) return true;
+  if (/^\s*(?:Mode|----)\s+.*(?:LastWriteTime|Length|Name|Path)/im.test(trimmed)) return true;
+  if (/^\s*Directory:\s+/im.test(trimmed)) return true;
+  if (/^(?:diff --git|--- a\/|\+\+\+ b\/|\*\*\* Begin Patch)/m.test(trimmed)) return true;
+  if (/^Exit Code:\s*\d+/im.test(trimmed)) return true;
+
+  return false;
+}
+
 export function isSystemStatusText(text: string): boolean {
+  if (looksLikeExecutionLeakText(text)) return true;
+
   const trimmed = text.trim();
   if (trimmed.startsWith('[')) {
     const statusPrefixes = [
@@ -485,6 +507,30 @@ const RESULT_ITEM_TYPES = new Set([
   'custom_tool_call_output',
   'mcp_tool_call_output',
   'local_shell_call_output',
+]);
+
+const COMMAND_ITEM_TYPES = new Set([
+  'command_execution',
+  'local_shell_call',
+  'local_shell_call_output',
+]);
+
+const FILE_EDIT_ITEM_TYPES = new Set([
+  'file_change',
+  'diff_ready',
+  'file_change_delta',
+  'diff_delta',
+  'patch_delta',
+]);
+
+const TERMINAL_OUTPUT_ITEM_TYPES = new Set([
+  'terminal_output',
+  'terminal_output_delta',
+  'tool_output_delta',
+  'command_output_delta',
+  'shell_output_delta',
+  'stdout_delta',
+  'stderr_delta',
 ]);
 
 const PROVIDER_ITEM_EVENT_TYPES = new Set([
@@ -587,6 +633,89 @@ function getItemType(payload: any, item: any): string {
 
 function getProtocolKind(payload: any): string {
   return asString(payload?.method) || asString(payload?.params?.method) || asString(payload?.type) || '';
+}
+
+function normalizedProtocolKind(payload: any): string {
+  return getProtocolKind(payload).toLowerCase().replace(/[\/_\-\s]+/g, '.');
+}
+
+function isCommandTool(tool: ToolDisplay): boolean {
+  const name = String(tool.name || '').toLowerCase();
+  return (
+    name.includes('command') ||
+    name.includes('execute') ||
+    name.includes('shell') ||
+    name.includes('run') ||
+    COMMAND_ITEM_TYPES.has(String((tool as any).itemType || '').toLowerCase())
+  );
+}
+
+function isEditTool(tool: ToolDisplay): boolean {
+  const name = String(tool.name || '').toLowerCase();
+  const output = typeof tool.output === 'string' ? tool.output : '';
+  return (
+    name.includes('edit') ||
+    name.includes('diff') ||
+    name.includes('file') ||
+    output.startsWith('diff --git') ||
+    output.includes('\n--- ') ||
+    output.includes('\n+++ ')
+  );
+}
+
+function hasFileEditShape(payload: any, item: any, itemType: string, protocol: string): boolean {
+  if (FILE_EDIT_ITEM_TYPES.has(itemType)) return true;
+  const diffLike = firstMeaningful(
+    item?.diff,
+    payload?.diff,
+    item?.patch,
+    payload?.patch,
+    item?.changes,
+    payload?.changes,
+    item?.edits,
+    payload?.edits,
+  );
+  if (diffLike === undefined) return false;
+  const pathLike = firstPresent(item?.path, payload?.path, item?.file, payload?.file);
+  const protocolLooksEdit =
+    protocol.includes('file') ||
+    protocol.includes('diff') ||
+    protocol.includes('patch') ||
+    protocol.includes('edit');
+  return Boolean(pathLike || protocolLooksEdit);
+}
+
+function fileEditInput(payload: any, item: any): any {
+  return firstPresent(item?.path, payload?.path, item?.file, payload?.file, item?.title, payload?.title);
+}
+
+function fileEditOutput(payload: any, item: any): any {
+  return firstPresent(
+    item?.diff,
+    payload?.diff,
+    item?.patch,
+    payload?.patch,
+    item?.changes,
+    payload?.changes,
+    item?.edits,
+    payload?.edits,
+    item?.summary,
+    payload?.summary,
+  );
+}
+
+function terminalOutputText(payload: any, item: any, itemType: string): string | undefined {
+  if (!TERMINAL_OUTPUT_ITEM_TYPES.has(itemType)) return undefined;
+  const delta = firstPresent(item?.delta, payload?.delta);
+  return asString(firstPresent(
+    item?.line,
+    payload?.line,
+    item?.text,
+    payload?.text,
+    item?.output,
+    payload?.output,
+    typeof delta === 'object' ? delta?.text : delta,
+  ));
 }
 
 function isProviderItemEvent(event: any): boolean {
@@ -694,8 +823,8 @@ function toolName(payload: any, item: any, type: string): string {
   ));
   if (explicit && explicit.trim()) return explicit;
 
-  if (type === 'command_execution' || type === 'local_shell_call') return 'Execute Command';
-  if (type === 'file_change' || type === 'diff_ready') return 'Edit File';
+  if (COMMAND_ITEM_TYPES.has(type)) return 'Execute Command';
+  if (FILE_EDIT_ITEM_TYPES.has(type)) return 'Edit File';
   if (type === 'todo_list') return 'Task Planning (Codex)';
   if (type === 'approval_request') return '权限确认请求';
   if (type === 'approval_decision') return '权限处理结果';
@@ -786,11 +915,13 @@ export function renderTurnEvents(
     .filter((e) => {
       if (!isProviderItemEvent(e)) return false;
       const item = getPayloadItem(e.payload);
-      return getItemType(e.payload, item) === 'terminal_output';
+      const itemType = getItemType(e.payload, item);
+      return TERMINAL_OUTPUT_ITEM_TYPES.has(itemType);
     })
     .map((e) => {
       const item = getPayloadItem(e.payload);
-      return firstPresent(e.payload?.line, item?.line);
+      const itemType = getItemType(e.payload, item);
+      return terminalOutputText(e.payload, item, itemType);
     })
     .filter(Boolean);
 
@@ -830,15 +961,23 @@ export function renderTurnEvents(
 
     const item = getPayloadItem(payload);
     const type = getItemType(payload, item);
-    const protocol = getProtocolKind(payload).toLowerCase().replace(/\//g, '.');
+    const protocol = normalizedProtocolKind(payload);
     const itemType = type.toLowerCase();
 
-    if (itemType === 'agent_message' || itemType === 'assistant' || itemType === 'terminal_output' || itemType === 'execution_telemetry') {
+    if (
+      itemType === 'agent_message' ||
+      itemType === 'assistant' ||
+      TERMINAL_OUTPUT_ITEM_TYPES.has(itemType) ||
+      itemType === 'execution_telemetry'
+    ) {
       return;
     }
 
-    const name = toolName(payload, item, itemType);
-    const id = stableToolId(turnId, e, index, payload, item, itemType, name);
+    const effectiveItemType = hasFileEditShape(payload, item, itemType, protocol)
+      ? (FILE_EDIT_ITEM_TYPES.has(itemType) ? itemType : 'file_change')
+      : itemType;
+    const name = toolName(payload, item, effectiveItemType);
+    const id = stableToolId(turnId, e, index, payload, item, effectiveItemType, name);
 
     if (itemType === 'approval_request') {
       const requestId = asString(payload.request_id);
@@ -924,7 +1063,7 @@ export function renderTurnEvents(
         status: normalizeStatus({ ...payload, type: payload.type || 'item.completed' }, item, e.event_type),
         output: toolOutput(payload, item),
       });
-    } else if (itemType === 'command_execution') {
+    } else if (COMMAND_ITEM_TYPES.has(itemType)) {
       mergeTool(toolCalls, {
         id,
         name,
@@ -932,13 +1071,13 @@ export function renderTurnEvents(
         status: normalizeStatus(payload, item, e.event_type),
         output: toolOutput(payload, item),
       });
-    } else if (itemType === 'file_change' || itemType === 'diff_ready') {
+    } else if (FILE_EDIT_ITEM_TYPES.has(effectiveItemType) || hasFileEditShape(payload, item, itemType, protocol)) {
       mergeTool(toolCalls, {
         id,
         name,
-        input: firstPresent(item?.path, payload?.path, item?.file, payload?.file),
+        input: fileEditInput(payload, item),
         status: normalizeStatus(payload, item, e.event_type),
-        output: firstPresent(item?.diff, payload?.diff, item?.patch, payload?.patch, item?.summary, payload?.summary),
+        output: fileEditOutput(payload, item),
       });
     } else if (itemType === 'todo_list') {
       mergeTool(toolCalls, {
@@ -987,6 +1126,13 @@ export function renderTurnEvents(
 
   const hasRunningTool = toolCalls.some((tool) => tool.status === 'running' || tool.status === 'pending');
   const hasLiveTerminal = (realtimeLines?.length ?? 0) > 0;
+  const commandCount = (commandLine ? 1 : 0) + toolCalls.filter(isCommandTool).length;
+  const editCount = toolCalls.filter(isEditTool).length;
+  const summaryParts = [
+    editCount > 0 ? `已编辑 ${editCount} 个文件` : null,
+    commandCount > 0 ? `已运行 ${commandCount} 条命令` : null,
+  ].filter(Boolean);
+  const summaryTitle = summaryParts.length > 0 ? summaryParts.join(' · ') : '执行详情与日志';
 
   return (
     <div className="execution-details-accordion" style={{ marginTop: '10px', fontSize: '12px' }}>
@@ -996,21 +1142,21 @@ export function renderTurnEvents(
       >
         <summary style={{ padding: '8px 12px', cursor: 'pointer', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px', userSelect: 'none', background: 'rgba(255,255,255,0.02)' }}>
           <Terminal size={14} style={{ color: 'var(--color-secondary)' }} />
-          <span>Execution Details & Logs</span>
+          <span>{summaryTitle}</span>
           <span style={{ marginLeft: 'auto', display: 'flex', gap: '6px', alignItems: 'center' }}>
             {hasRunningTool && (
               <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(245, 158, 11, 0.1)', color: 'var(--color-warning)', borderRadius: '3px' }}>
-                Running
+                运行中
               </span>
             )}
             {toolCalls.length > 0 && (
               <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(6, 182, 212, 0.1)', color: 'var(--color-secondary)', borderRadius: '3px' }}>
-                {toolCalls.length} Tool{toolCalls.length > 1 ? 's' : ''}
+                {toolCalls.length} 项
               </span>
             )}
             {combinedTerminal.length > 0 && (
               <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-primary)', borderRadius: '3px' }}>
-                {combinedTerminal.length} Log{combinedTerminal.length > 1 ? 's' : ''}
+                {combinedTerminal.length} 日志
               </span>
             )}
           </span>

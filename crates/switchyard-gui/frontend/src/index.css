@@ -27,6 +27,7 @@
 
   --shadow-glow: 0 4px 12px rgba(0, 0, 0, 0.25);
   --shadow-heavy: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4);
+  --glass-backdrop-filter: blur(16px);
 
   color-scheme: dark;
 }
@@ -70,8 +71,8 @@ body {
 /* Glassmorphism Classes */
 .glass-panel {
   background: var(--bg-glass);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: var(--glass-backdrop-filter);
+  -webkit-backdrop-filter: var(--glass-backdrop-filter);
   border: 1px solid var(--border-muted);
   border-radius: 4px;
   box-shadow: var(--shadow-glow);
@@ -79,8 +80,8 @@ body {
 
 .glass-panel-interactive {
   background: var(--bg-glass);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: var(--glass-backdrop-filter);
+  -webkit-backdrop-filter: var(--glass-backdrop-filter);
   border: 1px solid var(--border-muted);
   border-radius: 4px;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -120,6 +121,55 @@ body {
   position: relative;
 }
 
+/* Layout/resize performance boundaries.
+   Pane resizing changes real widths/heights, so it is inevitably layout-bound
+   (unlike transform/opacity animations that can stay fully compositor/GPU
+   driven). These containment boundaries keep reflow/paint invalidation local
+   to each pane instead of letting a canvas/editor resize dirty the whole app. */
+.main-pane-stack,
+.chat-canvas-row,
+.chat-pane,
+.canvas-column,
+.left-column,
+.sidebar,
+.main-content,
+.canvas-panel,
+.terminal-panel,
+.chat-messages,
+.files-tree {
+  min-width: 0;
+  min-height: 0;
+}
+
+.main-pane-stack,
+.chat-canvas-row,
+.chat-pane,
+.canvas-column,
+.left-column,
+.sidebar,
+.main-content,
+.canvas-panel,
+.terminal-panel,
+.files-tree {
+  contain: layout paint style;
+}
+
+.chat-messages {
+  contain: layout paint style;
+  overflow-anchor: auto;
+}
+
+/* Long transcripts can contain thousands of markdown/tool DOM nodes. Let
+   Chromium skip layout + paint for off-screen turns while preserving a stable
+   estimated scroll height. This is the CSS equivalent of lightweight
+   virtualization and directly reduces sash-drag reflow cost. */
+.message-bubble,
+.message-assistant-flow,
+.tool-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 160px;
+}
+
 /* VS Code-like draggable splitters ("sashes"). They are intentionally a
    little wider than the visual 1px border so users can grab them easily
    without fighting exact pixels. */
@@ -129,6 +179,7 @@ body {
   z-index: 3;
   flex-shrink: 0;
   touch-action: none;
+  -webkit-user-drag: none;
 }
 
 .layout-sash::after {
@@ -139,6 +190,8 @@ body {
   background: var(--color-primary);
   transition: opacity 120ms ease;
   pointer-events: none;
+  transform: translateZ(0);
+  will-change: opacity;
 }
 
 .layout-sash:hover::after,
@@ -149,6 +202,37 @@ body {
 .is-layout-resizing,
 .is-layout-resizing * {
   user-select: none !important;
+}
+
+.is-layout-resizing {
+  --glass-backdrop-filter: none;
+}
+
+.is-layout-resizing *,
+.is-layout-resizing *::before,
+.is-layout-resizing *::after {
+  transition-duration: 0s !important;
+  animation-play-state: paused !important;
+}
+
+.is-layout-resizing .glass-panel,
+.is-layout-resizing .glass-panel-interactive {
+  box-shadow: none !important;
+}
+
+.is-layout-resizing .main-content,
+.is-layout-resizing .left-column,
+.is-layout-resizing .sidebar,
+.is-layout-resizing .canvas-panel,
+.is-layout-resizing .terminal-panel,
+.is-layout-resizing .files-tree,
+.is-layout-resizing .chat-messages,
+.is-layout-resizing .cm-editor {
+  pointer-events: none;
+}
+
+.is-layout-resizing .layout-sash {
+  pointer-events: auto;
 }
 
 .layout-sash-vertical {

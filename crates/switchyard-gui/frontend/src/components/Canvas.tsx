@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import {
   X,
   Copy,
@@ -535,12 +535,19 @@ const CanvasBody: React.FC<{
 /// One row in the line-by-line diff view.
 type DiffRow = { kind: 'equal' | 'remove' | 'add'; text: string };
 
-/// LCS-based line diff. O(m*n); fine for typical source-file sizes.
-function computeDiff(before: string, after: string): DiffRow[] {
+const MAX_INLINE_DIFF_CELLS = 350_000;
+
+/// LCS-based line diff. O(m*n); guarded so opening a large file in the Canvas
+/// does not freeze the GUI render thread. The right follow-up is a workerized
+/// or Monaco-style virtual diff, but this keeps the current inline view safe.
+function computeDiff(before: string, after: string): DiffRow[] | null {
   const a = before.split('\n');
   const b = after.split('\n');
   const m = a.length;
   const n = b.length;
+  if (m * n > MAX_INLINE_DIFF_CELLS) {
+    return null;
+  }
   const lcs: number[][] = Array.from({ length: m + 1 }, () =>
     new Array(n + 1).fill(0),
   );
@@ -557,27 +564,39 @@ function computeDiff(before: string, after: string): DiffRow[] {
   let j = n;
   while (i > 0 && j > 0) {
     if (a[i - 1] === b[j - 1]) {
-      rows.unshift({ kind: 'equal', text: a[i - 1] });
+      rows.push({ kind: 'equal', text: a[i - 1] });
       i--;
       j--;
     } else if (lcs[i - 1][j] >= lcs[i][j - 1]) {
-      rows.unshift({ kind: 'remove', text: a[i - 1] });
+      rows.push({ kind: 'remove', text: a[i - 1] });
       i--;
     } else {
-      rows.unshift({ kind: 'add', text: b[j - 1] });
+      rows.push({ kind: 'add', text: b[j - 1] });
       j--;
     }
   }
-  while (i > 0) rows.unshift({ kind: 'remove', text: a[--i] });
-  while (j > 0) rows.unshift({ kind: 'add', text: b[--j] });
-  return rows;
+  while (i > 0) rows.push({ kind: 'remove', text: a[--i] });
+  while (j > 0) rows.push({ kind: 'add', text: b[--j] });
+  return rows.reverse();
 }
 
 /// Unified line diff renderer. Red lines were on disk, green are the
 /// AI's edit, plain lines are unchanged. Line numbers on both sides
 /// (git-style) so the user can correlate hunks back to the file.
 const DiffView: React.FC<{ before: string; after: string }> = ({ before, after }) => {
-  const rows = computeDiff(before, after);
+  const rows = useMemo(() => computeDiff(before, after), [before, after]);
+  if (!rows) {
+    const beforeLines = before.split('\n').length;
+    const afterLines = after.split('\n').length;
+    return (
+      <div style={{ padding: 24, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+        Diff is too large to render inline without blocking the GUI
+        {' '}
+        ({beforeLines.toLocaleString()} → {afterLines.toLocaleString()} lines).
+        Use the editor view or an external diff tool for this file.
+      </div>
+    );
+  }
   if (rows.every((r) => r.kind === 'equal')) {
     return (
       <div style={{ padding: 24, color: 'var(--text-muted)' }}>

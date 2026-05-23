@@ -25,7 +25,7 @@ interface ToolCardProps {
 
 export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
   const [showInput, setShowInput] = useState(false);
-  const [showOutput, setShowOutput] = useState(true);
+  const [outputVisibilityOverride, setOutputVisibilityOverride] = useState<boolean | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
   const getStatusColor = (status: string) => {
@@ -55,6 +55,17 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
     return hasAdd && hasSub;
   };
 
+  const diffStats = (diffText: string) => {
+    let additions = 0;
+    let deletions = 0;
+    diffText.split('\n').forEach((line) => {
+      if (line.startsWith('+++') || line.startsWith('---')) return;
+      if (line.startsWith('+')) additions += 1;
+      if (line.startsWith('-')) deletions += 1;
+    });
+    return { additions, deletions };
+  };
+
   // Custom renderer for diff contents
   const renderDiff = (diffText: string) => {
     const lines = diffText.split('\n');
@@ -72,6 +83,8 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
           flexDirection: 'column',
           gap: '2px',
           lineHeight: '1.5',
+          maxHeight: '260px',
+          overflowY: 'auto',
         }}
       >
         {lines.map((line, idx) => {
@@ -115,9 +128,22 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
     return JSON.stringify(data, null, 2);
   };
 
-  const hasInput = tool.input && formatData(tool.input).length > 0;
-  const hasOutput = tool.output && formatData(tool.output).length > 0;
-  const outputIsDiff = hasOutput && typeof tool.output === 'string' && isDiffContent(tool.output);
+  const inputText = formatData(tool.input);
+  const outputText = formatData(tool.output);
+  const hasInput = Boolean(tool.input && inputText.length > 0);
+  const hasOutput = Boolean(tool.output && outputText.length > 0);
+  const outputLineCount = hasOutput ? outputText.split(/\r?\n/).length : 0;
+  const outputCharCount = outputText.length;
+  const outputIsDiff = hasOutput && isDiffContent(outputText);
+  const stats = outputIsDiff ? diffStats(outputText) : null;
+  const lowerName = tool.name.toLowerCase();
+  const commandLike = lowerName.includes('command') || lowerName.includes('execute') || lowerName.includes('run') || lowerName.includes('shell');
+  const outputIsLarge = outputIsDiff || outputLineCount > 40 || outputCharCount > 2000 || (commandLike && outputLineCount > 12);
+  const showOutput = outputVisibilityOverride ?? !outputIsLarge;
+  const toggleOutput = () => setOutputVisibilityOverride(!showOutput);
+  const outputSummary = outputIsDiff
+    ? `Diff (+${stats?.additions ?? 0} -${stats?.deletions ?? 0}, ${outputLineCount} lines)`
+    : `Output (${outputLineCount} line${outputLineCount === 1 ? '' : 's'}${outputCharCount > 2000 ? `, ${outputCharCount.toLocaleString()} chars` : ''})`;
   const hasActions = Array.isArray(tool.actions) && tool.actions.length > 0;
 
   const actionStyle = (tone: ToolAction['tone'] = 'secondary'): React.CSSProperties => {
@@ -238,7 +264,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
                   wordBreak: 'break-all',
                 }}
               >
-                {formatData(tool.input)}
+                {inputText}
               </pre>
             )}
           </div>
@@ -248,7 +274,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
         {hasOutput && (
           <div>
             <div 
-              onClick={() => setShowOutput(!showOutput)}
+              onClick={toggleOutput}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -260,11 +286,25 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
               }}
             >
               {showOutput ? <EyeOff size={11} /> : <Eye size={11} />}
-              <span>{showOutput ? 'Hide Output' : 'Show Output / Result'}</span>
+              <span>{showOutput ? `Hide ${outputSummary}` : `Show ${outputSummary}`}</span>
             </div>
+            {!showOutput && outputIsLarge && (
+              <div
+                style={{
+                  color: 'var(--text-muted)',
+                  background: 'rgba(255,255,255,0.025)',
+                  border: '1px dashed var(--border-muted)',
+                  borderRadius: '4px',
+                  padding: '6px 8px',
+                  marginBottom: '4px',
+                }}
+              >
+                已折叠大块{outputIsDiff ? '文件差异' : '工具输出'}，点击上方展开查看完整内容。
+              </div>
+            )}
             {showOutput && (
               outputIsDiff ? (
-                renderDiff(tool.output)
+                renderDiff(outputText)
               ) : (
                 <pre 
                   style={{
@@ -282,7 +322,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
                     wordBreak: 'break-all',
                   }}
                 >
-                  {formatData(tool.output)}
+                  {outputText}
                 </pre>
               )
             )}
