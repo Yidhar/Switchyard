@@ -113,8 +113,13 @@ pub fn check_auth_error(stdout: &str, stderr: &str, provider_name: &str) -> Opti
 /// When system_prompt is present (session summary, delegate results, peer catalog),
 /// wraps it with section markers so the model sees structured context.
 /// Without system_prompt, passes user_message unchanged.
+///
+/// Attachments are intentionally not appended as text here. Native providers
+/// pass them through structured CLI/API arguments (for example Codex `--image`);
+/// non-native fallbacks should make an explicit, provider-specific decision
+/// before exposing local paths to the model prompt.
 pub fn compose_prompt(input: &switchyard_provider_api::TurnInput) -> String {
-    let user_message = input.user_message_with_attachment_references();
+    let user_message = input.user_message_text();
     match &input.system_prompt {
         Some(sp) if !sp.is_empty() => {
             format!("[Context]\n{sp}\n\n[Task]\n{user_message}")
@@ -174,6 +179,7 @@ pub fn build_turn_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn effective_timeout_uses_provider_default_when_policy_is_zero() {
@@ -185,5 +191,20 @@ mod tests {
     fn effective_timeout_uses_policy_when_present() {
         assert_eq!(effective_timeout_secs(300, 120), 120);
         assert_eq!(effective_timeout_secs(300, 900), 900);
+    }
+
+    #[test]
+    fn compose_prompt_does_not_append_attachment_references() {
+        let input = TurnInput::text("图片输入测试").with_attachments(vec![InputAttachment {
+            path: PathBuf::from(r"C:\Users\demo\.switchyard\clipboard_attachments\image.png"),
+            mime_type: Some("image/png".to_string()),
+        }]);
+
+        let prompt = compose_prompt(&input);
+
+        assert_eq!(prompt, "图片输入测试");
+        assert!(!prompt.contains("[Switchyard Attachments]"));
+        assert!(!prompt.contains("clipboard_attachments"));
+        assert!(!prompt.contains("image.png"));
     }
 }

@@ -19,8 +19,9 @@ use file_watcher::{CapturedChange, FileWatcherState};
 
 use switchyard_config::{SandboxMode, SwitchyardConfig};
 use switchyard_core::{
-    ProviderRegistry, build_peer_catalog_probed, execution_policy_from_config_with_overrides,
-    run_routed_turn_observable_with_policy_and_attachments,
+    ProviderRegistry, RouterPromptInjection, build_peer_catalog_probed,
+    execution_policy_from_config_with_overrides,
+    run_routed_turn_observable_with_policy_attachments_and_prompt_injection,
 };
 use switchyard_provider_antigravity::AntigravityProvider;
 use switchyard_provider_api::{
@@ -2107,7 +2108,7 @@ async fn run_turn(
     file_watcher.start_turn();
 
     let policy = execution_policy_from_config_with_overrides(&config, &cwd, sandbox_mode, &[]);
-    let output = run_routed_turn_observable_with_policy_and_attachments(
+    let output = run_routed_turn_observable_with_policy_attachments_and_prompt_injection(
         &mut store,
         &mut session,
         &core_proxy,
@@ -2121,6 +2122,7 @@ async fn run_turn(
         Some(&tx),
         cancel.clone(),
         policy,
+        RouterPromptInjection::Clean,
     )
     .await;
 

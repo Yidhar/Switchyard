@@ -25,6 +25,26 @@ use crate::turn_runner::TurnOutput;
 const MAX_ROUTER_LOOPS: usize = 3;
 const MAX_CONTINUATION_HINT_JOBS: usize = 3;
 
+/// Controls whether Switchyard injects orchestration instructions into the
+/// provider-facing prompt for this routed turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterPromptInjection {
+    /// Legacy agent/orchestration mode: include peer delegation instructions,
+    /// HYARD live-session hints, continuation hints, and callback receipts in
+    /// the prompt so the model can drive delegation itself.
+    VerboseOrchestration,
+    /// Clean chat mode: send only the user's authored text plus structured
+    /// attachments. No Switchyard debug/delegation/HYARD boilerplate is added
+    /// to the model prompt.
+    Clean,
+}
+
+impl RouterPromptInjection {
+    fn includes_orchestration(self) -> bool {
+        matches!(self, Self::VerboseOrchestration)
+    }
+}
+
 /// Result of a routed turn, which may include delegation.
 pub struct RoutedTurnOutput {
     /// The final turn_id (the last core turn).
@@ -51,6 +71,19 @@ fn build_initial_router_message(
     }
 
     sections.join("\n\n---\n")
+}
+
+fn build_first_iteration_router_message(
+    user_message: &str,
+    peer_catalog: &PeerCatalog,
+    continuation_hint: Option<&str>,
+    prompt_injection: RouterPromptInjection,
+) -> String {
+    if prompt_injection.includes_orchestration() {
+        build_initial_router_message(user_message, peer_catalog, continuation_hint)
+    } else {
+        user_message.to_string()
+    }
 }
 
 fn build_finalization_router_message(
@@ -458,9 +491,8 @@ pub async fn run_routed_turn_observable_with_policy(
 }
 
 /// Full observable routed turn with explicit sandbox policy and local
-/// attachments. Attachments are delivered to the first Core provider turn and
-/// are also rendered as path references in the stored user message so history
-/// and non-native providers retain useful context.
+/// attachments. Attachments are delivered structurally to the first Core
+/// provider turn; they are not rendered into the stored user message.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_routed_turn_observable_with_policy_and_attachments(
     store: &mut (impl CanonicalStore + ?Sized),
@@ -477,6 +509,49 @@ pub async fn run_routed_turn_observable_with_policy_and_attachments(
     cancel: switchyard_provider_api::CancellationToken,
     base_policy: ExecutionPolicy,
 ) -> Result<RoutedTurnOutput, CoreError> {
+    run_routed_turn_observable_with_policy_attachments_and_prompt_injection(
+        store,
+        session,
+        core_provider,
+        peer_catalog,
+        resolve_peer,
+        registry,
+        user_message,
+        attachments,
+        cwd,
+        artifact_dir,
+        runtime_tx,
+        cancel,
+        base_policy,
+        RouterPromptInjection::VerboseOrchestration,
+    )
+    .await
+}
+
+/// Full observable routed turn with explicit sandbox policy, local
+/// attachments, and a prompt-injection policy.
+///
+/// GUI chat should use [`RouterPromptInjection::Clean`] so user messages and
+/// structured attachments are not polluted with Switchyard/HYARD debugging
+/// hints. CLI/TUI agent flows can keep [`RouterPromptInjection::VerboseOrchestration`]
+/// when they want model-driven delegation.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injection(
+    store: &mut (impl CanonicalStore + ?Sized),
+    session: &mut Session,
+    core_provider: &dyn Provider,
+    peer_catalog: &PeerCatalog,
+    resolve_peer: &(dyn Fn(&str) -> Option<Box<dyn Provider>> + Send + Sync),
+    registry: Option<std::sync::Arc<dyn LiveInstanceRegistry>>,
+    user_message: String,
+    attachments: Vec<InputAttachment>,
+    cwd: PathBuf,
+    artifact_dir: Option<&std::path::Path>,
+    runtime_tx: Option<&tokio::sync::mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    cancel: switchyard_provider_api::CancellationToken,
+    base_policy: ExecutionPolicy,
+    prompt_injection: RouterPromptInjection,
+) -> Result<RoutedTurnOutput, CoreError> {
     let mut last_output: Option<TurnOutput> = None;
     let mut delegated = false;
     let mut inject_context: Option<String> = None;
@@ -485,16 +560,23 @@ pub async fn run_routed_turn_observable_with_policy_and_attachments(
         system_prompt: None,
         attachments: attachments.clone(),
     };
-    let stored_user_message = user_turn_input.user_message_with_attachment_references();
-    let continuation_hint = build_hyard_continuation_hint(&cwd);
-    let session_hint = build_hyard_session_hint(session.session_id);
-    let mut callback_receipts = collect_callback_receipts_for_injection(store, session.session_id)?;
-    let callback_hint = build_callback_receipt_hint(&callback_receipts);
-    let initial_hint = combine_hint_blocks([
-        Some(session_hint.as_str()),
-        continuation_hint.as_deref(),
-        callback_hint.as_deref(),
-    ]);
+    let stored_user_message = user_turn_input.user_message_text();
+    let (continuation_hint, initial_hint, mut callback_receipts) = if prompt_injection
+        .includes_orchestration()
+    {
+        let continuation_hint = build_hyard_continuation_hint(&cwd);
+        let session_hint = build_hyard_session_hint(session.session_id);
+        let callback_receipts = collect_callback_receipts_for_injection(store, session.session_id)?;
+        let callback_hint = build_callback_receipt_hint(&callback_receipts);
+        let initial_hint = combine_hint_blocks([
+            Some(session_hint.as_str()),
+            continuation_hint.as_deref(),
+            callback_hint.as_deref(),
+        ]);
+        (continuation_hint, initial_hint, callback_receipts)
+    } else {
+        (None, None, Vec::new())
+    };
 
     // Resolve config once for retry policy + per-provider env lookup. Helpers
     // that resolve their own copy (e.g. build_hyard_continuation_hint) keep
@@ -514,11 +596,13 @@ pub async fn run_routed_turn_observable_with_policy_and_attachments(
 
     for iteration in 0..MAX_ROUTER_LOOPS {
         let message = if iteration == 0 {
-            // First iteration: user message + peer catalog + optional HYARD continuity state.
-            build_initial_router_message(
+            // First iteration: clean user text, optionally augmented with
+            // peer catalog + HYARD continuity state for orchestration mode.
+            build_first_iteration_router_message(
                 &stored_user_message,
                 peer_catalog,
                 initial_hint.as_deref(),
+                prompt_injection,
             )
         } else if let Some(ref ctx) = inject_context {
             // Finalization: original task + delegate result + explicit instruction
@@ -938,6 +1022,50 @@ pub async fn run_routed_turn_observable_with_policy_and_attachments(
 mod tests {
     use super::*;
     use std::fs;
+    use switchyard_provider_api::{PeerDescriptor, ProviderCapability, ProviderRole};
+
+    fn sample_peer_catalog() -> PeerCatalog {
+        let mut catalog = PeerCatalog::new();
+        catalog.add(PeerDescriptor {
+            provider_id: "claude".to_string(),
+            roles: vec![ProviderRole::Reviewer],
+            available: true,
+            capabilities: vec![ProviderCapability::HeadlessTurn],
+            description: "Claude CLI".to_string(),
+            host_surface: None,
+        });
+        catalog
+    }
+
+    #[test]
+    fn clean_prompt_injection_keeps_first_turn_to_user_text_only() {
+        let message = build_first_iteration_router_message(
+            "图片输入测试",
+            &sample_peer_catalog(),
+            Some("HYARD live-session hint:\n- Current Switchyard session id: test"),
+            RouterPromptInjection::Clean,
+        );
+
+        assert_eq!(message, "图片输入测试");
+        assert!(!message.contains("Available peer providers"));
+        assert!(!message.contains("SWITCHYARD_JSON_BEGIN"));
+        assert!(!message.contains("HYARD live-session hint"));
+    }
+
+    #[test]
+    fn verbose_prompt_injection_keeps_legacy_orchestration_hints() {
+        let message = build_first_iteration_router_message(
+            "实现这个功能",
+            &sample_peer_catalog(),
+            Some("HYARD live-session hint:\n- Current Switchyard session id: test"),
+            RouterPromptInjection::VerboseOrchestration,
+        );
+
+        assert!(message.contains("实现这个功能"));
+        assert!(message.contains("Available peer providers"));
+        assert!(message.contains("SWITCHYARD_JSON_BEGIN"));
+        assert!(message.contains("HYARD live-session hint"));
+    }
 
     #[test]
     fn continuation_hint_reads_active_jobs_and_prioritizes_wait_timeout() {

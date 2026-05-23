@@ -109,15 +109,17 @@ pub trait LiveInstance: Send + Sync {
 
     /// Send a full turn payload, including optional local image attachments,
     /// through a persistent instance. Providers with native multimodal daemon
-    /// support should override this method. The default path preserves
-    /// backward compatibility by appending attachment file references to the
-    /// text and delegating to `send_message_with_policy`.
+    /// support should override this method.
+    ///
+    /// The default path deliberately sends only the literal user-authored text
+    /// and leaves attachments structured. That avoids leaking local file paths
+    /// or Switchyard attachment boilerplate into the model prompt.
     async fn send_turn_with_policy(
         &mut self,
         input: &TurnInput,
         policy: &crate::ExecutionPolicy,
     ) -> Result<mpsc::Receiver<ProviderEvent>, ProviderError> {
-        let text = input.user_message_with_attachment_references();
+        let text = input.user_message_text();
         self.send_message_with_policy(&text, policy).await
     }
     async fn update_context(&mut self, context: ContextBundle) -> Result<(), ProviderError>;

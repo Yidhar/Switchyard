@@ -32,6 +32,15 @@ impl TurnInput {
         self
     }
 
+    /// Return the literal user-authored task text without any Switchyard
+    /// attachment or orchestration notes appended.
+    ///
+    /// GUI and native multimodal provider paths should prefer this method so
+    /// structured attachments stay out of the text prompt.
+    pub fn user_message_text(&self) -> String {
+        self.user_message.clone()
+    }
+
     /// Return the user-visible task text with a stable, lightweight list of
     /// attached local files appended. Providers with native multimodal support
     /// still receive the actual attachment payload separately; this note keeps

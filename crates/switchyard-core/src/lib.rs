@@ -21,8 +21,9 @@ pub use fake_provider::FakeProvider;
 pub use policy::{execution_policy_from_config, execution_policy_from_config_with_overrides};
 pub use registry::{ProviderRegistry, build_peer_catalog, build_peer_catalog_probed};
 pub use router::{
-    RoutedTurnOutput, run_routed_turn, run_routed_turn_observable,
+    RoutedTurnOutput, RouterPromptInjection, run_routed_turn, run_routed_turn_observable,
     run_routed_turn_observable_with_policy, run_routed_turn_observable_with_policy_and_attachments,
+    run_routed_turn_observable_with_policy_attachments_and_prompt_injection,
     run_routed_turn_with_archive, run_routed_turn_with_archive_and_policy,
 };
 pub use runtime_events::RuntimeEvent;
