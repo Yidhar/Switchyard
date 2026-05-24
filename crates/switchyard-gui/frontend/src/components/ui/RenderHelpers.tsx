@@ -656,7 +656,9 @@ function isEditTool(tool: ToolDisplay): boolean {
   return (
     name.includes('edit') ||
     name.includes('diff') ||
-    name.includes('file') ||
+    name.includes('patch') ||
+    name.includes('file change') ||
+    name.includes('changed file') ||
     output.startsWith('diff --git') ||
     output.includes('\n--- ') ||
     output.includes('\n+++ ')
@@ -686,7 +688,22 @@ function hasFileEditShape(payload: any, item: any, itemType: string, protocol: s
 }
 
 function fileEditInput(payload: any, item: any): any {
-  return firstPresent(item?.path, payload?.path, item?.file, payload?.file, item?.title, payload?.title);
+  return firstPresent(
+    item?.path,
+    payload?.path,
+    item?.file,
+    payload?.file,
+    item?.title,
+    payload?.title,
+    item?.input,
+    payload?.input,
+    item?.arguments,
+    payload?.arguments,
+    item?.args,
+    payload?.args,
+    item?.params,
+    payload?.params,
+  );
 }
 
 function fileEditOutput(payload: any, item: any): any {
@@ -852,6 +869,18 @@ function stableToolId(turnId: string, event: any, index: number, payload: any, i
       return `${turnId}:approval:${String(approvalRequestId)}`;
     }
   }
+  if (FILE_EDIT_ITEM_TYPES.has(type)) {
+    const filePath = fileEditPathForTool({
+      id: '',
+      name,
+      input: fileEditInput(payload, item),
+      status: 'running',
+      output: fileEditOutput(payload, item),
+    });
+    if (filePath) {
+      return `${turnId}:${type}:file:${canonicalEditPathKey(filePath)}`;
+    }
+  }
   const natural = firstPresent(
     item?.id,
     payload?.id,
@@ -875,7 +904,11 @@ function mergeTool(toolCalls: ToolDisplay[], next: ToolDisplay) {
   const existing = toolCalls.find(
     (tool) =>
       tool.id === next.id ||
-      (tool.name === next.name && (tool.status === 'running' || tool.status === 'pending') && !tool.output),
+      (!isEditTool(tool) &&
+        !isEditTool(next) &&
+        tool.name === next.name &&
+        (tool.status === 'running' || tool.status === 'pending') &&
+        !tool.output),
   );
   if (!existing) {
     toolCalls.push(next);
@@ -913,8 +946,49 @@ function formatToolData(value: any): string {
   }
 }
 
+function collectDiffTextFragments(value: any, depth = 0, fragments: string[] = []): string[] {
+  if (value === undefined || value === null || depth > 4) return fragments;
+
+  if (typeof value === 'string') {
+    if (
+      value.includes('diff --git') ||
+      value.includes('\n+++ ') ||
+      value.includes('\n--- ') ||
+      /^[+-][^+-]/m.test(value)
+    ) {
+      fragments.push(value);
+    }
+    return fragments;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectDiffTextFragments(item, depth + 1, fragments));
+    return fragments;
+  }
+
+  if (typeof value !== 'object') return fragments;
+
+  [
+    'diff',
+    'patch',
+    'content',
+    'output',
+    'result',
+    'summary',
+    'text',
+    'changes',
+    'edits',
+    'files',
+    'items',
+    'data',
+  ].forEach((key) => collectDiffTextFragments(value[key], depth + 1, fragments));
+
+  return fragments;
+}
+
 function diffStatsFromText(value: any): { additions: number; deletions: number; lines: number } {
-  const text = formatToolData(value);
+  const fragments = collectDiffTextFragments(value);
+  const text = fragments.length > 0 ? fragments.join('\n') : formatToolData(value);
   let additions = 0;
   let deletions = 0;
   const lines = text ? text.split(/\r?\n/) : [];
@@ -935,19 +1009,165 @@ function compactPathLabel(path: string): string {
   return `…/${tail}`;
 }
 
-function fileEditPathLabel(tool: ToolDisplay): string {
-  if (typeof tool.input === 'string' && tool.input.trim()) {
-    return compactPathLabel(tool.input.trim());
+function normalizeEditPath(path: string): string {
+  return path
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/^file:\/\//i, '')
+    .replace(/\\/g, '/')
+    .replace(/^(?:a|b)\//, '');
+}
+
+function canonicalEditPathKey(path: string): string {
+  return normalizeEditPath(path)
+    .replace(/^\.\/+/, '')
+    .replace(/\/+/g, '/')
+    .toLowerCase();
+}
+
+function isGenericEditPathLabel(path: string): boolean {
+  const normalized = path.trim().toLowerCase();
+  return [
+    'edit',
+    'edit file',
+    'file edit',
+    'file change',
+    'file changes',
+    'changed file',
+    'changed files',
+    'diff',
+    'patch',
+    'apply patch',
+    'apply_patch',
+    'tool call',
+  ].includes(normalized);
+}
+
+function stripDiffPathMetadata(path: string): string {
+  return path
+    .split('\t')[0]
+    .replace(/\s+\d{4}-\d{2}-\d{2}.*$/, '')
+    .trim();
+}
+
+function pathFromUnifiedDiff(value: any): string | undefined {
+  const text = typeof value === 'string' ? value : formatToolData(value);
+  if (!text) return undefined;
+
+  const gitMatch = text.match(/^diff --git\s+"?a\/(.+?)"?\s+"?b\/(.+?)"?\s*$/m);
+  if (gitMatch) {
+    return normalizeEditPath(stripDiffPathMetadata(gitMatch[2] || gitMatch[1]));
   }
-  const candidate = firstPresent(
-    tool.input?.path,
-    tool.input?.file,
-    tool.input?.title,
-    tool.input?.relative_path,
-    tool.input?.absolute_path,
+
+  const plusMatch = text.match(/^\+\+\+\s+(.+)$/m);
+  if (plusMatch) {
+    const candidate = normalizeEditPath(stripDiffPathMetadata(plusMatch[1]));
+    if (candidate && candidate !== '/dev/null') return candidate;
+  }
+
+  const minusMatch = text.match(/^---\s+(.+)$/m);
+  if (minusMatch) {
+    const candidate = normalizeEditPath(stripDiffPathMetadata(minusMatch[1]));
+    if (candidate && candidate !== '/dev/null') return candidate;
+  }
+
+  return undefined;
+}
+
+function looksLikeEditPath(text: string): boolean {
+  const normalized = normalizeEditPath(text);
+  if (!normalized || normalized.length > 260) return false;
+  if (isGenericEditPathLabel(normalized)) return false;
+  if (/^https?:\/\//i.test(normalized) || normalized.includes('://')) return false;
+  if (/^(?:diff --git|--- |\+\+\+ |\*\*\* Begin Patch)/m.test(normalized)) return false;
+  if (/[\r\n{}[\]]/.test(normalized)) return false;
+
+  const basename = activityPathBasename(normalized);
+  if (!basename || basename === '.' || basename === '..') return false;
+  if (DOTFILE_NAMES.has(basename.toLowerCase()) || EXTENSIONLESS_FILE_NAMES.has(basename.toLowerCase())) return true;
+  if (looksLikeFilePath(normalized)) return true;
+  if (/[\\/]/.test(normalized)) return true;
+  return /^[^/\\\s]+\.[A-Za-z0-9][A-Za-z0-9_-]{0,16}$/.test(basename);
+}
+
+function pathCandidateFromText(value: string, requirePathShape = false): string | undefined {
+  const diffPath = pathFromUnifiedDiff(value);
+  if (diffPath) return diffPath;
+
+  const candidate = normalizeEditPath(value);
+  if (!candidate || candidate.length > 260 || /[\r\n]/.test(candidate)) return undefined;
+  if (requirePathShape && !looksLikeEditPath(candidate)) return undefined;
+  if (!looksLikeEditPath(candidate)) return undefined;
+  return candidate;
+}
+
+function extractEditPathFromValue(value: any, depth = 0): string | undefined {
+  if (value === undefined || value === null || depth > 4) return undefined;
+
+  if (typeof value === 'string') {
+    return pathCandidateFromText(value);
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = extractEditPathFromValue(item, depth + 1);
+      if (nested) return nested;
+    }
+    return undefined;
+  }
+
+  if (typeof value !== 'object') return undefined;
+
+  const directPath = firstPresent(
+    value.path,
+    value.file,
+    value.filename,
+    value.file_name,
+    value.filePath,
+    value.file_path,
+    value.filepath,
+    value.relative_path,
+    value.relativePath,
+    value.absolute_path,
+    value.absolutePath,
   );
-  const text = asString(candidate);
-  if (text?.trim()) return compactPathLabel(text);
+  const directText = asString(directPath);
+  if (directText) {
+    const candidate = pathCandidateFromText(directText, true);
+    if (candidate) return candidate;
+  }
+
+  const titleText = asString(firstPresent(value.title, value.name, value.label));
+  if (titleText) {
+    const candidate = pathCandidateFromText(titleText, true);
+    if (candidate) return candidate;
+  }
+
+  const diffPath = pathFromUnifiedDiff(firstPresent(
+    value.diff,
+    value.patch,
+    value.content,
+    value.output,
+    value.result,
+    value.summary,
+  ));
+  if (diffPath) return diffPath;
+
+  for (const key of ['input', 'arguments', 'args', 'params', 'changes', 'edits', 'files', 'items', 'data']) {
+    const nested = extractEditPathFromValue(value[key], depth + 1);
+    if (nested) return nested;
+  }
+
+  return undefined;
+}
+
+function fileEditPathForTool(tool: ToolDisplay): string | undefined {
+  return extractEditPathFromValue(tool.input) || extractEditPathFromValue(tool.output);
+}
+
+function fileEditPathLabel(tool: ToolDisplay): string {
+  const path = fileEditPathForTool(tool);
+  if (path) return compactPathLabel(path);
   return tool.name || 'File change';
 }
 
@@ -993,6 +1213,67 @@ function isCreatedFileChange(value: any): boolean {
     /^create mode\b/im.test(text) ||
     /\bcreated\s+(?:file|path)\b/i.test(text)
   );
+}
+
+function mergeEditStatus(current: ToolStatus, next: ToolStatus): ToolStatus {
+  if (current === 'failed' || next === 'failed') return 'failed';
+  if (current === 'running' || next === 'running') return 'running';
+  if (current === 'pending' || next === 'pending') return 'pending';
+  if (current === 'cancelled' || next === 'cancelled') return 'cancelled';
+  return next || current;
+}
+
+function editSummaryVerb(item: EditSummary): string {
+  if (item.status === 'running' || item.status === 'pending') return '正在编辑';
+  if (item.status === 'failed') return '编辑失败';
+  if (item.status === 'cancelled') return '已取消';
+  if (item.created) return '已创建';
+  return '已编辑';
+}
+
+function editSummaryIndicator(item: EditSummary): string {
+  if (item.status === 'failed') return '!';
+  if (item.status === 'running' || item.status === 'pending') return '…';
+  if (item.status === 'cancelled') return '×';
+  return '›';
+}
+
+function aggregateEditSummaries(editTools: ToolDisplay[]): EditSummary[] {
+  const summaries: EditSummary[] = [];
+  const byKey = new Map<string, EditSummary>();
+
+  editTools.forEach((tool, index) => {
+    const fullPath = fileEditPathForTool(tool);
+    const fallbackLabel = fileEditPathLabel(tool);
+    const knownPath = fullPath && !isGenericEditPathLabel(fullPath) ? fullPath : undefined;
+    const key = knownPath ? canonicalEditPathKey(knownPath) : `unknown:${tool.id}:${index}`;
+    const stats = diffStatsFromText(tool.output);
+    const nextSummary: EditSummary = {
+      id: knownPath ? `edit:${key}` : `${tool.id}:${index}`,
+      path: knownPath ? compactPathLabel(knownPath) : fallbackLabel,
+      status: tool.status,
+      created: isCreatedFileChange(tool.output),
+      ...stats,
+    };
+
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, nextSummary);
+      summaries.push(nextSummary);
+      return;
+    }
+
+    existing.status = mergeEditStatus(existing.status, nextSummary.status);
+    existing.additions = Math.max(existing.additions, nextSummary.additions);
+    existing.deletions = Math.max(existing.deletions, nextSummary.deletions);
+    existing.lines = Math.max(existing.lines, nextSummary.lines);
+    existing.created = existing.created || nextSummary.created;
+    if (isGenericEditPathLabel(existing.path) && !isGenericEditPathLabel(nextSummary.path)) {
+      existing.path = nextSummary.path;
+    }
+  });
+
+  return summaries;
 }
 
 function collectTurnExecutionState(
@@ -1243,17 +1524,8 @@ function collectTurnExecutionState(
   const hasLiveTerminal = turnIsActive && (realtimeLines?.length ?? 0) > 0;
   const commandCount = (commandLine ? 1 : 0) + displayToolCalls.filter(isCommandTool).length;
   const editTools = displayToolCalls.filter(isEditTool);
-  const editCount = editTools.length;
-  const editSummaries = editTools.map((tool) => {
-    const stats = diffStatsFromText(tool.output);
-    return {
-      id: tool.id,
-      path: fileEditPathLabel(tool),
-      status: tool.status,
-      created: isCreatedFileChange(tool.output),
-      ...stats,
-    };
-  });
+  const editSummaries = aggregateEditSummaries(editTools);
+  const editCount = editSummaries.length;
   const totalAdditions = editSummaries.reduce((sum, item) => sum + item.additions, 0);
   const totalDeletions = editSummaries.reduce((sum, item) => sum + item.deletions, 0);
   const actionableTools = displayToolCalls.filter((tool) => Array.isArray(tool.actions) && tool.actions.length > 0);
@@ -1542,11 +1814,66 @@ export function renderTurnEvents(
 
   const visibleEditSummaries = editSummaries.slice(0, 4);
   const hiddenEditCount = Math.max(0, editSummaries.length - visibleEditSummaries.length);
+  const executionItemCount = Math.max(0, displayToolCalls.length - state.editTools.length + editSummaries.length);
   const summaryParts = [
     editCount > 0 ? `已编辑 ${editCount} 个文件` : null,
     commandCount > 0 ? `已运行 ${commandCount} 条命令` : null,
   ].filter(Boolean);
   const summaryTitle = summaryParts.length > 0 ? summaryParts.join(' · ') : '执行详情与日志';
+  const renderEditSummaryRow = (item: EditSummary) => (
+    <div
+      key={item.id}
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'auto minmax(0, 1fr) auto auto',
+        gap: 8,
+        alignItems: 'center',
+        color: 'var(--text-secondary)',
+        padding: '2px 2px',
+        minWidth: 0,
+        lineHeight: 1.45,
+      }}
+    >
+      <span
+        style={{
+          color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-secondary)',
+          fontWeight: 700,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {editSummaryVerb(item)}
+      </span>
+      <span
+        style={{
+          minWidth: 0,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          color: 'var(--color-primary)',
+          fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
+          fontSize: 11,
+        }}
+        title={item.path}
+      >
+        {activityPathBasename(item.path)}
+      </span>
+      <span style={{ fontFamily: 'monospace', fontSize: 11, whiteSpace: 'nowrap' }}>
+        <span style={{ color: 'var(--color-success)' }}>+{item.additions}</span>{' '}
+        <span style={{ color: 'var(--color-error)' }}>-{item.deletions}</span>
+      </span>
+      <span
+        aria-hidden="true"
+        style={{
+          color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-muted)',
+          fontSize: 13,
+          lineHeight: 1,
+          opacity: 0.8,
+        }}
+      >
+        {editSummaryIndicator(item)}
+      </span>
+    </div>
+  );
 
   return (
     <div
@@ -1586,9 +1913,9 @@ export function renderTurnEvents(
               运行中
             </span>
           ) : null}
-          {displayToolCalls.length > 0 && (
+          {executionItemCount > 0 && (
             <span style={{ fontSize: '11px', padding: '2px 7px', background: 'rgba(6, 182, 212, 0.1)', color: 'var(--color-secondary)', borderRadius: '999px' }}>
-              {displayToolCalls.length} 项
+              {executionItemCount} 项
             </span>
           )}
           {combinedTerminal.length > 0 && (
@@ -1604,34 +1931,7 @@ export function renderTurnEvents(
 
       {editSummaries.length > 0 && (
         <div style={{ padding: '7px 12px 9px', display: 'flex', flexDirection: 'column', gap: 4 }}>
-          {visibleEditSummaries.map((item) => (
-            <div
-              key={item.id}
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'minmax(0, 1fr) auto auto',
-                gap: 8,
-                alignItems: 'center',
-                color: 'var(--text-secondary)',
-                background: 'rgba(255,255,255,0.018)',
-                border: '1px solid rgba(255,255,255,0.04)',
-                borderRadius: 6,
-                padding: '5px 7px',
-                minWidth: 0,
-              }}
-            >
-              <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: 11 }}>
-                {item.path}
-              </span>
-              <span style={{ fontFamily: 'monospace', fontSize: 11 }}>
-                <span style={{ color: 'var(--color-success)' }}>+{item.additions}</span>{' '}
-                <span style={{ color: 'var(--color-error)' }}>-{item.deletions}</span>
-              </span>
-              <span style={{ color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-muted)', fontSize: 11 }}>
-                {item.status === 'completed' ? '✓' : item.status === 'failed' ? '!' : '⌄'}
-              </span>
-            </div>
-          ))}
+          {visibleEditSummaries.map(renderEditSummaryRow)}
           {hiddenEditCount > 0 && (
             <details style={{ marginTop: 2 }}>
               <summary
@@ -1646,34 +1946,7 @@ export function renderTurnEvents(
                 再显示 {hiddenEditCount} 个文件
               </summary>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 4 }}>
-                {editSummaries.slice(4).map((item) => (
-                  <div
-                    key={item.id}
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'minmax(0, 1fr) auto auto',
-                      gap: 8,
-                      alignItems: 'center',
-                      color: 'var(--text-secondary)',
-                      background: 'rgba(255,255,255,0.018)',
-                      border: '1px solid rgba(255,255,255,0.04)',
-                      borderRadius: 6,
-                      padding: '5px 7px',
-                      minWidth: 0,
-                    }}
-                  >
-                    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: 11 }}>
-                      {item.path}
-                    </span>
-                    <span style={{ fontFamily: 'monospace', fontSize: 11 }}>
-                      <span style={{ color: 'var(--color-success)' }}>+{item.additions}</span>{' '}
-                      <span style={{ color: 'var(--color-error)' }}>-{item.deletions}</span>
-                    </span>
-                    <span style={{ color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-muted)', fontSize: 11 }}>
-                      {item.status === 'completed' ? '✓' : item.status === 'failed' ? '!' : '⌄'}
-                    </span>
-                  </div>
-                ))}
+                {editSummaries.slice(4).map(renderEditSummaryRow)}
               </div>
             </details>
           )}
