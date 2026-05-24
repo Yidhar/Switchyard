@@ -36,6 +36,7 @@ interface ChatAreaProps {
     onProposeForCanvas?: (path: string, content: string) => void,
   ) => React.ReactNode;
   renderTurnEvents: (turnId: string, events: any[], turns: Turn[], realtimeLines?: string[], hyardJobs?: Record<string, any>) => React.ReactNode;
+  renderTurnActivitySummary: (turnId: string, events: any[], turns: Turn[], realtimeLines?: string[], hyardJobs?: Record<string, any>) => React.ReactNode;
   queuedMessages: SendPayload[];
   onClearQueue: () => void;
   sandboxMode: SandboxMode;
@@ -251,6 +252,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   hyardJobs,
   renderMessageBody,
   renderTurnEvents,
+  renderTurnActivitySummary,
   queuedMessages,
   onClearQueue,
   sandboxMode,
@@ -910,7 +912,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           <div className="message-assistant-flow">
             <div className="message-header">{selectedSession?.active_core ?? 'Core'} (core)</div>
             <div className="message-body" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)' }}>
-              <span className="thinking-dots">Orchestrator preparing and executing core provider</span>
+              <span className="thinking-dots">正在准备并启动 core provider…</span>
               <span className="spinner-small"></span>
             </div>
           </div>
@@ -923,18 +925,22 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           <div className="message-assistant-flow">
             <div className="message-header">{selectedSession?.active_core ?? 'Core'} (core)</div>
             {renderedActiveCoreText ? (
-              <RenderedMessageBody
-                text={renderedActiveCoreText}
-                renderMessageBody={renderMessageBody}
-                onOpenFile={onOpenFile}
-              />
+              <>
+                <RenderedMessageBody
+                  text={renderedActiveCoreText}
+                  renderMessageBody={renderMessageBody}
+                  onOpenFile={onOpenFile}
+                />
+                {activeCoreTurnId && renderTurnEvents(activeCoreTurnId, sessionEvents, turns, realtimeTerminalLines[activeCoreTurnId], hyardJobs)}
+              </>
+            ) : activeCoreTurnId ? (
+              renderTurnActivitySummary(activeCoreTurnId, sessionEvents, turns, realtimeTerminalLines[activeCoreTurnId], hyardJobs)
             ) : (
               <div className="message-body" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)' }}>
-                <span className="thinking-dots">Waiting for provider stream or tool output</span>
+                <span className="thinking-dots">正在连接 provider，等待首个流式事件…</span>
                 <span className="spinner-small"></span>
               </div>
             )}
-            {activeCoreTurnId && renderTurnEvents(activeCoreTurnId, sessionEvents, turns, realtimeTerminalLines[activeCoreTurnId], hyardJobs)}
           </div>
         )}
 
@@ -947,11 +953,23 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <div className="message-header" style={{ color: 'var(--color-secondary)' }}>
               Active Delegation: {activePeerName}
             </div>
-            <div className="message-body" style={{ fontStyle: 'italic', display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <span>{renderedActivePeerText || 'Waiting for output...'}</span>
-              {!renderedActivePeerText && <span className="spinner-small"></span>}
-            </div>
-            {activePeerTurnId && renderTurnEvents(activePeerTurnId, sessionEvents, turns, realtimeTerminalLines[activePeerTurnId], hyardJobs)}
+            {renderedActivePeerText ? (
+              <>
+                <RenderedMessageBody
+                  text={renderedActivePeerText}
+                  renderMessageBody={renderMessageBody}
+                  onOpenFile={onOpenFile}
+                />
+                {activePeerTurnId && renderTurnEvents(activePeerTurnId, sessionEvents, turns, realtimeTerminalLines[activePeerTurnId], hyardJobs)}
+              </>
+            ) : activePeerTurnId ? (
+              renderTurnActivitySummary(activePeerTurnId, sessionEvents, turns, realtimeTerminalLines[activePeerTurnId], hyardJobs)
+            ) : (
+              <div className="message-body" style={{ fontStyle: 'italic', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span className="thinking-dots">正在等待 peer 输出…</span>
+                <span className="spinner-small"></span>
+              </div>
+            )}
           </div>
         )}
 

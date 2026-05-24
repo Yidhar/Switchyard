@@ -31,7 +31,7 @@ import { StatusBar } from './components/StatusBar';
 import { parseSlash, type SlashContext } from './components/slashCommands';
 // ArtifactDrawer is no longer rendered — its bottom-bar UX didn't fit
 // the new layout. The import + state are dropped along with the bar.
-import { renderMessageBody, isSystemStatusText, renderTurnEvents } from './components/ui/RenderHelpers';
+import { renderMessageBody, isSystemStatusText, renderTurnEvents, renderTurnActivitySummary } from './components/ui/RenderHelpers';
 import { resolveToolApproval } from './services/api';
 import {
   attachmentFromPath,
@@ -443,7 +443,14 @@ function payloadLooksLikeToolOrActivity(payload: any): boolean {
 }
 
 function appendRealtimeLines(current: string[] | undefined, incoming: string[]): string[] {
-  const next = [...(current || []), ...incoming];
+  const next = [...(current || [])];
+  for (const line of incoming) {
+    // Runtime status text and terminal output can occasionally mirror the same
+    // provider line. De-dupe consecutive duplicates so the live activity block
+    // stays readable while still preserving the full stream order.
+    if (next[next.length - 1] === line) continue;
+    next.push(line);
+  }
   if (next.length <= MAX_REALTIME_TERMINAL_LINES) return next;
   return next.slice(next.length - MAX_REALTIME_TERMINAL_LINES);
 }
@@ -1388,6 +1395,12 @@ function App() {
               const itemText = typeof data.text === 'string' ? data.text : '';
               if (isSystemStatusText(itemText)) {
                 addLog(now, 'core', itemText);
+                if (data.turn_id && itemText.trim()) {
+                  setRealtimeTerminalLines((prev) => ({
+                    ...prev,
+                    [data.turn_id]: appendRealtimeLines(prev[data.turn_id], itemText.split(/\r?\n/)),
+                  }));
+                }
               } else if (hasProviderTextUpdate(itemText, data.payload)) {
                 setActiveCoreText((prev) => applyProviderTextUpdate(prev, itemText, data.payload));
               }
@@ -1428,6 +1441,12 @@ function App() {
               const itemText = typeof data.text === 'string' ? data.text : '';
               if (isSystemStatusText(itemText)) {
                 addLog(now, 'peer', itemText);
+                if (data.turn_id && itemText.trim()) {
+                  setRealtimeTerminalLines((prev) => ({
+                    ...prev,
+                    [data.turn_id]: appendRealtimeLines(prev[data.turn_id], itemText.split(/\r?\n/)),
+                  }));
+                }
               } else if (hasProviderTextUpdate(itemText, data.payload)) {
                 setActivePeerText((prev) => applyProviderTextUpdate(prev, itemText, data.payload));
               }
@@ -1747,6 +1766,16 @@ function App() {
     realtimeLines?: string[],
     jobs?: Record<string, any>,
   ) => renderTurnEvents(turnId, eventList, turnList, realtimeLines, jobs, {
+    onResolveApproval: handleResolveToolApproval,
+  });
+
+  const renderTurnActivitySummaryWithActions = (
+    turnId: string,
+    eventList: any[],
+    turnList: Turn[],
+    realtimeLines?: string[],
+    jobs?: Record<string, any>,
+  ) => renderTurnActivitySummary(turnId, eventList, turnList, realtimeLines, jobs, {
     onResolveApproval: handleResolveToolApproval,
   });
 
@@ -2782,6 +2811,7 @@ function App() {
               hyardJobs={hyardJobs}
               renderMessageBody={renderMessageBody}
               renderTurnEvents={renderTurnEventsWithActions}
+              renderTurnActivitySummary={renderTurnActivitySummaryWithActions}
               queuedMessages={messageQueue}
               onClearQueue={handleClearQueue}
               sandboxMode={config?.sandbox?.mode ?? DEFAULT_SANDBOX_MODE}

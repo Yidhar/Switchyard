@@ -951,14 +951,58 @@ function fileEditPathLabel(tool: ToolDisplay): string {
   return tool.name || 'File change';
 }
 
-export function renderTurnEvents(
+
+interface EditSummary {
+  id: string;
+  path: string;
+  status: ToolStatus;
+  additions: number;
+  deletions: number;
+  lines: number;
+  created: boolean;
+}
+
+interface TurnExecutionState {
+  turnEvents: any[];
+  commandLine?: string;
+  commandArgs: any;
+  combinedTerminal: string[];
+  toolCalls: ToolDisplay[];
+  displayToolCalls: ToolDisplay[];
+  editTools: ToolDisplay[];
+  editSummaries: EditSummary[];
+  actionableTools: ToolDisplay[];
+  currentTurn?: Turn;
+  turnStatus?: Turn['status'];
+  turnIsActive: boolean;
+  hasRunningTool: boolean;
+  hasLiveTerminal: boolean;
+  commandCount: number;
+  editCount: number;
+  totalAdditions: number;
+  totalDeletions: number;
+}
+
+function isCreatedFileChange(value: any): boolean {
+  const text = formatToolData(value);
+  if (!text) return false;
+  return (
+    /^new file mode\b/m.test(text) ||
+    /^---\s+\/dev\/null\s*$/m.test(text) ||
+    /\n---\s+\/dev\/null(?:\s|$)/.test(text) ||
+    /^create mode\b/im.test(text) ||
+    /\bcreated\s+(?:file|path)\b/i.test(text)
+  );
+}
+
+function collectTurnExecutionState(
   turnId: string,
   events: any[],
   turns: Turn[],
   realtimeLines?: string[],
   hyardJobs?: Record<string, any>,
   options: RenderTurnEventsOptions = {},
-) {
+): TurnExecutionState {
   // Filter events for this turn
   const turnEvents = events.filter((e) => e.turn_id === turnId);
 
@@ -987,14 +1031,14 @@ export function renderTurnEvents(
       const itemType = getItemType(e.payload, item);
       return terminalOutputText(e.payload, item, itemType);
     })
-    .filter(Boolean);
+    .filter((line): line is string => Boolean(line));
 
   let combinedTerminal = [...dbTerminalLines, ...(realtimeLines || [])];
 
   if (hyardJobs && hyardJobs[turnId]) {
     const job = hyardJobs[turnId];
     if (job.last_output_preview && combinedTerminal.length === 0) {
-      combinedTerminal = job.last_output_preview.split('\n');
+      combinedTerminal = String(job.last_output_preview).split('\n');
     }
     if (job.execution && !commandLine) {
       commandLine = executionCommand(job.execution);
@@ -1184,10 +1228,6 @@ export function renderTurnEvents(
     }
   });
 
-  if (!commandLine && toolCalls.length === 0 && combinedTerminal.length === 0) {
-    return null;
-  }
-
   const currentTurn = turns.find((turn) => turn.turn_id === turnId);
   const turnStatus = currentTurn?.status;
   const turnIsActive = isActiveTurnStatus(turnStatus);
@@ -1210,14 +1250,298 @@ export function renderTurnEvents(
       id: tool.id,
       path: fileEditPathLabel(tool),
       status: tool.status,
+      created: isCreatedFileChange(tool.output),
       ...stats,
     };
   });
   const totalAdditions = editSummaries.reduce((sum, item) => sum + item.additions, 0);
   const totalDeletions = editSummaries.reduce((sum, item) => sum + item.deletions, 0);
+  const actionableTools = displayToolCalls.filter((tool) => Array.isArray(tool.actions) && tool.actions.length > 0);
+
+  return {
+    turnEvents,
+    commandLine,
+    commandArgs,
+    combinedTerminal,
+    toolCalls,
+    displayToolCalls,
+    editTools,
+    editSummaries,
+    actionableTools,
+    currentTurn,
+    turnStatus,
+    turnIsActive,
+    hasRunningTool,
+    hasLiveTerminal,
+    commandCount,
+    editCount,
+    totalAdditions,
+    totalDeletions,
+  };
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\[[0-9]{1,3}(?:;[0-9]{1,3})*m/g, '');
+}
+
+function truncateActivityText(text: string, max = 180): string {
+  const cleaned = stripAnsi(text).replace(/\s+/g, ' ').trim();
+  return cleaned.length > max ? `${cleaned.slice(0, Math.max(0, max - 1))}…` : cleaned;
+}
+
+function latestMeaningfulTerminalLine(lines: string[]): string | null {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const parts = String(lines[i] ?? '').split(/\r?\n/).reverse();
+    for (const part of parts) {
+      const cleaned = truncateActivityText(part);
+      if (!cleaned) continue;
+      if (/^CODEX \((?:CORE|PEER)\)$/i.test(cleaned)) continue;
+      if (/^PWD:\s*$/i.test(cleaned) || /^ROOT:\s*$/i.test(cleaned)) continue;
+      return cleaned;
+    }
+  }
+  return null;
+}
+
+function activityPathBasename(path: string): string {
+  const text = path.replace(/\\/g, '/');
+  const parts = text.split('/').filter(Boolean);
+  return parts[parts.length - 1] || path;
+}
+
+function activeToolInputLabel(tool: ToolDisplay): string {
+  const input = formatToolData(tool.input);
+  if (input) return truncateActivityText(input, 120);
+  return tool.name;
+}
+
+export function renderTurnActivitySummary(
+  turnId: string,
+  events: any[],
+  turns: Turn[],
+  realtimeLines?: string[],
+  hyardJobs?: Record<string, any>,
+  options: RenderTurnEventsOptions = {},
+) {
+  const state = collectTurnExecutionState(turnId, events, turns, realtimeLines, hyardJobs, options);
+  const {
+    commandLine,
+    combinedTerminal,
+    displayToolCalls,
+    editSummaries,
+    actionableTools,
+    turnIsActive,
+    hasRunningTool,
+    hasLiveTerminal,
+    commandCount,
+    totalAdditions,
+    totalDeletions,
+  } = state;
+
+  const completedEdits = editSummaries.filter((item) => item.status === 'completed');
+  const createdCount = completedEdits.filter((item) => item.created).length;
+  const editedCompletedCount = completedEdits.filter((item) => !item.created).length;
+  const editingCount = editSummaries.filter((item) => item.status === 'running' || item.status === 'pending').length;
+  const failedEditCount = editSummaries.filter((item) => item.status === 'failed').length;
+  const latestTerminalLine = latestMeaningfulTerminalLine(combinedTerminal);
+  const runningEdit = editSummaries.find((item) => item.status === 'running' || item.status === 'pending');
+  const latestEdit = runningEdit ?? (turnIsActive ? editSummaries[editSummaries.length - 1] : undefined);
+  const runningCommand = displayToolCalls.find((tool) => isCommandTool(tool) && (tool.status === 'running' || tool.status === 'pending'));
+  const hasActivity = Boolean(commandLine || displayToolCalls.length > 0 || combinedTerminal.length > 0);
+  const summaryParts = [
+    createdCount > 0 ? `已创建 ${createdCount} 个文件` : null,
+    editedCompletedCount > 0 ? `已编辑 ${editedCompletedCount} 个文件` : null,
+    editingCount > 0 ? `正在编辑 ${editingCount} 个文件` : null,
+    failedEditCount > 0 ? `${failedEditCount} 个文件编辑失败` : null,
+    commandCount > 0 ? `已运行 ${commandCount} 条命令` : null,
+    !hasActivity ? '正在连接 provider，等待工具事件…' : null,
+  ].filter(Boolean);
+
+  const showSpinner = turnIsActive || hasRunningTool || hasLiveTerminal;
+  const detailToolCalls = displayToolCalls.filter((tool) => !actionableTools.includes(tool));
+
+  return (
+    <div
+      className="message-body live-execution-activity"
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+        color: 'var(--text-secondary)',
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          flexWrap: 'wrap',
+          lineHeight: 1.55,
+        }}
+      >
+        <span aria-hidden="true" style={{ color: 'var(--color-secondary)', fontWeight: 800 }}>✎</span>
+        <span className="thinking-dots" style={{ color: hasActivity ? 'var(--text-primary)' : 'var(--text-secondary)', fontWeight: 700 }}>
+          {summaryParts.join('  ')}
+        </span>
+        {(totalAdditions > 0 || totalDeletions > 0) && (
+          <span style={{ fontFamily: 'monospace', fontSize: 12 }}>
+            <span style={{ color: 'var(--color-success)' }}>+{totalAdditions.toLocaleString()}</span>{' '}
+            <span style={{ color: 'var(--color-error)' }}>-{totalDeletions.toLocaleString()}</span>
+          </span>
+        )}
+        {showSpinner && <span className="spinner-small" aria-label="运行中" />}
+      </div>
+
+      {latestTerminalLine && (
+        <div
+          style={{
+            color: 'var(--text-secondary)',
+            fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
+            fontSize: 12,
+            paddingLeft: 23,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+          }}
+          title={latestTerminalLine}
+        >
+          {latestTerminalLine}
+        </div>
+      )}
+
+      {latestEdit && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            minWidth: 0,
+            paddingLeft: 1,
+            lineHeight: 1.45,
+          }}
+        >
+          <span aria-hidden="true" style={{ color: 'var(--color-secondary)', fontWeight: 800 }}>✎</span>
+          <span style={{ color: 'var(--text-secondary)' }}>{runningEdit ? '正在编辑' : '最近编辑'}</span>
+          <span
+            style={{
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              color: 'var(--color-primary)',
+              fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
+              fontSize: 12,
+            }}
+            title={latestEdit.path}
+          >
+            {activityPathBasename(latestEdit.path)}
+          </span>
+          {(latestEdit.additions > 0 || latestEdit.deletions > 0) && (
+            <span style={{ flex: '0 0 auto', fontFamily: 'monospace', fontSize: 12 }}>
+              <span style={{ color: 'var(--color-success)' }}>+{latestEdit.additions}</span>{' '}
+              <span style={{ color: 'var(--color-error)' }}>-{latestEdit.deletions}</span>
+            </span>
+          )}
+        </div>
+      )}
+
+      {!latestEdit && runningCommand && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            minWidth: 0,
+            paddingLeft: 1,
+            lineHeight: 1.45,
+          }}
+        >
+          <span aria-hidden="true" style={{ color: 'var(--color-secondary)', fontWeight: 800 }}>⌁</span>
+          <span style={{ color: 'var(--text-secondary)' }}>正在运行</span>
+          <span
+            style={{
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              color: 'var(--color-primary)',
+              fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
+              fontSize: 12,
+            }}
+            title={formatToolData(runningCommand.input) || runningCommand.name}
+          >
+            {activeToolInputLabel(runningCommand)}
+          </span>
+        </div>
+      )}
+
+      {actionableTools.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingLeft: 23 }}>
+          {actionableTools.map((tool, idx) => (
+            <ToolCard key={tool.id || idx} tool={tool} />
+          ))}
+        </div>
+      )}
+
+      {(detailToolCalls.length > 0 || combinedTerminal.length > 0 || commandLine) && (
+        <details style={{ marginLeft: 23, color: 'var(--text-muted)' }}>
+          <summary style={{ cursor: 'pointer', userSelect: 'none', fontSize: 12, fontWeight: 700 }}>
+            查看实时执行详情
+          </summary>
+          <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {commandLine && (
+              <code style={{ display: 'block', padding: '6px 10px', background: 'rgba(0, 0, 0, 0.22)', borderRadius: 6, wordBreak: 'break-all', fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
+                {commandLine}{commandArgsSuffix(state.commandArgs)}
+              </code>
+            )}
+            {detailToolCalls.slice(0, 5).map((tool, idx) => (
+              <ToolCard key={tool.id || idx} tool={tool} />
+            ))}
+            {detailToolCalls.length > 5 && (
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>还有 {detailToolCalls.length - 5} 项执行详情会在回合结束后折叠显示。</div>
+            )}
+            {combinedTerminal.length > 0 && (
+              <pre style={{ margin: 0, padding: '8px 10px', background: '#0c0f1d', borderRadius: 6, color: '#38bdf8', fontFamily: 'monospace', fontSize: 11, maxHeight: 140, overflowY: 'auto', border: '1px solid #1e293b', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {combinedTerminal.slice(-80).join('\n')}
+              </pre>
+            )}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
+export function renderTurnEvents(
+  turnId: string,
+  events: any[],
+  turns: Turn[],
+  realtimeLines?: string[],
+  hyardJobs?: Record<string, any>,
+  options: RenderTurnEventsOptions = {},
+) {
+  const state = collectTurnExecutionState(turnId, events, turns, realtimeLines, hyardJobs, options);
+  const {
+    commandLine,
+    commandArgs,
+    combinedTerminal,
+    displayToolCalls,
+    editSummaries,
+    actionableTools,
+    hasRunningTool,
+    hasLiveTerminal,
+    commandCount,
+    editCount,
+    totalAdditions,
+    totalDeletions,
+  } = state;
+
+  if (!commandLine && displayToolCalls.length === 0 && combinedTerminal.length === 0) {
+    return null;
+  }
+
   const visibleEditSummaries = editSummaries.slice(0, 4);
   const hiddenEditCount = Math.max(0, editSummaries.length - visibleEditSummaries.length);
-  const actionableTools = displayToolCalls.filter((tool) => Array.isArray(tool.actions) && tool.actions.length > 0);
   const summaryParts = [
     editCount > 0 ? `已编辑 ${editCount} 个文件` : null,
     commandCount > 0 ? `已运行 ${commandCount} 条命令` : null,
