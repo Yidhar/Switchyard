@@ -1,15 +1,24 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { convertFileSrc } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { Send, RefreshCw, MessageSquare, Pencil, Check, Square, Plus, ChevronDown, X, FileText, Image as ImageIcon } from 'lucide-react';
-import type { Session, Turn, SandboxMode, SendPayload, InputAttachment, AttachmentKind } from '../types';
+import type { Session, Turn, SandboxMode, SendPayload, InputAttachment } from '../types';
 import { completeSlash } from './slashCommands';
 import { saveClipboardAttachment } from '../services/api';
+import {
+  attachmentFromPath,
+  extractAttachmentsFromAttachmentReferences,
+  filenameFromPath,
+  mergeInputAttachments,
+  stripAttachmentReferences,
+} from '../utils/attachments';
 
 interface ChatAreaProps {
   selectedSession: Session | null;
   isGenerating: boolean;
   turns: Turn[];
+  turnAttachments?: Record<string, InputAttachment[]>;
   handleSend: (payload: SendPayload, restoreText?: (text: string) => void) => void | Promise<void>;
   handleCancel: () => void;
   activeCoreText: string | null;
@@ -81,53 +90,6 @@ function sandboxOptionFor(mode: SandboxMode) {
   return SANDBOX_OPTIONS.find((option) => option.mode === mode) ?? SANDBOX_OPTIONS[1];
 }
 
-function filenameFromPath(path: string): string {
-  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
-}
-
-const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tif', 'tiff']);
-
-function extensionFromPath(path: string): string {
-  const filename = filenameFromPath(path);
-  const dotIndex = filename.lastIndexOf('.');
-  return dotIndex === -1 ? '' : filename.slice(dotIndex + 1).toLowerCase();
-}
-
-function imageMimeTypeForPath(path: string): string | null {
-  switch (extensionFromPath(path)) {
-    case 'png':
-      return 'image/png';
-    case 'jpg':
-    case 'jpeg':
-      return 'image/jpeg';
-    case 'webp':
-      return 'image/webp';
-    case 'gif':
-      return 'image/gif';
-    case 'bmp':
-      return 'image/bmp';
-    case 'tif':
-    case 'tiff':
-      return 'image/tiff';
-    default:
-      return null;
-  }
-}
-
-function attachmentKindForPath(path: string): AttachmentKind {
-  return IMAGE_EXTENSIONS.has(extensionFromPath(path)) ? 'image' : 'file';
-}
-
-function attachmentFromPath(path: string): InputAttachment {
-  const kind = attachmentKindForPath(path);
-  return {
-    path,
-    name: filenameFromPath(path),
-    kind,
-    mimeType: kind === 'image' ? imageMimeTypeForPath(path) : null,
-  };
-}
-
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -160,6 +122,92 @@ const RenderedMessageBody: React.FC<RenderedMessageBodyProps> = React.memo(({
   return <>{renderMessageBody(text, undefined, onOpenFile)}</>;
 });
 
+interface UserAttachmentPreviewGridProps {
+  attachments: InputAttachment[];
+  onOpenImage: (attachment: InputAttachment) => void;
+  onOpenFile: (path: string) => void;
+}
+
+const UserAttachmentPreviewGrid: React.FC<UserAttachmentPreviewGridProps> = React.memo(({
+  attachments,
+  onOpenImage,
+  onOpenFile,
+}) => {
+  if (attachments.length === 0) return null;
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: 8,
+        marginTop: 8,
+      }}
+    >
+      {attachments.map((attachment) => {
+        if (attachment.kind === 'image') {
+          const src = convertFileSrc(attachment.path);
+          return (
+            <button
+              key={attachment.path}
+              type="button"
+              onClick={() => onOpenImage(attachment)}
+              title={`${attachment.name || filenameFromPath(attachment.path)}\n${attachment.path}`}
+              style={{
+                width: 104,
+                height: 78,
+                border: '1px solid rgba(148, 163, 184, 0.28)',
+                borderRadius: 8,
+                padding: 0,
+                overflow: 'hidden',
+                background: 'rgba(15, 23, 42, 0.55)',
+                cursor: 'zoom-in',
+                position: 'relative',
+              }}
+            >
+              <img
+                src={src}
+                alt={attachment.name || filenameFromPath(attachment.path)}
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  objectFit: 'cover',
+                  display: 'block',
+                }}
+              />
+            </button>
+          );
+        }
+        return (
+          <button
+            key={attachment.path}
+            type="button"
+            onClick={() => onOpenFile(attachment.path)}
+            title={`Open ${attachment.path}`}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              maxWidth: 240,
+              border: '1px solid rgba(148, 163, 184, 0.24)',
+              borderRadius: 999,
+              background: 'rgba(15, 23, 42, 0.45)',
+              color: 'var(--text-secondary)',
+              padding: '5px 9px',
+              fontSize: 12,
+              cursor: 'pointer',
+            }}
+          >
+            <FileText size={13} style={{ color: 'var(--color-primary)', flex: '0 0 auto' }} />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {attachment.name || filenameFromPath(attachment.path)}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+});
+
 function useRafThrottledValue<T>(value: T): T {
   const [throttled, setThrottled] = useState(value);
   const latestRef = useRef(value);
@@ -190,6 +238,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   selectedSession,
   isGenerating,
   turns,
+  turnAttachments = {},
   handleSend,
   handleCancel,
   activeCoreText,
@@ -229,6 +278,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // appended above doesn't accidentally trap us in edit mode.
   const [editingTurnId, setEditingTurnId] = useState<string | null>(null);
   const [editingDraft, setEditingDraft] = useState<string>('');
+  const [previewAttachment, setPreviewAttachment] = useState<InputAttachment | null>(null);
 
   // Index of the most recent "real" user-origin turn (excludes the structured
   // system-feedback turns the orchestrator stamps with origin=user but a JSON
@@ -385,7 +435,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   const beginEdit = (turn: Turn) => {
     setEditingTurnId(turn.turn_id);
-    setEditingDraft(turn.user_message);
+    setEditingDraft(stripAttachmentReferences(turn.user_message));
   };
   const cancelEdit = () => {
     setEditingTurnId(null);
@@ -402,6 +452,83 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   return (
     <div className="main-content glass-panel" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>
+      {previewAttachment && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Image preview"
+          onClick={() => setPreviewAttachment(null)}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 100,
+            background: 'rgba(2, 6, 23, 0.78)',
+            backdropFilter: 'blur(8px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 24,
+          }}
+        >
+          <div
+            onClick={(event) => event.stopPropagation()}
+            style={{
+              maxWidth: '96%',
+              maxHeight: '96%',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 10,
+              background: 'rgba(15, 23, 42, 0.92)',
+              border: '1px solid rgba(148, 163, 184, 0.24)',
+              borderRadius: 12,
+              padding: 12,
+              boxShadow: '0 24px 80px rgba(0, 0, 0, 0.55)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+              <ImageIcon size={15} style={{ color: 'var(--color-primary)', flex: '0 0 auto' }} />
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ color: 'var(--text-primary)', fontSize: 12, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {previewAttachment.name || filenameFromPath(previewAttachment.path)}
+                </div>
+                <div style={{ color: 'var(--text-muted)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {previewAttachment.path}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewAttachment(null)}
+                title="Close preview"
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 999,
+                  border: '1px solid var(--border-muted)',
+                  background: 'rgba(255,255,255,0.04)',
+                  color: 'var(--text-secondary)',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <img
+              src={convertFileSrc(previewAttachment.path)}
+              alt={previewAttachment.name || filenameFromPath(previewAttachment.path)}
+              style={{
+                maxWidth: 'min(86vw, 1100px)',
+                maxHeight: '78vh',
+                objectFit: 'contain',
+                borderRadius: 8,
+                background: '#020617',
+              }}
+            />
+          </div>
+        </div>
+      )}
       {/* Compact chat header — just the session label. Core /
           worker / peer detail moved into the corner bubble + the
           diagnostics drawer to keep the chat surface uncluttered. */}
@@ -522,6 +649,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     minute: '2-digit',
                   })
                 : '';
+              const visibleUserMessage = stripAttachmentReferences(t.user_message);
+              const attachmentsForTurn = mergeInputAttachments(
+                turnAttachments[t.turn_id],
+                extractAttachmentsFromAttachmentReferences(t.user_message),
+              );
               return (
                 <React.Fragment key={t.turn_id || idx}>
                   <div className="message-bubble message-user">
@@ -659,11 +791,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         </div>
                       </div>
                     ) : (
-                      <RenderedMessageBody
-                        text={t.user_message}
-                        renderMessageBody={renderMessageBody}
-                        onOpenFile={onOpenFile}
-                      />
+                      <>
+                        <RenderedMessageBody
+                          text={visibleUserMessage}
+                          renderMessageBody={renderMessageBody}
+                          onOpenFile={onOpenFile}
+                        />
+                        <UserAttachmentPreviewGrid
+                          attachments={attachmentsForTurn}
+                          onOpenImage={setPreviewAttachment}
+                          onOpenFile={onOpenFile}
+                        />
+                      </>
                     )}
                   </div>
                   {!isEditing && (assistantContent || hasAssistantActivity) && (
@@ -1111,6 +1250,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
       text,
       imagePaths,
       filePaths,
+      attachments: currentAttachments,
     };
     setInputText('');
     setAttachments([]);

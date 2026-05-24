@@ -13,6 +13,7 @@ import type {
   Workspace,
   SandboxMode,
   SendPayload,
+  InputAttachment,
 } from './types';
 import { Sidebar } from './components/Sidebar';
 import { IconRail, type RailMode } from './components/IconRail';
@@ -32,6 +33,14 @@ import { parseSlash, type SlashContext } from './components/slashCommands';
 // the new layout. The import + state are dropped along with the bar.
 import { renderMessageBody, isSystemStatusText, renderTurnEvents } from './components/ui/RenderHelpers';
 import { resolveToolApproval } from './services/api';
+import {
+  attachmentFromPath,
+  extractAttachmentsFromAttachmentReferences,
+  extractFilePathsFromAttachmentReferences,
+  extractImagePathsFromAttachmentReferences,
+  mergeInputAttachments,
+  stripAttachmentReferences,
+} from './utils/attachments';
 
 const RUNTIME_ITEM_EVENT_FALLBACK = 'item_updated';
 const DEBUG_RUNTIME_EVENTS = false;
@@ -43,25 +52,26 @@ const MIN_CHAT_COLUMN_WIDTH = 380;
 const MIN_CANVAS_COLUMN_WIDTH = 360;
 const DEFAULT_CANVAS_COLUMN_WIDTH = 680;
 const DEFAULT_SANDBOX_MODE: SandboxMode = 'workspace-write';
-const ATTACHMENT_MARKER = '[Switchyard Attachments]';
-const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tif', 'tiff']);
-
-function isImageAttachmentPath(path: string): boolean {
-  const cleanPath = path.trim().replace(/^["']|["']$/g, '');
-  const filename = cleanPath.split(/[\\/]/).filter(Boolean).pop() ?? cleanPath;
-  const dotIndex = filename.lastIndexOf('.');
-  if (dotIndex === -1) return false;
-  return IMAGE_EXTENSIONS.has(filename.slice(dotIndex + 1).toLowerCase());
-}
+const TURN_ATTACHMENTS_STORAGE_KEY = 'switchyard.turnAttachments.v1';
 
 function normalizeSendPayload(input: string | SendPayload): SendPayload {
   if (typeof input === 'string') {
     return { text: input, imagePaths: [], filePaths: [] };
   }
+  const attachments = Array.isArray(input.attachments)
+    ? mergeInputAttachments(input.attachments)
+    : [];
+  const imagePaths = Array.isArray(input.imagePaths) && input.imagePaths.length > 0
+    ? input.imagePaths
+    : attachments.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.path);
+  const filePaths = Array.isArray(input.filePaths) && input.filePaths.length > 0
+    ? input.filePaths
+    : attachments.filter((attachment) => attachment.kind !== 'image').map((attachment) => attachment.path);
   return {
     text: input.text,
-    imagePaths: Array.isArray(input.imagePaths) ? input.imagePaths : [],
-    filePaths: Array.isArray(input.filePaths) ? input.filePaths : [],
+    imagePaths,
+    filePaths,
+    attachments: attachments.length > 0 ? attachments : input.attachments,
   };
 }
 
@@ -77,32 +87,33 @@ function describeSendPayload(payload: SendPayload): string {
   return `${payload.text || fallback} (${parts.join(', ')})`;
 }
 
-function extractAttachmentPathsFromAttachmentReferences(text: string): string[] {
-  const markerIndex = text.indexOf(ATTACHMENT_MARKER);
-  if (markerIndex === -1) return [];
-  return text
-    .slice(markerIndex + ATTACHMENT_MARKER.length)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith('- '))
-    .map((line) => line.slice(2).replace(/\s+\([^)]*\)\s*$/, '').trim())
-    .filter(Boolean);
+function attachmentsFromPayload(payload: SendPayload): InputAttachment[] {
+  const explicit = Array.isArray(payload.attachments)
+    ? mergeInputAttachments(payload.attachments)
+    : [];
+  if (explicit.length > 0) return explicit;
+  return mergeInputAttachments(
+    payload.imagePaths.map((path) => attachmentFromPath(path)),
+    (payload.filePaths ?? []).map((path) => attachmentFromPath(path)),
+    extractAttachmentsFromAttachmentReferences(payload.text),
+  );
 }
 
-function extractImagePathsFromAttachmentReferences(text: string): string[] {
-  return extractAttachmentPathsFromAttachmentReferences(text).filter(isImageAttachmentPath);
-}
-
-function extractFilePathsFromAttachmentReferences(text: string): string[] {
-  return extractAttachmentPathsFromAttachmentReferences(text).filter((path) => !isImageAttachmentPath(path));
-}
-
-function displayMessageWithAttachmentReferences(payload: SendPayload): string {
-  const attachmentPaths = [...payload.imagePaths, ...(payload.filePaths ?? [])];
-  if (attachmentPaths.length === 0 || payload.text.includes(ATTACHMENT_MARKER)) {
-    return payload.text;
+function readStoredTurnAttachments(): Record<string, InputAttachment[]> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(TURN_ATTACHMENTS_STORAGE_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object') return {};
+    const normalized: Record<string, InputAttachment[]> = {};
+    for (const [turnId, value] of Object.entries(parsed)) {
+      if (!Array.isArray(value)) continue;
+      const attachments = mergeInputAttachments(value as InputAttachment[]);
+      if (attachments.length > 0) normalized[turnId] = attachments;
+    }
+    return normalized;
+  } catch {
+    return {};
   }
-  return `${payload.text}\n\n${ATTACHMENT_MARKER}\n${attachmentPaths.map((path) => `- ${path}`).join('\n')}`;
 }
 
 function runtimePayloadItem(payload: any): any {
@@ -756,6 +767,7 @@ function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
+  const [turnAttachments, setTurnAttachments] = useState<Record<string, InputAttachment[]>>(readStoredTurnAttachments);
   const [isGenerating, setIsGenerating] = useState(false);
   const [messageQueue, setMessageQueue] = useState<SendPayload[]>([]);
   // React state is not synchronous enough to decide whether a rapid follow-up
@@ -771,6 +783,14 @@ function App() {
   useEffect(() => {
     messageQueueRef.current = messageQueue;
   }, [messageQueue]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(TURN_ATTACHMENTS_STORAGE_KEY, JSON.stringify(turnAttachments));
+    } catch (error) {
+      console.warn('Failed to persist turn attachment previews', error);
+    }
+  }, [turnAttachments]);
   
   // Streaming state during active run
   const [activeCoreText, setActiveCoreText] = useState('');
@@ -1572,6 +1592,9 @@ function App() {
           case 'TurnCompleted':
             setActiveNodes([]);
             setActiveTurnIds([]);
+            setActiveCoreTurnId(null);
+            setActivePeerTurnId(null);
+            setActivePeerName(null);
             setActiveCoreText('');
             setActivePeerText('');
             addLog(now, 'sys', `Routed turn completed successfully.`);
@@ -1586,6 +1609,9 @@ function App() {
           case 'TurnFailed':
             setActiveNodes([]);
             setActiveTurnIds([]);
+            setActiveCoreTurnId(null);
+            setActivePeerTurnId(null);
+            setActivePeerName(null);
             setActiveCoreText('');
             setActivePeerText('');
             addLog(now, 'sys', `Turn failed: ${data.error}`);
@@ -1877,9 +1903,10 @@ function App() {
   const isSendPipelineBusy = () => isPreparingDispatchRef.current || isDispatchingRef.current;
 
   const runSingleMessage = async (sessionForSend: Session, payload: SendPayload) => {
-    const message = payload.text;
+    const message = stripAttachmentReferences(payload.text);
     const imagePaths = payload.imagePaths;
     const filePaths = payload.filePaths ?? [];
+    const payloadAttachments = attachmentsFromPayload(payload);
     const sandboxMode = sandboxModeRef.current;
     setActiveCoreText('');
     setActivePeerText('');
@@ -1889,13 +1916,14 @@ function App() {
     setTelemetryLogs([]);
 
     // Add visual temp turn/message instantly for reactive feel
+    const tempTurnId = `temp-user-${Date.now()}`;
     const tempUserTurn: Turn = {
-      turn_id: `temp-user-${Date.now()}`,
+      turn_id: tempTurnId,
       session_id: sessionForSend.session_id,
       origin: 'user',
       provider: 'user',
       role: 'core',
-      user_message: displayMessageWithAttachmentReferences(payload),
+      user_message: message,
       provider_response: null,
       error_message: null,
       status: 'completed',
@@ -1904,6 +1932,12 @@ function App() {
       delegated_by: null
     };
     setTurns((prev) => [...prev, tempUserTurn]);
+    if (payloadAttachments.length > 0) {
+      setTurnAttachments((prev) => ({
+        ...prev,
+        [tempTurnId]: payloadAttachments,
+      }));
+    }
 
     try {
       await invoke('run_turn', {
@@ -1927,6 +1961,19 @@ function App() {
       // Reload turns database state
       try {
         const updatedTurns = await invoke<Turn[]>('get_session_turns', { sessionId: sessionForSend.session_id });
+        if (payloadAttachments.length > 0) {
+          const matchedTurn = [...updatedTurns]
+            .reverse()
+            .find((turn) => turn.origin === 'user' && stripAttachmentReferences(turn.user_message).trim() === message.trim());
+          setTurnAttachments((prev) => {
+            const next = { ...prev };
+            delete next[tempTurnId];
+            if (matchedTurn) {
+              next[matchedTurn.turn_id] = payloadAttachments;
+            }
+            return next;
+          });
+        }
         if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
           setTurns(updatedTurns);
         }
@@ -2161,14 +2208,20 @@ function App() {
     restoreText?: (text: string) => void,
   ) => {
     const rawPayload = normalizeSendPayload(rawInput);
-    const text = rawPayload.text.trim();
-    const imagePaths = rawPayload.imagePaths;
-    const filePaths = rawPayload.filePaths ?? [];
+    const text = stripAttachmentReferences(rawPayload.text).trim();
+    const attachments = attachmentsFromPayload(rawPayload);
+    const imagePaths = rawPayload.imagePaths.length > 0
+      ? rawPayload.imagePaths
+      : attachments.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.path);
+    const filePaths = (rawPayload.filePaths?.length ?? 0) > 0
+      ? rawPayload.filePaths ?? []
+      : attachments.filter((attachment) => attachment.kind !== 'image').map((attachment) => attachment.path);
     if (!text && imagePaths.length === 0 && filePaths.length === 0) return;
     const payload: SendPayload = {
       text: text || (filePaths.length > 0 ? '请分析这些附件。' : '请分析这些图片。'),
       imagePaths,
       filePaths,
+      attachments: attachments.length > 0 ? attachments : undefined,
     };
 
     // Slash commands short-circuit the orchestrator dispatch. They
@@ -2267,10 +2320,22 @@ function App() {
         console.error('refresh after rewind failed', e);
       }
       // Queue + dispatch the new message just like a normal send.
+      const originalTurn = turns.find((turn) => turn.turn_id === turnId);
+      const attachments = mergeInputAttachments(
+        turnAttachments[turnId],
+        originalTurn ? extractAttachmentsFromAttachmentReferences(originalTurn.user_message) : [],
+        extractAttachmentsFromAttachmentReferences(newText),
+      );
+      const cleanText = stripAttachmentReferences(newText);
       const payload: SendPayload = {
-        text: newText,
-        imagePaths: extractImagePathsFromAttachmentReferences(newText),
-        filePaths: extractFilePathsFromAttachmentReferences(newText),
+        text: cleanText,
+        imagePaths: attachments.length > 0
+          ? attachments.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.path)
+          : extractImagePathsFromAttachmentReferences(newText),
+        filePaths: attachments.length > 0
+          ? attachments.filter((attachment) => attachment.kind !== 'image').map((attachment) => attachment.path)
+          : extractFilePathsFromAttachmentReferences(newText),
+        attachments: attachments.length > 0 ? attachments : undefined,
       };
       if (isSendPipelineBusy()) {
         enqueueQueuedMessage(payload);
@@ -2310,10 +2375,20 @@ function App() {
       } catch (e) {
         console.error('refresh after rewind failed', e);
       }
+      const attachments = mergeInputAttachments(
+        turnAttachments[turnId],
+        extractAttachmentsFromAttachmentReferences(message),
+      );
+      const cleanMessage = stripAttachmentReferences(message);
       const payload: SendPayload = {
-        text: message,
-        imagePaths: extractImagePathsFromAttachmentReferences(message),
-        filePaths: extractFilePathsFromAttachmentReferences(message),
+        text: cleanMessage,
+        imagePaths: attachments.length > 0
+          ? attachments.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.path)
+          : extractImagePathsFromAttachmentReferences(message),
+        filePaths: attachments.length > 0
+          ? attachments.filter((attachment) => attachment.kind !== 'image').map((attachment) => attachment.path)
+          : extractFilePathsFromAttachmentReferences(message),
+        attachments: attachments.length > 0 ? attachments : undefined,
       };
       if (isSendPipelineBusy()) {
         enqueueQueuedMessage(payload);
@@ -2694,6 +2769,7 @@ function App() {
               selectedSession={selectedSession}
               isGenerating={isGenerating}
               turns={turns}
+              turnAttachments={turnAttachments}
               handleSend={handleSend}
               handleCancel={handleCancel}
               activeCoreText={activeCoreText}

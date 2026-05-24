@@ -46,6 +46,7 @@ export interface SendPayload {
   text: string;
   imagePaths: string[];
   filePaths?: string[];
+  attachments?: InputAttachment[];
 }
 
 export interface Session {
