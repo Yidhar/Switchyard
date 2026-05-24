@@ -931,7 +931,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   renderMessageBody={renderMessageBody}
                   onOpenFile={onOpenFile}
                 />
-                {activeCoreTurnId && renderTurnEvents(activeCoreTurnId, sessionEvents, turns, realtimeTerminalLines[activeCoreTurnId], hyardJobs)}
+                {activeCoreTurnId && renderTurnActivitySummary(activeCoreTurnId, sessionEvents, turns, realtimeTerminalLines[activeCoreTurnId], hyardJobs)}
               </>
             ) : activeCoreTurnId ? (
               renderTurnActivitySummary(activeCoreTurnId, sessionEvents, turns, realtimeTerminalLines[activeCoreTurnId], hyardJobs)
@@ -960,7 +960,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   renderMessageBody={renderMessageBody}
                   onOpenFile={onOpenFile}
                 />
-                {activePeerTurnId && renderTurnEvents(activePeerTurnId, sessionEvents, turns, realtimeTerminalLines[activePeerTurnId], hyardJobs)}
+                {activePeerTurnId && renderTurnActivitySummary(activePeerTurnId, sessionEvents, turns, realtimeTerminalLines[activePeerTurnId], hyardJobs)}
               </>
             ) : activePeerTurnId ? (
               renderTurnActivitySummary(activePeerTurnId, sessionEvents, turns, realtimeTerminalLines[activePeerTurnId], hyardJobs)
