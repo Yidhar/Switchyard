@@ -887,6 +887,70 @@ function mergeTool(toolCalls: ToolDisplay[], next: ToolDisplay) {
   if (next.actions !== undefined) existing.actions = next.actions;
 }
 
+function isActiveTurnStatus(status?: Turn['status']): boolean {
+  return status === 'pending' || status === 'running';
+}
+
+function isTerminalTurnStatus(status?: Turn['status']): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
+}
+
+function settleToolStatus(status: ToolStatus, turnStatus?: Turn['status']): ToolStatus {
+  if (!isTerminalTurnStatus(turnStatus)) return status;
+  if (status !== 'pending' && status !== 'running') return status;
+  if (turnStatus === 'failed') return 'failed';
+  if (turnStatus === 'cancelled') return 'cancelled';
+  return 'completed';
+}
+
+function formatToolData(value: any): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value.trim();
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function diffStatsFromText(value: any): { additions: number; deletions: number; lines: number } {
+  const text = formatToolData(value);
+  let additions = 0;
+  let deletions = 0;
+  const lines = text ? text.split(/\r?\n/) : [];
+  for (const line of lines) {
+    if (line.startsWith('+++') || line.startsWith('---')) continue;
+    if (line.startsWith('+')) additions += 1;
+    if (line.startsWith('-')) deletions += 1;
+  }
+  return { additions, deletions, lines: lines.length };
+}
+
+function compactPathLabel(path: string): string {
+  const normalized = path.replace(/\\/g, '/').trim();
+  if (normalized.length <= 76) return normalized;
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.length <= 2) return `…${normalized.slice(-73)}`;
+  const tail = parts.slice(-3).join('/');
+  return `…/${tail}`;
+}
+
+function fileEditPathLabel(tool: ToolDisplay): string {
+  if (typeof tool.input === 'string' && tool.input.trim()) {
+    return compactPathLabel(tool.input.trim());
+  }
+  const candidate = firstPresent(
+    tool.input?.path,
+    tool.input?.file,
+    tool.input?.title,
+    tool.input?.relative_path,
+    tool.input?.absolute_path,
+  );
+  const text = asString(candidate);
+  if (text?.trim()) return compactPathLabel(text);
+  return tool.name || 'File change';
+}
+
 export function renderTurnEvents(
   turnId: string,
   events: any[],
@@ -1124,10 +1188,36 @@ export function renderTurnEvents(
     return null;
   }
 
-  const hasRunningTool = toolCalls.some((tool) => tool.status === 'running' || tool.status === 'pending');
-  const hasLiveTerminal = (realtimeLines?.length ?? 0) > 0;
-  const commandCount = (commandLine ? 1 : 0) + toolCalls.filter(isCommandTool).length;
-  const editCount = toolCalls.filter(isEditTool).length;
+  const currentTurn = turns.find((turn) => turn.turn_id === turnId);
+  const turnStatus = currentTurn?.status;
+  const turnIsActive = isActiveTurnStatus(turnStatus);
+  const displayToolCalls = toolCalls.map((tool) => {
+    const status = settleToolStatus(tool.status, turnStatus);
+    return {
+      ...tool,
+      status,
+      actions: turnIsActive && status === 'pending' ? tool.actions : undefined,
+    };
+  });
+  const hasRunningTool = turnIsActive && displayToolCalls.some((tool) => tool.status === 'running' || tool.status === 'pending');
+  const hasLiveTerminal = turnIsActive && (realtimeLines?.length ?? 0) > 0;
+  const commandCount = (commandLine ? 1 : 0) + displayToolCalls.filter(isCommandTool).length;
+  const editTools = displayToolCalls.filter(isEditTool);
+  const editCount = editTools.length;
+  const editSummaries = editTools.map((tool) => {
+    const stats = diffStatsFromText(tool.output);
+    return {
+      id: tool.id,
+      path: fileEditPathLabel(tool),
+      status: tool.status,
+      ...stats,
+    };
+  });
+  const totalAdditions = editSummaries.reduce((sum, item) => sum + item.additions, 0);
+  const totalDeletions = editSummaries.reduce((sum, item) => sum + item.deletions, 0);
+  const visibleEditSummaries = editSummaries.slice(0, 4);
+  const hiddenEditCount = Math.max(0, editSummaries.length - visibleEditSummaries.length);
+  const actionableTools = displayToolCalls.filter((tool) => Array.isArray(tool.actions) && tool.actions.length > 0);
   const summaryParts = [
     editCount > 0 ? `已编辑 ${editCount} 个文件` : null,
     commandCount > 0 ? `已运行 ${commandCount} 条命令` : null,
@@ -1135,31 +1225,157 @@ export function renderTurnEvents(
   const summaryTitle = summaryParts.length > 0 ? summaryParts.join(' · ') : '执行详情与日志';
 
   return (
-    <div className="execution-details-accordion" style={{ marginTop: '10px', fontSize: '12px' }}>
-      <details
-        open={hasRunningTool || hasLiveTerminal}
-        style={{ background: 'rgba(0,0,0,0.15)', borderRadius: '4px', border: '1px solid var(--border-muted)', overflow: 'hidden' }}
+    <div
+      className="execution-details-accordion"
+      style={{
+        marginTop: '10px',
+        fontSize: '12px',
+        background: 'rgba(0,0,0,0.15)',
+        borderRadius: '8px',
+        border: '1px solid var(--border-muted)',
+        overflow: 'hidden',
+      }}
+    >
+      <div
+        style={{
+          padding: '9px 12px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          background: 'rgba(255,255,255,0.025)',
+          borderBottom: editSummaries.length > 0 || actionableTools.length > 0 ? '1px solid rgba(255,255,255,0.05)' : 'none',
+        }}
       >
-        <summary style={{ padding: '8px 12px', cursor: 'pointer', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px', userSelect: 'none', background: 'rgba(255,255,255,0.02)' }}>
-          <Terminal size={14} style={{ color: 'var(--color-secondary)' }} />
-          <span>{summaryTitle}</span>
-          <span style={{ marginLeft: 'auto', display: 'flex', gap: '6px', alignItems: 'center' }}>
-            {hasRunningTool && (
-              <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(245, 158, 11, 0.1)', color: 'var(--color-warning)', borderRadius: '3px' }}>
-                运行中
-              </span>
-            )}
-            {toolCalls.length > 0 && (
-              <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(6, 182, 212, 0.1)', color: 'var(--color-secondary)', borderRadius: '3px' }}>
-                {toolCalls.length} 项
-              </span>
-            )}
-            {combinedTerminal.length > 0 && (
-              <span style={{ fontSize: '11px', padding: '1px 5px', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-primary)', borderRadius: '3px' }}>
-                {combinedTerminal.length} 日志
-              </span>
-            )}
+        <Terminal size={14} style={{ color: 'var(--color-secondary)', flex: '0 0 auto' }} />
+        <div style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ color: 'var(--text-primary)', fontWeight: 800 }}>{summaryTitle}</span>
+          {(totalAdditions > 0 || totalDeletions > 0) && (
+            <span style={{ color: 'var(--text-muted)', fontFamily: 'monospace', fontSize: 11 }}>
+              <span style={{ color: 'var(--color-success)' }}>+{totalAdditions.toLocaleString()}</span>{' '}
+              <span style={{ color: 'var(--color-error)' }}>-{totalDeletions.toLocaleString()}</span>
+            </span>
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flex: '0 0 auto' }}>
+          {hasRunningTool || hasLiveTerminal ? (
+            <span style={{ fontSize: '11px', padding: '2px 7px', background: 'rgba(245, 158, 11, 0.1)', color: 'var(--color-warning)', borderRadius: '999px', fontWeight: 700 }}>
+              运行中
+            </span>
+          ) : null}
+          {displayToolCalls.length > 0 && (
+            <span style={{ fontSize: '11px', padding: '2px 7px', background: 'rgba(6, 182, 212, 0.1)', color: 'var(--color-secondary)', borderRadius: '999px' }}>
+              {displayToolCalls.length} 项
+            </span>
+          )}
+          {combinedTerminal.length > 0 && (
+            <span style={{ fontSize: '11px', padding: '2px 7px', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-primary)', borderRadius: '999px' }}>
+              {combinedTerminal.length} 日志
+            </span>
+          )}
+          <span style={{ fontSize: '11px', padding: '4px 8px', border: '1px solid var(--border-muted)', color: 'var(--text-muted)', borderRadius: '6px', opacity: 0.6 }}>
+            撤销
           </span>
+        </div>
+      </div>
+
+      {editSummaries.length > 0 && (
+        <div style={{ padding: '7px 12px 9px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {visibleEditSummaries.map((item) => (
+            <div
+              key={item.id}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'minmax(0, 1fr) auto auto',
+                gap: 8,
+                alignItems: 'center',
+                color: 'var(--text-secondary)',
+                background: 'rgba(255,255,255,0.018)',
+                border: '1px solid rgba(255,255,255,0.04)',
+                borderRadius: 6,
+                padding: '5px 7px',
+                minWidth: 0,
+              }}
+            >
+              <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: 11 }}>
+                {item.path}
+              </span>
+              <span style={{ fontFamily: 'monospace', fontSize: 11 }}>
+                <span style={{ color: 'var(--color-success)' }}>+{item.additions}</span>{' '}
+                <span style={{ color: 'var(--color-error)' }}>-{item.deletions}</span>
+              </span>
+              <span style={{ color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-muted)', fontSize: 11 }}>
+                {item.status === 'completed' ? '✓' : item.status === 'failed' ? '!' : '⌄'}
+              </span>
+            </div>
+          ))}
+          {hiddenEditCount > 0 && (
+            <details style={{ marginTop: 2 }}>
+              <summary
+                style={{
+                  color: 'var(--text-muted)',
+                  fontSize: 11,
+                  padding: '3px 2px',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                }}
+              >
+                再显示 {hiddenEditCount} 个文件
+              </summary>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 4 }}>
+                {editSummaries.slice(4).map((item) => (
+                  <div
+                    key={item.id}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'minmax(0, 1fr) auto auto',
+                      gap: 8,
+                      alignItems: 'center',
+                      color: 'var(--text-secondary)',
+                      background: 'rgba(255,255,255,0.018)',
+                      border: '1px solid rgba(255,255,255,0.04)',
+                      borderRadius: 6,
+                      padding: '5px 7px',
+                      minWidth: 0,
+                    }}
+                  >
+                    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: 11 }}>
+                      {item.path}
+                    </span>
+                    <span style={{ fontFamily: 'monospace', fontSize: 11 }}>
+                      <span style={{ color: 'var(--color-success)' }}>+{item.additions}</span>{' '}
+                      <span style={{ color: 'var(--color-error)' }}>-{item.deletions}</span>
+                    </span>
+                    <span style={{ color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-muted)', fontSize: 11 }}>
+                      {item.status === 'completed' ? '✓' : item.status === 'failed' ? '!' : '⌄'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+
+      {actionableTools.length > 0 && (
+        <div style={{ padding: '8px 12px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+          {actionableTools.map((tool, idx) => (
+            <ToolCard key={tool.id || idx} tool={tool} />
+          ))}
+        </div>
+      )}
+
+      <details style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+        <summary
+          style={{
+            padding: '8px 12px',
+            cursor: 'pointer',
+            color: 'var(--text-secondary)',
+            fontWeight: 700,
+            userSelect: 'none',
+            background: 'rgba(255,255,255,0.015)',
+          }}
+        >
+          审核执行详情
         </summary>
         <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '10px', borderTop: '1px solid var(--border-muted)' }}>
           {commandLine && (
@@ -1171,11 +1387,11 @@ export function renderTurnEvents(
             </div>
           )}
 
-          {toolCalls.length > 0 && (
+          {displayToolCalls.length > 0 && (
             <div>
               <div style={{ fontWeight: 'bold', color: 'var(--text-secondary)', marginBottom: '6px' }}>Tool Executions:</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                {toolCalls.map((tc, idx) => (
+                {displayToolCalls.map((tc, idx) => (
                   <ToolCard key={tc.id || idx} tool={tc} />
                 ))}
               </div>
