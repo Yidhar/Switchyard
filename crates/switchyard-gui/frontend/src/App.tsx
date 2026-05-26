@@ -537,7 +537,8 @@ function hasProviderTextUpdate(text: any, payload: any): boolean {
     return isAssistantTextRuntimePayload(payload);
   }
   if (!payload || !isAssistantTextRuntimePayload(payload)) return false;
-  return Boolean(runtimePayloadText(payload));
+  const payloadText = runtimePayloadText(payload);
+  return Boolean(payloadText && !isSystemStatusText(payloadText));
 }
 
 function isRuntimeReasoningEvent(data: any): boolean {
@@ -719,6 +720,18 @@ function upsertRuntimeItemEvent(existing: any[], data: any): any[] {
   return next;
 }
 
+function shouldDropRuntimeAssistantText(text: string | null): boolean {
+  return Boolean(text && text.trim() && isSystemStatusText(text));
+}
+
+function appendRuntimeAssistantText(prev: string, text: string): string {
+  return shouldDropRuntimeAssistantText(text) ? prev : prev + text;
+}
+
+function replaceRuntimeAssistantText(prev: string, text: string): string {
+  return shouldDropRuntimeAssistantText(text) ? prev : text;
+}
+
 function applyProviderTextUpdate(prev: string, text: string, payload: any): string {
   const incomingText = typeof text === 'string' ? text : '';
   if (!payload) return incomingText && !isSystemStatusText(incomingText) ? prev + incomingText : prev;
@@ -731,18 +744,18 @@ function applyProviderTextUpdate(prev: string, text: string, payload: any): stri
 
   const directText = typeof payload.text === 'string' ? payload.text : null;
   if (directText !== null) {
-    return isSystemStatusText(directText) ? prev : prev + directText;
+    return appendRuntimeAssistantText(prev, directText);
   }
   const paramsText = typeof params.text === 'string' ? params.text : null;
   if (paramsText !== null) {
-    return isSystemStatusText(paramsText) ? prev : prev + paramsText;
+    return appendRuntimeAssistantText(prev, paramsText);
   }
 
   const deltaText =
     runtimeDeltaText(payload.delta, textProtocolHint) ||
     runtimeDeltaText(params.delta, textProtocolHint || paramsTextProtocolHint) ||
     runtimeDeltaText(item?.delta, textProtocolHint);
-  if (deltaText !== null) return prev + deltaText;
+  if (deltaText !== null) return appendRuntimeAssistantText(prev, deltaText);
 
   const contentText =
     runtimeContentText(payload.content) ||
@@ -751,23 +764,25 @@ function applyProviderTextUpdate(prev: string, text: string, payload: any): stri
   if (contentText !== null) {
     const protocol = runtimeProtocolKind(payload);
     const isDelta = payload.delta === true || params.delta === true || item?.delta === true || protocol.includes('delta');
-    return isDelta ? prev + contentText : contentText;
+    return isDelta
+      ? appendRuntimeAssistantText(prev, contentText)
+      : replaceRuntimeAssistantText(prev, contentText);
   }
 
-  if (typeof item?.text === 'string') return item.text;
-  if (typeof payload.item?.text === 'string') return payload.item.text;
-  if (typeof payload.params?.item?.text === 'string') return payload.params.item.text;
-  if (typeof item?.result === 'string') return item.result;
-  if (typeof payload.result === 'string') return payload.result;
-  if (typeof params.result === 'string') return params.result;
+  if (typeof item?.text === 'string') return replaceRuntimeAssistantText(prev, item.text);
+  if (typeof payload.item?.text === 'string') return replaceRuntimeAssistantText(prev, payload.item.text);
+  if (typeof payload.params?.item?.text === 'string') return replaceRuntimeAssistantText(prev, payload.params.item.text);
+  if (typeof item?.result === 'string') return replaceRuntimeAssistantText(prev, item.result);
+  if (typeof payload.result === 'string') return replaceRuntimeAssistantText(prev, payload.result);
+  if (typeof params.result === 'string') return replaceRuntimeAssistantText(prev, params.result);
 
   const messageText =
     runtimeContentText(payload.message?.content) ||
     runtimeContentText(params.message?.content) ||
     runtimeContentText(item?.message?.content);
-  if (messageText) return messageText;
+  if (messageText) return replaceRuntimeAssistantText(prev, messageText);
 
-  return incomingText ? prev + incomingText : prev;
+  return incomingText ? appendRuntimeAssistantText(prev, incomingText) : prev;
 }
 
 function App() {

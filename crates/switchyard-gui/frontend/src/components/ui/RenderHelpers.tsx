@@ -284,11 +284,13 @@ export function renderMessageBody(
   _onProposeForCanvas?: (path: string, content: string) => void,
 ) {
   if (!text) return null;
+  const displayText = stripSystemStatusLeakText(text);
+  if (!displayText) return null;
 
   // Check if it contains a delegate JSON block
-  const jsonMatch = text.match(/<<<SWITCHYARD_JSON_BEGIN>>>([\s\S]*?)<<<SWITCHYARD_JSON_END>>>/);
+  const jsonMatch = displayText.match(/<<<SWITCHYARD_JSON_BEGIN>>>([\s\S]*?)<<<SWITCHYARD_JSON_END>>>/);
   let delegateCard: React.ReactNode = null;
-  let remainingText = text;
+  let remainingText = displayText;
 
   if (jsonMatch && jsonMatch[1]) {
     try {
@@ -357,12 +359,14 @@ export function renderMessageBody(
           </div>
         );
         // Strip the JSON block from the text so we don't render the raw JSON
-        remainingText = text.replace(/<<<SWITCHYARD_JSON_BEGIN>>>[\s\S]*?<<<SWITCHYARD_JSON_END>>>/, '');
+        remainingText = displayText.replace(/<<<SWITCHYARD_JSON_BEGIN>>>[\s\S]*?<<<SWITCHYARD_JSON_END>>>/, '');
       }
     } catch (e) {
       // Ignore parsing error
     }
   }
+
+  if (!remainingText.trim() && !delegateCard) return null;
 
   // Split by code blocks first
   const parts = remainingText.split(/(```[\s\S]*?```)/g);
@@ -441,6 +445,12 @@ function looksLikeExecutionLeakText(text: string): boolean {
   if (/^\s*Directory:\s+/im.test(trimmed)) return true;
   if (/^(?:diff --git|--- a\/|\+\+\+ b\/|\*\*\* Begin Patch)/m.test(trimmed)) return true;
   if (/^Exit Code:\s*\d+/im.test(trimmed)) return true;
+  if (/^warning:\s+in the working copy\b/im.test(trimmed)) return true;
+  if (/\b(?:LF|CRLF) will be replaced by (?:CRLF|LF)\b/i.test(trimmed)) return true;
+  if (/^(?:LF|CRLF) will be(?:\s|$)/i.test(trimmed)) return true;
+  if (/^replaced by (?:CRLF|LF)\b/i.test(trimmed)) return true;
+  if (/\bthe next time Git touches it\b/i.test(trimmed)) return true;
+  if (/^\[warning\]\s*$/i.test(trimmed)) return true;
 
   return false;
 }
@@ -463,6 +473,75 @@ export function isSystemStatusText(text: string): boolean {
     }
   }
   return false;
+}
+
+const EXECUTION_LOG_FENCE_LANG_RE = /^(?:text|txt|log|logs|console|terminal|shell|sh|bash|zsh|powershell|ps1|cmd|bat)$/i;
+
+function parseFenceLine(line: string): string | null {
+  const match = line.trim().match(/^```([^\r\n`]*)$/);
+  return match ? (match[1] ?? '') : null;
+}
+
+function isExecutionLogFenceInfo(info: string): boolean {
+  const lang = info.trim().split(/\s+/)[0] ?? '';
+  return !lang || EXECUTION_LOG_FENCE_LANG_RE.test(lang);
+}
+
+function lineLooksLikeRuntimeLeak(line: string): boolean {
+  return Boolean(line.trim()) && isSystemStatusText(line);
+}
+
+export function stripSystemStatusLeakText(text: string): string {
+  if (!text) return text;
+
+  const lines = text.split(/\r?\n/);
+  const kept: string[] = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const fenceInfo = parseFenceLine(line);
+
+    if (fenceInfo !== null && isExecutionLogFenceInfo(fenceInfo)) {
+      let closingIndex = -1;
+      for (let j = i + 1; j < lines.length; j += 1) {
+        if (lines[j].trim() === '```') {
+          closingIndex = j;
+          break;
+        }
+      }
+
+      const bodyEnd = closingIndex === -1 ? lines.length : closingIndex;
+      const bodyLines = lines.slice(i + 1, bodyEnd);
+      const nonEmptyBodyLines = bodyLines.filter((bodyLine) => bodyLine.trim());
+      const bodyIsOnlyRuntimeLeak =
+        nonEmptyBodyLines.length > 0 &&
+        nonEmptyBodyLines.every((bodyLine) => lineLooksLikeRuntimeLeak(bodyLine));
+
+      if (bodyIsOnlyRuntimeLeak) {
+        i = closingIndex === -1 ? lines.length : closingIndex;
+        continue;
+      }
+    }
+
+    if (lineLooksLikeRuntimeLeak(line)) continue;
+    kept.push(line);
+  }
+
+  return kept
+    .join('\n')
+    // If a streamed terminal leak opened a text/log fence before the warning
+    // line was filtered, don't leave an empty or dangling code block in the
+    // assistant prose.
+    .replace(
+      /(^|\n)[ \t]*```(?:text|txt|log|logs|console|terminal|shell|sh|bash|zsh|powershell|ps1|cmd|bat)?[^\S\r\n]*(?:\n[ \t]*)?```[ \t]*(?=\n|$)/gi,
+      '$1',
+    )
+    .replace(
+      /(^|\n)[ \t]*```(?:text|txt|log|logs|console|terminal|shell|sh|bash|zsh|powershell|ps1|cmd|bat)?[^\S\r\n]*$/i,
+      '$1',
+    )
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 type ToolStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -1569,6 +1648,7 @@ function latestMeaningfulTerminalLine(lines: string[]): string | null {
       if (!cleaned) continue;
       if (/^CODEX \((?:CORE|PEER)\)$/i.test(cleaned)) continue;
       if (/^PWD:\s*$/i.test(cleaned) || /^ROOT:\s*$/i.test(cleaned)) continue;
+      if (/^\[warning\]$/i.test(cleaned)) continue;
       return cleaned;
     }
   }
