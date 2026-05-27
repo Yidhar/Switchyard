@@ -1,7 +1,8 @@
 import React from 'react';
-import { Terminal } from 'lucide-react';
+import { Copy, Terminal } from 'lucide-react';
 import type { Turn } from '../../types';
 import { ToolCard } from './ToolCard';
+import { VirtualizedDiffBlock } from './VirtualizedDiffBlock';
 
 /// Heuristic: does this text look enough like a file path that the Canvas
 /// should offer to open it?
@@ -240,18 +241,199 @@ function parseMarkdownHeading(line: string): { level: number; text: string } | n
   return allowNoSpaceHeading ? { level: marker.length, text: rest } : null;
 }
 
+type MarkdownTableAlignment = 'left' | 'center' | 'right' | null;
+
+interface MarkdownTableBlock {
+  header: string[];
+  alignments: MarkdownTableAlignment[];
+  rows: string[][];
+  endIndex: number;
+}
+
+function isEscapedMarkdownChar(source: string, index: number): boolean {
+  let slashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && source[cursor] === '\\'; cursor -= 1) {
+    slashCount += 1;
+  }
+  return slashCount % 2 === 1;
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  let source = line.trim();
+  if (source.startsWith('|')) {
+    source = source.slice(1);
+  }
+  if (source.endsWith('|') && !isEscapedMarkdownChar(source, source.length - 1)) {
+    source = source.slice(0, -1);
+  }
+
+  const cells: string[] = [];
+  let current = '';
+  let inInlineCode = false;
+
+  for (let idx = 0; idx < source.length; idx += 1) {
+    const char = source[idx];
+    const escaped = isEscapedMarkdownChar(source, idx);
+
+    if (char === '`' && !escaped) {
+      inInlineCode = !inInlineCode;
+      current += char;
+      continue;
+    }
+
+    if (char === '\\' && source[idx + 1] === '|') {
+      current += '|';
+      idx += 1;
+      continue;
+    }
+
+    if (char === '|' && !inInlineCode) {
+      cells.push(current.trim());
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  cells.push(current.trim());
+  return cells;
+}
+
+function parseMarkdownTableSeparator(line: string): MarkdownTableAlignment[] | null {
+  const cells = splitMarkdownTableRow(line);
+  if (cells.length < 2) return null;
+
+  const alignments: MarkdownTableAlignment[] = [];
+  for (const cell of cells) {
+    const normalized = cell.replace(/\s+/g, '');
+    if (!/^:?-{3,}:?$/.test(normalized)) {
+      return null;
+    }
+
+    const startsWithColon = normalized.startsWith(':');
+    const endsWithColon = normalized.endsWith(':');
+    if (startsWithColon && endsWithColon) {
+      alignments.push('center');
+    } else if (endsWithColon) {
+      alignments.push('right');
+    } else if (startsWithColon) {
+      alignments.push('left');
+    } else {
+      alignments.push(null);
+    }
+  }
+
+  return alignments;
+}
+
+function normalizeMarkdownTableRow(cells: string[], columnCount: number): string[] {
+  const normalized = cells.slice(0, columnCount);
+  while (normalized.length < columnCount) {
+    normalized.push('');
+  }
+  return normalized;
+}
+
+function parseMarkdownTableAt(lines: string[], startIndex: number): MarkdownTableBlock | null {
+  if (startIndex >= lines.length - 1) return null;
+
+  const headerCells = splitMarkdownTableRow(lines[startIndex]);
+  if (headerCells.length < 2) return null;
+
+  const alignments = parseMarkdownTableSeparator(lines[startIndex + 1]);
+  if (!alignments || alignments.length !== headerCells.length) {
+    return null;
+  }
+
+  const columnCount = headerCells.length;
+  const rows: string[][] = [];
+  let endIndex = startIndex + 1;
+
+  for (let lineIdx = startIndex + 2; lineIdx < lines.length; lineIdx += 1) {
+    const line = lines[lineIdx];
+    if (!line.trim() || !line.includes('|')) {
+      break;
+    }
+
+    const cells = splitMarkdownTableRow(line);
+    if (cells.length < 2) {
+      break;
+    }
+
+    rows.push(normalizeMarkdownTableRow(cells, columnCount));
+    endIndex = lineIdx;
+  }
+
+  return {
+    header: normalizeMarkdownTableRow(headerCells, columnCount),
+    alignments,
+    rows,
+    endIndex,
+  };
+}
+
+function getMarkdownTableCellStyle(alignment: MarkdownTableAlignment): React.CSSProperties | undefined {
+  return alignment ? { textAlign: alignment } : undefined;
+}
+
+function renderMarkdownTable(
+  table: MarkdownTableBlock,
+  key: string,
+  onOpenFile?: (path: string) => void,
+): React.ReactNode {
+  return (
+    <div key={key} className="markdown-table-scroll" role="region" aria-label="Markdown table" tabIndex={0}>
+      <table className="markdown-table">
+        <thead>
+          <tr>
+            {table.header.map((cell, colIdx) => (
+              <th key={`${key}-head-${colIdx}`} scope="col" style={getMarkdownTableCellStyle(table.alignments[colIdx])}>
+                {renderInlineMarkdown(cell, `${key}-head-${colIdx}`, onOpenFile)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        {table.rows.length > 0 ? (
+          <tbody>
+            {table.rows.map((row, rowIdx) => (
+              <tr key={`${key}-row-${rowIdx}`}>
+                {row.map((cell, colIdx) => (
+                  <td key={`${key}-row-${rowIdx}-cell-${colIdx}`} style={getMarkdownTableCellStyle(table.alignments[colIdx])}>
+                    {renderInlineMarkdown(cell, `${key}-row-${rowIdx}-cell-${colIdx}`, onOpenFile)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        ) : null}
+      </table>
+    </div>
+  );
+}
+
 function renderMarkdownTextPart(
   part: string,
   keyPrefix: string,
   onOpenFile?: (path: string) => void,
 ): React.ReactNode[] {
   const lines = part.split(/\r?\n/);
-  return lines.flatMap((line, lineIdx) => {
+  const nodes: React.ReactNode[] = [];
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx += 1) {
+    const table = parseMarkdownTableAt(lines, lineIdx);
+    if (table) {
+      nodes.push(renderMarkdownTable(table, `${keyPrefix}-table-${lineIdx}`, onOpenFile));
+      lineIdx = table.endIndex;
+      continue;
+    }
+
+    const line = lines[lineIdx];
     const heading = parseMarkdownHeading(line);
     const key = `${keyPrefix}-line-${lineIdx}`;
     const trailingNewline = lineIdx < lines.length - 1 ? '\n' : null;
     if (heading) {
-      return [
+      nodes.push(
         React.createElement(
           `h${heading.level}` as keyof React.JSX.IntrinsicElements,
           { key, className: `message-heading message-heading-${heading.level}` },
@@ -259,15 +441,19 @@ function renderMarkdownTextPart(
         ),
         // Block headings already occupy their own line; only preserve extra
         // blank lines from the source, not the structural line break itself.
-      ];
+      );
+      continue;
     }
-    return [
+
+    nodes.push(
       <React.Fragment key={key}>
         {renderInlineMarkdown(line, key, onOpenFile)}
         {trailingNewline}
       </React.Fragment>,
-    ];
-  });
+    );
+  }
+
+  return nodes;
 }
 
 export function renderMessageBody(
@@ -545,6 +731,7 @@ export function stripSystemStatusLeakText(text: string): string {
 }
 
 type ToolStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type RuntimeTurnPhase = 'running' | 'output_completed' | 'finalizing' | 'completed' | 'failed';
 
 interface ToolDisplay {
   id: string;
@@ -552,6 +739,7 @@ interface ToolDisplay {
   input: any;
   status: ToolStatus;
   output: any;
+  itemType?: string;
   actions?: Array<{
     id?: string;
     label: string;
@@ -568,6 +756,20 @@ export interface RenderTurnEventsOptions {
     decision: 'approve' | 'deny',
     reason?: string,
   ) => void | Promise<void>;
+  onCancelTurn?: () => void | Promise<void>;
+  runtimePhase?: RuntimeTurnPhase;
+  runtimeElapsedMs?: number;
+  runtimePhaseElapsedMs?: number;
+  runtimeStartedAtMs?: number;
+  runtimePhaseStartedAtMs?: number;
+  /// Perf hint from ChatArea: `events` has already been narrowed to the
+  /// requested turn. Avoids repeatedly scanning the full session event list
+  /// for every historical bubble.
+  eventsAlreadyScoped?: boolean;
+  /// Perf hint from ChatArea: `turns` contains only the current turn plus its
+  /// immediate delegated children. `collectTurnExecutionState` can keep its
+  /// existing find/filter logic, but those operations stay bounded.
+  turnsAlreadyScoped?: boolean;
 }
 
 const CALL_ITEM_TYPES = new Set([
@@ -576,6 +778,9 @@ const CALL_ITEM_TYPES = new Set([
   'function_call',
   'custom_tool_call',
   'mcp_tool_call',
+  'dynamic_tool_call',
+  'collab_agent_tool_call',
+  'web_search',
   'local_shell_call',
 ]);
 
@@ -592,6 +797,7 @@ const COMMAND_ITEM_TYPES = new Set([
   'command_execution',
   'local_shell_call',
   'local_shell_call_output',
+  'command_output_delta',
 ]);
 
 const FILE_EDIT_ITEM_TYPES = new Set([
@@ -600,6 +806,7 @@ const FILE_EDIT_ITEM_TYPES = new Set([
   'file_change_delta',
   'diff_delta',
   'patch_delta',
+  'file_change_patch',
 ]);
 
 const TERMINAL_OUTPUT_ITEM_TYPES = new Set([
@@ -610,6 +817,7 @@ const TERMINAL_OUTPUT_ITEM_TYPES = new Set([
   'shell_output_delta',
   'stdout_delta',
   'stderr_delta',
+  'process_output_delta',
 ]);
 
 const PROVIDER_ITEM_EVENT_TYPES = new Set([
@@ -645,6 +853,19 @@ function firstMeaningful<T = any>(...values: T[]): T | undefined {
 function asString(value: any): string | undefined {
   if (value === undefined || value === null) return undefined;
   return typeof value === 'string' ? value : String(value);
+}
+
+function decodeBase64Text(value: any): string | undefined {
+  const encoded = asString(value)?.trim();
+  if (!encoded) return undefined;
+  try {
+    const binary = atob(encoded);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const decoded = new TextDecoder().decode(bytes);
+    return decoded.length > 0 ? decoded : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeProviderEventType(value: any): string {
@@ -700,7 +921,7 @@ function getPayloadItem(payload: any): any {
 }
 
 function getItemType(payload: any, item: any): string {
-  return (
+  const raw = (
     asString(payload?.item_type) ||
     asString(payload?.params?.item_type) ||
     itemTypeFromLooseValue(item?.type) ||
@@ -708,6 +929,7 @@ function getItemType(payload: any, item: any): string {
     itemTypeFromLooseValue(payload?.type) ||
     ''
   );
+  return normalizeProviderEventType(raw);
 }
 
 function getProtocolKind(payload: any): string {
@@ -715,7 +937,7 @@ function getProtocolKind(payload: any): string {
 }
 
 function normalizedProtocolKind(payload: any): string {
-  return getProtocolKind(payload).toLowerCase().replace(/[\/_\-\s]+/g, '.');
+  return normalizeProviderEventType(getProtocolKind(payload)).replace(/_/g, '.');
 }
 
 function isCommandTool(tool: ToolDisplay): boolean {
@@ -729,7 +951,44 @@ function isCommandTool(tool: ToolDisplay): boolean {
   );
 }
 
+function textLooksLikeEditDiff(text: string): boolean {
+  const normalized = stripAnsi(String(text || '')).replace(/\r\n/g, '\n');
+  if (!normalized.trim()) return false;
+  if (/^diff --git\s+/m.test(normalized)) return true;
+  if (/^\*\*\* Begin Patch\b/m.test(normalized)) return true;
+  if (/^\*\*\* (?:Add|Update|Delete|Move) File:\s+\S+/m.test(normalized)) return true;
+
+  const hasMinusHeader = /^---\s+(?:a\/|\/dev\/null|[^\s]+\.[A-Za-z0-9][A-Za-z0-9_-]{0,16}(?:\s|$))/m.test(normalized);
+  const hasPlusHeader = /^\+\+\+\s+(?:b\/|\/dev\/null|[^\s]+\.[A-Za-z0-9][A-Za-z0-9_-]{0,16}(?:\s|$))/m.test(normalized);
+  if (hasMinusHeader && hasPlusHeader) return true;
+
+  return /^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/m.test(normalized);
+}
+
+function textLooksLikePartialDiff(text: string): boolean {
+  const normalized = stripAnsi(String(text || '')).replace(/\r\n/g, '\n');
+  if (!normalized.trim()) return false;
+  if (textLooksLikeEditDiff(normalized)) return true;
+  return /^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/m.test(normalized) || /^[+-][^+-]/m.test(normalized);
+}
+
 function isEditTool(tool: ToolDisplay): boolean {
+  const itemType = normalizeProviderEventType((tool as any).itemType || '');
+  if (itemType) {
+    if (FILE_EDIT_ITEM_TYPES.has(itemType)) return true;
+    if (
+      itemType === 'raw_response_item' ||
+      itemType === 'reasoning' ||
+      itemType === 'plan' ||
+      itemType === 'todo_list' ||
+      itemType === 'runtime_status' ||
+      itemType === 'terminal_output' ||
+      itemType === 'terminal_output_delta' ||
+      itemType === 'command_output_delta'
+    ) {
+      return false;
+    }
+  }
   const name = String(tool.name || '').toLowerCase();
   const output = typeof tool.output === 'string' ? tool.output : '';
   return (
@@ -738,9 +997,7 @@ function isEditTool(tool: ToolDisplay): boolean {
     name.includes('patch') ||
     name.includes('file change') ||
     name.includes('changed file') ||
-    output.startsWith('diff --git') ||
-    output.includes('\n--- ') ||
-    output.includes('\n+++ ')
+    textLooksLikeEditDiff(output)
   );
 }
 
@@ -757,7 +1014,18 @@ function hasFileEditShape(payload: any, item: any, itemType: string, protocol: s
     payload?.edits,
   );
   if (diffLike === undefined) return false;
-  const pathLike = firstPresent(item?.path, payload?.path, item?.file, payload?.file);
+  const pathLike = firstPresent(
+    item?.path,
+    payload?.path,
+    item?.filePath,
+    payload?.filePath,
+    item?.relativePath,
+    payload?.relativePath,
+    item?.sourcePath,
+    payload?.sourcePath,
+    item?.file,
+    payload?.file,
+  );
   const protocolLooksEdit =
     protocol.includes('file') ||
     protocol.includes('diff') ||
@@ -770,6 +1038,12 @@ function fileEditInput(payload: any, item: any): any {
   return firstPresent(
     item?.path,
     payload?.path,
+    item?.filePath,
+    payload?.filePath,
+    item?.relativePath,
+    payload?.relativePath,
+    item?.sourcePath,
+    payload?.sourcePath,
     item?.file,
     payload?.file,
     item?.title,
@@ -795,6 +1069,8 @@ function fileEditOutput(payload: any, item: any): any {
     payload?.changes,
     item?.edits,
     payload?.edits,
+    item?.message,
+    payload?.message,
     item?.summary,
     payload?.summary,
   );
@@ -803,6 +1079,14 @@ function fileEditOutput(payload: any, item: any): any {
 function terminalOutputText(payload: any, item: any, itemType: string): string | undefined {
   if (!TERMINAL_OUTPUT_ITEM_TYPES.has(itemType)) return undefined;
   const delta = firstPresent(item?.delta, payload?.delta);
+  const decodedDelta = decodeBase64Text(firstPresent(
+    item?.deltaBase64,
+    payload?.deltaBase64,
+    item?.delta_base64,
+    payload?.delta_base64,
+    typeof delta === 'object' ? delta?.deltaBase64 : undefined,
+    typeof delta === 'object' ? delta?.delta_base64 : undefined,
+  ));
   return asString(firstPresent(
     item?.line,
     payload?.line,
@@ -810,6 +1094,7 @@ function terminalOutputText(payload: any, item: any, itemType: string): string |
     payload?.text,
     item?.output,
     payload?.output,
+    decodedDelta,
     typeof delta === 'object' ? delta?.text : delta,
   ));
 }
@@ -827,6 +1112,8 @@ function normalizeStatus(payload: any, item: any, eventType?: string): ToolStatu
   const raw = asString(firstPresent(
     item?.status,
     payload?.status,
+    item?.run?.status,
+    payload?.run?.status,
     payload?.decision?.decision,
     payload?.decision,
   ))?.toLowerCase();
@@ -836,7 +1123,7 @@ function normalizeStatus(payload: any, item: any, eventType?: string): ToolStatu
     if (['cancelled', 'canceled', 'aborted', 'skipped'].includes(raw)) return 'cancelled';
   }
 
-  const exitCode = firstPresent(item?.exit_code, payload?.exit_code);
+  const exitCode = firstPresent(item?.exit_code, payload?.exit_code, item?.exitCode, payload?.exitCode);
   if (protocol.includes('failed') || protocol.includes('error')) return 'failed';
   if (protocol.includes('cancel')) return 'cancelled';
   if (protocol.includes('completed') || protocol.includes('complete') || protocol.includes('artifact_ready') || protocol.includes('output')) {
@@ -887,10 +1174,18 @@ function toolOutput(payload: any, item: any): any {
   const explicit = firstPresent(
     item?.aggregated_output,
     payload?.aggregated_output,
+    item?.aggregatedOutput,
+    payload?.aggregatedOutput,
     item?.output,
     payload?.output,
     item?.result,
     payload?.result,
+    item?.message,
+    payload?.message,
+    item?.run?.statusMessage,
+    payload?.run?.statusMessage,
+    item?.run?.entries,
+    payload?.run?.entries,
     item?.content,
     payload?.content,
     item?.error,
@@ -904,7 +1199,7 @@ function toolOutput(payload: any, item: any): any {
     return [stdout, stderr].filter(Boolean).join('\n');
   }
 
-  const exitCode = firstPresent(item?.exit_code, payload?.exit_code);
+  const exitCode = firstPresent(item?.exit_code, payload?.exit_code, item?.exitCode, payload?.exitCode);
   return exitCode !== undefined ? `Exit Code: ${exitCode}` : null;
 }
 
@@ -921,7 +1216,14 @@ function toolName(payload: any, item: any, type: string): string {
 
   if (COMMAND_ITEM_TYPES.has(type)) return 'Execute Command';
   if (FILE_EDIT_ITEM_TYPES.has(type)) return 'Edit File';
-  if (type === 'todo_list') return 'Task Planning (Codex)';
+  if (type === 'todo_list' || type === 'plan') return 'Task Planning (Codex)';
+  if (type === 'hook') return 'Hook';
+  if (type === 'runtime_status') return 'Codex Runtime';
+  if (type === 'auto_approval_review') return 'Auto Approval Review';
+  if (type === 'terminal_interaction') return 'Terminal Interaction';
+  if (type === 'web_search') return 'Web Search';
+  if (type === 'image_view') return 'Image View';
+  if (type === 'image_generation') return 'Image Generation';
   if (type === 'approval_request') return '权限确认请求';
   if (type === 'approval_decision') return '权限处理结果';
   if (type === 'server_request') return 'Codex Server Request';
@@ -963,6 +1265,10 @@ function stableToolId(turnId: string, event: any, index: number, payload: any, i
   const natural = firstPresent(
     item?.id,
     payload?.id,
+    item?.itemId,
+    payload?.itemId,
+    item?.processId,
+    payload?.processId,
     item?.call_id,
     payload?.call_id,
     item?.tool_call_id,
@@ -980,23 +1286,48 @@ function stableToolId(turnId: string, event: any, index: number, payload: any, i
 }
 
 function mergeTool(toolCalls: ToolDisplay[], next: ToolDisplay) {
+  const sanitizedNext = {
+    ...next,
+    output: sanitizeRuntimeValue(next.output),
+  };
   const existing = toolCalls.find(
     (tool) =>
-      tool.id === next.id ||
+      tool.id === sanitizedNext.id ||
       (!isEditTool(tool) &&
-        !isEditTool(next) &&
-        tool.name === next.name &&
+        !isEditTool(sanitizedNext) &&
+        tool.name === sanitizedNext.name &&
         (tool.status === 'running' || tool.status === 'pending') &&
         !tool.output),
   );
   if (!existing) {
-    toolCalls.push(next);
+    toolCalls.push(sanitizedNext);
     return;
   }
-  existing.status = next.status || existing.status;
-  if (next.input !== undefined && next.input !== null) existing.input = next.input;
-  if (next.output !== undefined && next.output !== null) existing.output = next.output;
-  if (next.actions !== undefined) existing.actions = next.actions;
+  existing.status = sanitizedNext.status || existing.status;
+  if (sanitizedNext.input !== undefined && sanitizedNext.input !== null) existing.input = sanitizedNext.input;
+  if (sanitizedNext.output !== undefined && sanitizedNext.output !== null) {
+    existing.output = mergeToolOutput(existing.output, sanitizedNext.output, isEditTool(existing) || isEditTool(sanitizedNext));
+  }
+  if (sanitizedNext.actions !== undefined) existing.actions = sanitizedNext.actions;
+  if (sanitizedNext.itemType !== undefined) existing.itemType = sanitizedNext.itemType;
+}
+
+function mergeToolOutput(existing: any, next: any, accumulateText: boolean): any {
+  if (!accumulateText) return next;
+  if (existing === undefined || existing === null || existing === '') return next;
+  if (next === undefined || next === null || next === '') return existing;
+
+  if (typeof existing === 'string' && typeof next === 'string') {
+    const current = existing.trimEnd();
+    const incoming = next.trim();
+    if (!incoming) return existing;
+    if (!current) return next;
+    if (current.includes(incoming)) return existing;
+    if (incoming.includes(current)) return next;
+    return `${current}\n${incoming}`;
+  }
+
+  return next;
 }
 
 function isActiveTurnStatus(status?: Turn['status']): boolean {
@@ -1015,33 +1346,148 @@ function settleToolStatus(status: ToolStatus, turnStatus?: Turn['status']): Tool
   return 'completed';
 }
 
-function formatToolData(value: any): string {
+const TOOL_DATA_STRINGIFY_MAX_CHARS = 120_000;
+const TOOL_DATA_PREVIEW_MAX_KEYS = 48;
+const TOOL_DATA_PREVIEW_MAX_ITEMS = 80;
+const DIFF_TEXT_FRAGMENT_MAX_COUNT = 24;
+const DIFF_TEXT_FRAGMENT_ARRAY_SCAN_LIMIT = 64;
+
+function truncateToolDataString(value: string, maxChars: number): string {
+  const text = value.trim();
+  if (text.length <= maxChars) return text;
+  const headChars = Math.floor(maxChars * 0.72);
+  const tailChars = Math.max(0, Math.floor(maxChars * 0.18));
+  return `${text.slice(0, headChars)}\n… 已截断 ${Math.max(0, text.length - headChars - tailChars).toLocaleString()} 个字符 …\n${text.slice(-tailChars)}`;
+}
+
+function simplifyToolDataForStringify(value: any, depth = 0, maxChars = TOOL_DATA_STRINGIFY_MAX_CHARS): any {
+  if (value === undefined || value === null) return value;
+  if (typeof value === 'string') return truncateToolDataString(value, maxChars);
+  if (typeof value !== 'object') return value;
+  if (depth >= 5) return '[Object]';
+
+  if (Array.isArray(value)) {
+    const items = value
+      .slice(0, TOOL_DATA_PREVIEW_MAX_ITEMS)
+      .map((item) => simplifyToolDataForStringify(item, depth + 1, Math.max(4_000, Math.floor(maxChars / 3))));
+    if (value.length > TOOL_DATA_PREVIEW_MAX_ITEMS) {
+      items.push(`… ${value.length - TOOL_DATA_PREVIEW_MAX_ITEMS} more items …`);
+    }
+    return items;
+  }
+
+  const entries = Object.entries(value);
+  const out: Record<string, any> = {};
+  for (const [key, item] of entries.slice(0, TOOL_DATA_PREVIEW_MAX_KEYS)) {
+    out[key] = simplifyToolDataForStringify(item, depth + 1, Math.max(4_000, Math.floor(maxChars / 3)));
+  }
+  if (entries.length > TOOL_DATA_PREVIEW_MAX_KEYS) {
+    out['…'] = `${entries.length - TOOL_DATA_PREVIEW_MAX_KEYS} more keys`;
+  }
+  return out;
+}
+
+function formatToolData(value: any, maxChars = TOOL_DATA_STRINGIFY_MAX_CHARS): string {
   if (value === undefined || value === null) return '';
-  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'string') return truncateToolDataString(value, maxChars);
   try {
-    return JSON.stringify(value, null, 2);
+    return truncateToolDataString(JSON.stringify(simplifyToolDataForStringify(value, 0, maxChars), null, 2), maxChars);
   } catch {
-    return String(value);
+    return truncateToolDataString(String(value), maxChars);
   }
 }
 
-function collectDiffTextFragments(value: any, depth = 0, fragments: string[] = []): string[] {
-  if (value === undefined || value === null || depth > 4) return fragments;
+function formatToolDataPreview(value: any, maxChars = 160): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return truncateActivityText(value, maxChars);
+  if (Array.isArray(value)) return truncateActivityText(`[${value.length} items]`, maxChars);
+  if (typeof value === 'object') {
+    const keys = Object.keys(value);
+    const preferred = ['cmd', 'command', 'path', 'file', 'filename', 'query', 'task', 'text', 'name'];
+    for (const key of preferred) {
+      const entry = value[key];
+      if (typeof entry === 'string' && entry.trim()) {
+        return truncateActivityText(`${key}: ${entry}`, maxChars);
+      }
+      if (Array.isArray(entry) && entry.length > 0) {
+        return truncateActivityText(`${key}: [${entry.length} items]`, maxChars);
+      }
+    }
+    return truncateActivityText(`{ ${keys.slice(0, 8).join(', ')}${keys.length > 8 ? ', …' : ''} }`, maxChars);
+  }
+  return truncateActivityText(String(value), maxChars);
+}
+
+function sanitizeRuntimeValue(value: any, depth = 0): any {
+  if (value === undefined || value === null) return value;
+  if (typeof value === 'string') {
+    const cleaned = stripSystemStatusLeakText(value);
+    return cleaned.trim() ? cleaned : null;
+  }
+  if (depth > 5 || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    const items = value
+      .map((item) => sanitizeRuntimeValue(item, depth + 1))
+      .filter((item) => {
+        if (item === undefined || item === null) return false;
+        if (typeof item === 'string') return item.trim().length > 0;
+        if (Array.isArray(item)) return item.length > 0;
+        if (typeof item === 'object') return Object.keys(item).length > 0;
+        return true;
+      });
+    return items.length > 0 ? items : null;
+  }
+
+  const cleaned: Record<string, any> = {};
+  Object.entries(value).forEach(([key, item]) => {
+    const next = sanitizeRuntimeValue(item, depth + 1);
+    if (next === undefined || next === null) return;
+    if (typeof next === 'string' && !next.trim()) return;
+    if (Array.isArray(next) && next.length === 0) return;
+    if (typeof next === 'object' && !Array.isArray(next) && Object.keys(next).length === 0) return;
+    cleaned[key] = next;
+  });
+  return Object.keys(cleaned).length > 0 ? cleaned : null;
+}
+
+function cleanRuntimeTerminalLines(lines: string[] | undefined): string[] {
+  if (!lines || lines.length === 0) return [];
+  const cleaned: string[] = [];
+  lines.forEach((entry) => {
+    const text = stripAnsi(String(entry ?? ''));
+    const stripped = stripSystemStatusLeakText(text);
+    if (!stripped.trim()) return;
+    stripped.split(/\r?\n/).forEach((line) => {
+      if (!line.trim()) return;
+      if (lineLooksLikeRuntimeLeak(line)) return;
+      cleaned.push(line);
+    });
+  });
+  return cleaned;
+}
+
+function collectDiffTextFragments(value: any, depth = 0, fragments: string[] = [], trustPartialDiff = false): string[] {
+  if (
+    value === undefined ||
+    value === null ||
+    depth > 4 ||
+    fragments.length >= DIFF_TEXT_FRAGMENT_MAX_COUNT
+  ) {
+    return fragments;
+  }
 
   if (typeof value === 'string') {
-    if (
-      value.includes('diff --git') ||
-      value.includes('\n+++ ') ||
-      value.includes('\n--- ') ||
-      /^[+-][^+-]/m.test(value)
-    ) {
+    if (textLooksLikeEditDiff(value) || (trustPartialDiff && textLooksLikePartialDiff(value))) {
       fragments.push(value);
     }
     return fragments;
   }
 
   if (Array.isArray(value)) {
-    value.forEach((item) => collectDiffTextFragments(item, depth + 1, fragments));
+    for (const item of value.slice(0, DIFF_TEXT_FRAGMENT_ARRAY_SCAN_LIMIT)) {
+      collectDiffTextFragments(item, depth + 1, fragments, trustPartialDiff);
+      if (fragments.length >= DIFF_TEXT_FRAGMENT_MAX_COUNT) break;
+    }
     return fragments;
   }
 
@@ -1060,23 +1506,63 @@ function collectDiffTextFragments(value: any, depth = 0, fragments: string[] = [
     'files',
     'items',
     'data',
-  ].forEach((key) => collectDiffTextFragments(value[key], depth + 1, fragments));
+  ].some((key) => {
+    collectDiffTextFragments(value[key], depth + 1, fragments, trustPartialDiff);
+    return fragments.length >= DIFF_TEXT_FRAGMENT_MAX_COUNT;
+  });
 
   return fragments;
 }
 
-function diffStatsFromText(value: any): { additions: number; deletions: number; lines: number } {
-  const fragments = collectDiffTextFragments(value);
-  const text = fragments.length > 0 ? fragments.join('\n') : formatToolData(value);
+function compactDiffText(text: string, maxChars = 120_000): string {
+  const normalized = stripAnsi(text).replace(/\r\n/g, '\n').trim();
+  if (normalized.length <= maxChars) return normalized;
+  const head = normalized.slice(0, Math.floor(maxChars * 0.72));
+  const tail = normalized.slice(-Math.floor(maxChars * 0.22));
+  return `${head}\n\n… diff 内容过长，已省略中间部分 …\n\n${tail}`;
+}
+
+function mergeDiffText(existing: string | undefined, next: string | undefined): string | undefined {
+  const incoming = next ? compactDiffText(next) : '';
+  if (!incoming) return existing;
+  if (!existing) return incoming;
+  if (existing.includes(incoming)) return existing;
+  if (incoming.includes(existing)) return incoming;
+  return compactDiffText(`${existing}\n${incoming}`);
+}
+
+function scanDiffTextStats(text: string): { additions: number; deletions: number; lines: number } {
+  if (!text) return { additions: 0, deletions: 0, lines: 0 };
   let additions = 0;
   let deletions = 0;
-  const lines = text ? text.split(/\r?\n/) : [];
-  for (const line of lines) {
-    if (line.startsWith('+++') || line.startsWith('---')) continue;
-    if (line.startsWith('+')) additions += 1;
-    if (line.startsWith('-')) deletions += 1;
+  let lines = 0;
+  let lineStart = 0;
+
+  for (let index = 0; index <= text.length; index += 1) {
+    if (index !== text.length && text.charCodeAt(index) !== 10) continue;
+    lines += 1;
+    const first = text.charCodeAt(lineStart);
+    if (first === 43 || first === 45) {
+      const second = text.charCodeAt(lineStart + 1);
+      const third = text.charCodeAt(lineStart + 2);
+      const isHeader = second === first && third === first;
+      if (!isHeader) {
+        if (first === 43) additions += 1;
+        else deletions += 1;
+      }
+    }
+    lineStart = index + 1;
   }
-  return { additions, deletions, lines: lines.length };
+
+  return { additions, deletions, lines };
+}
+
+function diffStatsFromText(value: any, trustPartialDiff = false): { additions: number; deletions: number; lines: number; hasDiffStat: boolean; diffText?: string } {
+  const fragments = collectDiffTextFragments(value, 0, [], trustPartialDiff);
+  const hasDiffStat = fragments.length > 0;
+  const text = hasDiffStat ? compactDiffText(fragments.join('\n')) : '';
+  const stats = scanDiffTextStats(text);
+  return { ...stats, hasDiffStat, diffText: text || undefined };
 }
 
 function compactPathLabel(path: string): string {
@@ -1132,10 +1618,17 @@ function stripDiffPathMetadata(path: string): string {
 function pathFromUnifiedDiff(value: any): string | undefined {
   const text = typeof value === 'string' ? value : formatToolData(value);
   if (!text) return undefined;
+  if (!textLooksLikeEditDiff(text)) return undefined;
 
   const gitMatch = text.match(/^diff --git\s+"?a\/(.+?)"?\s+"?b\/(.+?)"?\s*$/m);
   if (gitMatch) {
     return normalizeEditPath(stripDiffPathMetadata(gitMatch[2] || gitMatch[1]));
+  }
+
+  const patchFileMatch = text.match(/^\*\*\* (?:Add|Update|Delete|Move) File:\s+(.+)$/m);
+  if (patchFileMatch) {
+    const candidate = normalizeEditPath(stripDiffPathMetadata(patchFileMatch[1]));
+    if (candidate && candidate !== '/dev/null') return candidate;
   }
 
   const plusMatch = text.match(/^\+\+\+\s+(.+)$/m);
@@ -1244,12 +1737,6 @@ function fileEditPathForTool(tool: ToolDisplay): string | undefined {
   return extractEditPathFromValue(tool.input) || extractEditPathFromValue(tool.output);
 }
 
-function fileEditPathLabel(tool: ToolDisplay): string {
-  const path = fileEditPathForTool(tool);
-  if (path) return compactPathLabel(path);
-  return tool.name || 'File change';
-}
-
 
 interface EditSummary {
   id: string;
@@ -1258,6 +1745,8 @@ interface EditSummary {
   additions: number;
   deletions: number;
   lines: number;
+  hasDiffStat: boolean;
+  diffText?: string;
   created: boolean;
 }
 
@@ -1266,6 +1755,7 @@ interface TurnExecutionState {
   commandLine?: string;
   commandArgs: any;
   combinedTerminal: string[];
+  planNotes: string[];
   toolCalls: ToolDisplay[];
   displayToolCalls: ToolDisplay[];
   editTools: ToolDisplay[];
@@ -1282,8 +1772,7 @@ interface TurnExecutionState {
   totalDeletions: number;
 }
 
-function isCreatedFileChange(value: any): boolean {
-  const text = formatToolData(value);
+function isCreatedFileChangeText(text: string): boolean {
   if (!text) return false;
   return (
     /^new file mode\b/m.test(text) ||
@@ -1292,6 +1781,11 @@ function isCreatedFileChange(value: any): boolean {
     /^create mode\b/im.test(text) ||
     /\bcreated\s+(?:file|path)\b/i.test(text)
   );
+}
+
+function isCreatedFileChange(value: any, preparedText?: string): boolean {
+  const text = preparedText ?? formatToolData(value);
+  return isCreatedFileChangeText(text);
 }
 
 function mergeEditStatus(current: ToolStatus, next: ToolStatus): ToolStatus {
@@ -1314,7 +1808,7 @@ function editSummaryIndicator(item: EditSummary): string {
   if (item.status === 'failed') return '!';
   if (item.status === 'running' || item.status === 'pending') return '…';
   if (item.status === 'cancelled') return '×';
-  return '›';
+  return '✓';
 }
 
 function aggregateEditSummaries(editTools: ToolDisplay[]): EditSummary[] {
@@ -1323,15 +1817,19 @@ function aggregateEditSummaries(editTools: ToolDisplay[]): EditSummary[] {
 
   editTools.forEach((tool, index) => {
     const fullPath = fileEditPathForTool(tool);
-    const fallbackLabel = fileEditPathLabel(tool);
+    const fallbackLabel = fullPath ? compactPathLabel(fullPath) : (tool.name || 'File change');
     const knownPath = fullPath && !isGenericEditPathLabel(fullPath) ? fullPath : undefined;
     const key = knownPath ? canonicalEditPathKey(knownPath) : `unknown:${tool.id}:${index}`;
-    const stats = diffStatsFromText(tool.output);
+    const itemType = normalizeProviderEventType(tool.itemType || '');
+    const stats = diffStatsFromText(tool.output, FILE_EDIT_ITEM_TYPES.has(itemType));
+    if (!knownPath && !stats.hasDiffStat && tool.status === 'completed') {
+      return;
+    }
     const nextSummary: EditSummary = {
       id: knownPath ? `edit:${key}` : `${tool.id}:${index}`,
       path: knownPath ? compactPathLabel(knownPath) : fallbackLabel,
       status: tool.status,
-      created: isCreatedFileChange(tool.output),
+      created: isCreatedFileChange(tool.output, stats.diffText),
       ...stats,
     };
 
@@ -1346,6 +1844,8 @@ function aggregateEditSummaries(editTools: ToolDisplay[]): EditSummary[] {
     existing.additions = Math.max(existing.additions, nextSummary.additions);
     existing.deletions = Math.max(existing.deletions, nextSummary.deletions);
     existing.lines = Math.max(existing.lines, nextSummary.lines);
+    existing.hasDiffStat = existing.hasDiffStat || nextSummary.hasDiffStat;
+    existing.diffText = mergeDiffText(existing.diffText, nextSummary.diffText);
     existing.created = existing.created || nextSummary.created;
     if (isGenericEditPathLabel(existing.path) && !isGenericEditPathLabel(nextSummary.path)) {
       existing.path = nextSummary.path;
@@ -1353,6 +1853,62 @@ function aggregateEditSummaries(editTools: ToolDisplay[]): EditSummary[] {
   });
 
   return summaries;
+}
+
+function planDisplayInput(payload: any, item: any): any {
+  const listLike = firstMeaningful(
+    item?.items,
+    payload?.items,
+    item?.todos,
+    payload?.todos,
+    item?.tasks,
+    payload?.tasks,
+    item?.steps,
+    payload?.steps,
+  );
+  if (hasMeaningfulDisplayValue(listLike)) return listLike;
+
+  const plan = firstMeaningful(item?.plan, payload?.plan);
+  if (!hasMeaningfulDisplayValue(plan) || typeof plan === 'string') return undefined;
+  return plan;
+}
+
+function textFromPlanValue(value: any): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string') {
+    const cleaned = stripSystemStatusLeakText(value).trim();
+    return cleaned.length > 0 ? cleaned : undefined;
+  }
+  if (Array.isArray(value)) return undefined;
+  if (typeof value !== 'object') return undefined;
+
+  return textFromPlanValue(firstMeaningful(
+    value.explanation,
+    value.summary,
+    value.message,
+    value.text,
+    value.content,
+    value.delta,
+  ));
+}
+
+function planNoteText(payload: any, item: any): string | undefined {
+  const text = textFromPlanValue(firstMeaningful(
+    payload?.explanation,
+    item?.explanation,
+    payload?.summary,
+    item?.summary,
+    payload?.message,
+    item?.message,
+    payload?.delta,
+    item?.delta,
+    item?.text,
+    payload?.text,
+    payload?.plan,
+    item?.plan,
+  ));
+  if (!text) return undefined;
+  return text.length > 1000 ? `${text.slice(0, 999)}…` : text;
 }
 
 function collectTurnExecutionState(
@@ -1363,8 +1919,11 @@ function collectTurnExecutionState(
   hyardJobs?: Record<string, any>,
   options: RenderTurnEventsOptions = {},
 ): TurnExecutionState {
-  // Filter events for this turn
-  const turnEvents = events.filter((e) => e.turn_id === turnId);
+  // Filter events for this turn. Long histories can have thousands of events;
+  // ChatArea passes a pre-indexed slice for hot render paths.
+  const turnEvents = options.eventsAlreadyScoped
+    ? events
+    : events.filter((e) => e.turn_id === turnId);
 
   // Find execution telemetry event
   const telemetryEvent = turnEvents.find((e) => {
@@ -1393,12 +1952,12 @@ function collectTurnExecutionState(
     })
     .filter((line): line is string => Boolean(line));
 
-  let combinedTerminal = [...dbTerminalLines, ...(realtimeLines || [])];
+  let combinedTerminal = cleanRuntimeTerminalLines([...dbTerminalLines, ...(realtimeLines || [])]);
 
   if (hyardJobs && hyardJobs[turnId]) {
     const job = hyardJobs[turnId];
     if (job.last_output_preview && combinedTerminal.length === 0) {
-      combinedTerminal = String(job.last_output_preview).split('\n');
+      combinedTerminal = cleanRuntimeTerminalLines(String(job.last_output_preview).split('\n'));
     }
     if (job.execution && !commandLine) {
       commandLine = executionCommand(job.execution);
@@ -1408,6 +1967,13 @@ function collectTurnExecutionState(
 
   // Extract tool calls and delegate sub-agents
   const toolCalls: ToolDisplay[] = [];
+  const planNotes: string[] = [];
+  const pushPlanNote = (note?: string) => {
+    const cleaned = note ? truncateActivityText(note, 1000) : '';
+    if (!cleaned) return;
+    if (planNotes[planNotes.length - 1] === cleaned) return;
+    planNotes.push(cleaned);
+  };
 
   // 1. Gather child delegate turns
   const delegates = turns.filter((t) => t.delegated_by === turnId);
@@ -1472,6 +2038,7 @@ function collectTurnExecutionState(
         id,
         name,
         input,
+        itemType,
         status: 'pending',
         output: outputLines.join('\n'),
         actions: requestId && resolveApproval
@@ -1503,6 +2070,7 @@ function collectTurnExecutionState(
         id,
         name,
         input: payload.request,
+        itemType,
         status: String(decisionTag || '').startsWith('deny') ? 'failed' : 'completed',
         output: decisionText || decisionTag || payload.decision,
         actions: [],
@@ -1512,6 +2080,7 @@ function collectTurnExecutionState(
         id,
         name,
         input: firstPresent(payload.request, payload.params, item?.request, item?.params),
+        itemType,
         status: normalizeStatus(payload, item, e.event_type),
         output: firstMeaningful(payload.summary, item?.summary, payload.result, item?.result, payload.response, payload.error),
       });
@@ -1520,6 +2089,7 @@ function collectTurnExecutionState(
         id,
         name,
         input: toolInput(payload, item, itemType),
+        itemType,
         status: normalizeStatus(payload, item, e.event_type),
         output: toolOutput(payload, item),
       });
@@ -1528,6 +2098,7 @@ function collectTurnExecutionState(
         id,
         name,
         input: toolInput(payload, item, itemType),
+        itemType,
         status: normalizeStatus({ ...payload, type: payload.type || 'item.completed' }, item, e.event_type),
         output: toolOutput(payload, item),
       });
@@ -1536,6 +2107,7 @@ function collectTurnExecutionState(
         id,
         name,
         input: commandInput(payload, item),
+        itemType,
         status: normalizeStatus(payload, item, e.event_type),
         output: toolOutput(payload, item),
       });
@@ -1544,16 +2116,80 @@ function collectTurnExecutionState(
         id,
         name,
         input: fileEditInput(payload, item),
+        itemType: effectiveItemType,
         status: normalizeStatus(payload, item, e.event_type),
         output: fileEditOutput(payload, item),
       });
-    } else if (itemType === 'todo_list') {
+    } else if (itemType === 'todo_list' || itemType === 'plan') {
+      pushPlanNote(planNoteText(payload, item));
+      const input = planDisplayInput(payload, item);
+      if (input !== undefined) {
+        mergeTool(toolCalls, {
+          id,
+          name,
+          input,
+          itemType,
+          status: normalizeStatus(payload, item, e.event_type),
+          // Plan prose is not a tool result. Keep it out of the ToolCard output
+          // so assistant-facing text does not appear under "Task Planning".
+          output: null,
+        });
+      }
+    } else if (itemType === 'hook') {
+      const run = firstPresent(payload?.run, item?.run, payload, item);
       mergeTool(toolCalls, {
         id,
         name,
-        input: firstPresent(item?.items, payload?.items),
-        status: 'completed',
-        output: null,
+        input: {
+          event: firstPresent(run?.eventName, payload?.eventName, item?.eventName),
+          handler: firstPresent(run?.handlerType, payload?.handlerType, item?.handlerType),
+          source: firstPresent(run?.sourcePath, payload?.sourcePath, item?.sourcePath),
+        },
+        itemType,
+        status: normalizeStatus({ ...payload, status: firstPresent(run?.status, payload?.status) }, item, e.event_type),
+        output: firstMeaningful(
+          run?.statusMessage,
+          payload?.statusMessage,
+          run?.entries,
+          payload?.entries,
+          payload?.summary,
+        ),
+      });
+    } else if (itemType === 'auto_approval_review') {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: firstPresent(payload?.request, item?.request, payload?.decision, item?.decision, payload?.review, item?.review),
+        itemType,
+        status: normalizeStatus(payload, item, e.event_type),
+        output: firstMeaningful(payload?.summary, item?.summary, payload?.result, item?.result, payload?.decision, item?.decision),
+      });
+    } else if (itemType === 'terminal_interaction') {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: firstPresent(payload?.stdin, item?.stdin, payload?.input, item?.input),
+        itemType,
+        status: normalizeStatus(payload, item, e.event_type),
+        output: firstMeaningful(payload?.processId, item?.processId, payload?.summary, item?.summary),
+      });
+    } else if (itemType === 'runtime_status') {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: firstPresent(payload?.summary, item?.summary, payload?.status, item?.status),
+        itemType,
+        status: normalizeStatus(payload, item, e.event_type),
+        output: firstMeaningful(payload?.message, item?.message, payload?.summary, item?.summary),
+      });
+    } else if (itemType === 'raw_response_item') {
+      mergeTool(toolCalls, {
+        id,
+        name,
+        input: firstPresent(payload?.item, item),
+        itemType,
+        status: normalizeStatus({ ...payload, type: payload.type || 'item.completed' }, item, e.event_type),
+        output: firstMeaningful(payload?.text, item?.text, payload?.content, item?.content),
       });
     } else if (itemType === 'reasoning') {
       const summary = firstMeaningful(
@@ -1581,6 +2217,7 @@ function collectTurnExecutionState(
           id,
           name,
           input: null,
+          itemType,
           status: protocol.includes('completed') ? 'completed' : 'running',
           output: summary,
         });
@@ -1590,7 +2227,11 @@ function collectTurnExecutionState(
 
   const currentTurn = turns.find((turn) => turn.turn_id === turnId);
   const turnStatus = currentTurn?.status;
-  const turnIsActive = isActiveTurnStatus(turnStatus);
+  const runtimePhaseIsActive =
+    options.runtimePhase === 'running' ||
+    options.runtimePhase === 'output_completed' ||
+    options.runtimePhase === 'finalizing';
+  const turnIsActive = isActiveTurnStatus(turnStatus) || runtimePhaseIsActive;
   const displayToolCalls = toolCalls.map((tool) => {
     const status = settleToolStatus(tool.status, turnStatus);
     return {
@@ -1600,7 +2241,7 @@ function collectTurnExecutionState(
     };
   });
   const hasRunningTool = turnIsActive && displayToolCalls.some((tool) => tool.status === 'running' || tool.status === 'pending');
-  const hasLiveTerminal = turnIsActive && (realtimeLines?.length ?? 0) > 0;
+  const hasLiveTerminal = turnIsActive && combinedTerminal.length > 0;
   const commandCount = (commandLine ? 1 : 0) + displayToolCalls.filter(isCommandTool).length;
   const editTools = displayToolCalls.filter(isEditTool);
   const editSummaries = aggregateEditSummaries(editTools);
@@ -1614,6 +2255,7 @@ function collectTurnExecutionState(
     commandLine,
     commandArgs,
     combinedTerminal,
+    planNotes,
     toolCalls,
     displayToolCalls,
     editTools,
@@ -1640,19 +2282,25 @@ function truncateActivityText(text: string, max = 180): string {
   return cleaned.length > max ? `${cleaned.slice(0, Math.max(0, max - 1))}…` : cleaned;
 }
 
-function latestMeaningfulTerminalLine(lines: string[]): string | null {
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
+function latestMeaningfulTerminalLines(lines: string[], max = 5): string[] {
+  const out: string[] = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < max; i -= 1) {
     const parts = String(lines[i] ?? '').split(/\r?\n/).reverse();
     for (const part of parts) {
-      const cleaned = truncateActivityText(part);
+      if (out.length >= max) break;
+      const cleaned = truncateActivityText(part, 220);
       if (!cleaned) continue;
       if (/^CODEX \((?:CORE|PEER)\)$/i.test(cleaned)) continue;
       if (/^PWD:\s*$/i.test(cleaned) || /^ROOT:\s*$/i.test(cleaned)) continue;
-      if (/^\[warning\]$/i.test(cleaned)) continue;
-      return cleaned;
+      if (lineLooksLikeRuntimeLeak(cleaned)) continue;
+      // Skip immediately duplicated stream chunks, but keep repeated progress
+      // lines if another line appeared between them.
+      const last = out[out.length - 1];
+      if (last === cleaned) continue;
+      out.push(cleaned);
     }
   }
-  return null;
+  return out.reverse();
 }
 
 function activityPathBasename(path: string): string {
@@ -1662,9 +2310,221 @@ function activityPathBasename(path: string): string {
 }
 
 function activeToolInputLabel(tool: ToolDisplay): string {
-  const input = formatToolData(tool.input);
+  const input = formatToolDataPreview(tool.input, 120);
   if (input) return truncateActivityText(input, 120);
   return tool.name;
+}
+
+function runtimePhaseStatusText(phase: RuntimeTurnPhase | undefined, turnIsActive: boolean): string {
+  if (phase === 'output_completed') return 'Provider 输出已完成，正在收尾同步结果…';
+  if (phase === 'finalizing') return '正在生成最终结果并同步到会话…';
+  if (phase === 'completed') return 'Provider 输出已完成';
+  if (phase === 'failed') return 'Provider 执行失败';
+  if (phase === 'running' || turnIsActive) return 'Provider 正在运行，暂无工具事件…';
+  return '暂无可展示的执行事件';
+}
+
+function runtimePhaseThinkingLabel(phase: RuntimeTurnPhase | undefined): string {
+  if (phase === 'output_completed' || phase === 'finalizing') return '正在收尾';
+  if (phase === 'completed') return '已完成';
+  if (phase === 'failed') return '执行失败';
+  return '正在思考';
+}
+
+function formatRuntimeElapsed(ms?: number): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '处理中';
+  if (ms < 60_000) return `已处理 ${(Math.max(0, ms) / 1000).toFixed(1)}s`;
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `已处理 ${minutes}m ${String(seconds).padStart(2, '0')}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `已处理 ${hours}h ${String(remainingMinutes).padStart(2, '0')}m`;
+}
+
+function useRuntimeNow(active: boolean, intervalMs = 250): number {
+  const [now, setNow] = React.useState(() => Date.now());
+
+  React.useEffect(() => {
+    if (!active) return;
+    const tick = () => setNow(Date.now());
+    tick();
+    const timer = window.setInterval(tick, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [active, intervalMs]);
+
+  return now;
+}
+
+function RuntimeElapsedLabel({
+  startedAtMs,
+  fallbackElapsedMs,
+  active,
+}: {
+  startedAtMs?: number;
+  fallbackElapsedMs?: number;
+  active: boolean;
+}) {
+  const hasStartedAt = typeof startedAtMs === 'number' && Number.isFinite(startedAtMs);
+  const now = useRuntimeNow(Boolean(active && hasStartedAt));
+  const elapsedMs = hasStartedAt
+    ? Math.max(0, now - startedAtMs!)
+    : fallbackElapsedMs;
+  return <>{formatRuntimeElapsed(elapsedMs)}</>;
+}
+
+function writeClipboardText(text: string) {
+  if (!text.trim()) return;
+  try {
+    void navigator.clipboard?.writeText(text);
+  } catch {
+    // Clipboard can be unavailable in non-browser test environments.
+  }
+}
+
+const EDIT_SUMMARY_COLLAPSED_LIMIT = 4;
+
+function EditSummaryDiffStat({ item }: { item: EditSummary }) {
+  if (!(item.additions > 0 || item.deletions > 0)) {
+    return <span aria-hidden="true" style={{ minWidth: 44 }} />;
+  }
+
+  return (
+    <span
+      title={item.hasDiffStat ? '本次文件文本变更统计' : '变更统计'}
+      style={{ fontFamily: 'monospace', fontSize: 11, whiteSpace: 'nowrap' }}
+    >
+      <span style={{ color: 'var(--color-success)' }}>+{item.additions}</span>{' '}
+      <span style={{ color: 'var(--color-error)' }}>-{item.deletions}</span>
+    </span>
+  );
+}
+
+function EditSummaryDiffBlock({ text }: { text: string }) {
+  return <VirtualizedDiffBlock text={text} />;
+}
+
+function EditSummaryRow({ item }: { item: EditSummary }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const canExpand = Boolean(item.diffText && item.diffText.trim().length > 0);
+  const toggle = () => {
+    if (!canExpand) return;
+    setExpanded((value) => !value);
+  };
+
+  return (
+    <div>
+      <button
+        type="button"
+        disabled={!canExpand}
+        aria-expanded={canExpand ? expanded : undefined}
+        title={canExpand ? (expanded ? '收起 diff' : '展开 diff') : '暂无可展示 diff'}
+        onClick={toggle}
+        style={{
+          appearance: 'none',
+          width: '100%',
+          display: 'grid',
+          gridTemplateColumns: 'auto minmax(0, 1fr) auto auto',
+          gap: 8,
+          alignItems: 'center',
+          color: 'var(--text-secondary)',
+          padding: '2px 2px',
+          minWidth: 0,
+          lineHeight: 1.45,
+          border: 0,
+          background: expanded ? 'rgba(255,255,255,0.025)' : 'transparent',
+          borderRadius: 5,
+          font: 'inherit',
+          textAlign: 'left',
+          cursor: canExpand ? 'pointer' : 'default',
+          opacity: canExpand ? 1 : 0.82,
+        }}
+      >
+        <span
+          style={{
+            color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-secondary)',
+            fontWeight: 700,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {editSummaryVerb(item)}
+        </span>
+        <span
+          style={{
+            minWidth: 0,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            color: 'var(--color-primary)',
+            fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
+            fontSize: 11,
+          }}
+          title={item.path}
+        >
+          {activityPathBasename(item.path)}
+        </span>
+        <EditSummaryDiffStat item={item} />
+        <span
+          aria-hidden="true"
+          style={{
+            color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-muted)',
+            fontSize: 12,
+            lineHeight: 1,
+            opacity: canExpand ? 0.95 : 0.58,
+          }}
+        >
+          {canExpand ? (expanded ? '▾' : '›') : editSummaryIndicator(item)}
+        </span>
+      </button>
+      {expanded && canExpand && (
+        <EditSummaryDiffBlock text={item.diffText || ''} />
+      )}
+    </div>
+  );
+}
+
+function EditSummaryList({ editSummaries }: { editSummaries: EditSummary[] }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const canCollapse = editSummaries.length > EDIT_SUMMARY_COLLAPSED_LIMIT;
+  const hiddenEditCount = Math.max(0, editSummaries.length - EDIT_SUMMARY_COLLAPSED_LIMIT);
+  const visibleEditSummaries = expanded || !canCollapse
+    ? editSummaries
+    : editSummaries.slice(0, EDIT_SUMMARY_COLLAPSED_LIMIT);
+
+  return (
+    <div style={{ padding: '7px 12px 9px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {visibleEditSummaries.map((item) => (
+        <EditSummaryRow key={item.id} item={item} />
+      ))}
+      {canCollapse && (
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+          style={{
+            appearance: 'none',
+            alignSelf: 'flex-start',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            marginTop: 2,
+            padding: '3px 2px',
+            border: 0,
+            background: 'transparent',
+            color: 'var(--text-muted)',
+            font: 'inherit',
+            fontSize: 11,
+            cursor: 'pointer',
+            userSelect: 'none',
+          }}
+        >
+          <span aria-hidden="true">{expanded ? '▴' : '▾'}</span>
+          {expanded ? '收起' : `再显示 ${hiddenEditCount} 个文件`}
+        </button>
+      )}
+    </div>
+  );
 }
 
 export function renderTurnActivitySummary(
@@ -1679,6 +2539,7 @@ export function renderTurnActivitySummary(
   const {
     commandLine,
     combinedTerminal,
+    planNotes,
     displayToolCalls,
     editSummaries,
     actionableTools,
@@ -1695,137 +2556,161 @@ export function renderTurnActivitySummary(
   const editedCompletedCount = completedEdits.filter((item) => !item.created).length;
   const editingCount = editSummaries.filter((item) => item.status === 'running' || item.status === 'pending').length;
   const failedEditCount = editSummaries.filter((item) => item.status === 'failed').length;
-  const latestTerminalLine = latestMeaningfulTerminalLine(combinedTerminal);
+  const terminalTail = latestMeaningfulTerminalLines(combinedTerminal, 5);
+  const latestTerminalLine = terminalTail[terminalTail.length - 1] ?? null;
   const runningEdit = editSummaries.find((item) => item.status === 'running' || item.status === 'pending');
   const latestEdit = runningEdit ?? (turnIsActive ? editSummaries[editSummaries.length - 1] : undefined);
   const runningCommand = displayToolCalls.find((tool) => isCommandTool(tool) && (tool.status === 'running' || tool.status === 'pending'));
   const hasActivity = Boolean(commandLine || displayToolCalls.length > 0 || combinedTerminal.length > 0);
+  const runtimePhase = options.runtimePhase;
+  const phaseStatusText = runtimePhaseStatusText(runtimePhase, turnIsActive);
+  const showPhaseStatus =
+    !hasActivity ||
+    runtimePhase === 'output_completed' ||
+    runtimePhase === 'finalizing' ||
+    runtimePhase === 'failed';
   const summaryParts = [
     createdCount > 0 ? `已创建 ${createdCount} 个文件` : null,
     editedCompletedCount > 0 ? `已编辑 ${editedCompletedCount} 个文件` : null,
     editingCount > 0 ? `正在编辑 ${editingCount} 个文件` : null,
     failedEditCount > 0 ? `${failedEditCount} 个文件编辑失败` : null,
     commandCount > 0 ? `已运行 ${commandCount} 条命令` : null,
-    !hasActivity ? '正在连接 provider，等待工具事件…' : null,
+    showPhaseStatus ? phaseStatusText : null,
   ].filter(Boolean);
 
-  const showSpinner = turnIsActive || hasRunningTool || hasLiveTerminal;
+  const phaseIsActive = runtimePhase === 'running' || runtimePhase === 'output_completed' || runtimePhase === 'finalizing';
+  const showSpinner = phaseIsActive || turnIsActive || hasRunningTool || hasLiveTerminal;
   const detailToolCalls = displayToolCalls.filter((tool) => !actionableTools.includes(tool));
+  const commandActivity = runningCommand
+    ? activeToolInputLabel(runningCommand)
+    : commandLine
+      ? truncateActivityText(`${commandLine}${commandArgsSuffix(state.commandArgs)}`, 180)
+      : null;
+  const commandVerb = runningCommand || hasRunningTool || hasLiveTerminal || runtimePhase === 'running'
+    ? '正在运行'
+    : '已运行';
+  const editActivity = latestEdit
+    ? `${runningEdit ? '正在编辑' : '最近编辑'} ${activityPathBasename(latestEdit.path)}`
+    : null;
+  const thinkingLabel = runtimePhaseThinkingLabel(runtimePhase);
+  const guidanceLabel = actionableTools.length > 0 ? '需要你确认' : thinkingLabel;
+  const showTopSpinner = actionableTools.length === 0 && showSpinner;
+  const latestPlanNote = planNotes.length > 0 ? planNotes[planNotes.length - 1] : null;
+  const runtimeStartedAtMs = typeof options.runtimeStartedAtMs === 'number' && Number.isFinite(options.runtimeStartedAtMs)
+    ? options.runtimeStartedAtMs
+    : undefined;
+  const elapsedSnapshotMs = runtimeStartedAtMs
+    ? Math.max(0, Date.now() - runtimeStartedAtMs)
+    : options.runtimeElapsedMs;
+  const elapsedLabel = formatRuntimeElapsed(elapsedSnapshotMs);
+  const liveSummaryText = [
+    elapsedLabel,
+    summaryParts.join('  '),
+    latestPlanNote ? `计划 ${latestPlanNote}` : null,
+    commandActivity ? `${commandVerb} ${commandActivity}` : null,
+    editActivity,
+    latestTerminalLine ? `最新输出 ${latestTerminalLine}` : null,
+    terminalTail.length > 1 ? `实时输出\n${terminalTail.map((line) => `› ${line}`).join('\n')}` : null,
+    `${thinkingLabel}：${phaseStatusText}`,
+  ].filter(Boolean).join('\n');
 
   return (
     <div
       className="message-body live-execution-activity"
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 12,
-        color: 'var(--text-secondary)',
-      }}
     >
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          flexWrap: 'wrap',
-          lineHeight: 1.55,
-        }}
-      >
-        <span aria-hidden="true" style={{ color: 'var(--color-secondary)', fontWeight: 800 }}>✎</span>
-        <span className="thinking-dots" style={{ color: hasActivity ? 'var(--text-primary)' : 'var(--text-secondary)', fontWeight: 700 }}>
-          {summaryParts.join('  ')}
-        </span>
-        {(totalAdditions > 0 || totalDeletions > 0) && (
-          <span style={{ fontFamily: 'monospace', fontSize: 12 }}>
-            <span style={{ color: 'var(--color-success)' }}>+{totalAdditions.toLocaleString()}</span>{' '}
-            <span style={{ color: 'var(--color-error)' }}>-{totalDeletions.toLocaleString()}</span>
+      <div className="live-execution-card">
+        <div className="live-execution-topline">
+          <span className="live-execution-elapsed">
+            <RuntimeElapsedLabel
+              startedAtMs={runtimeStartedAtMs}
+              fallbackElapsedMs={options.runtimeElapsedMs}
+              active={showSpinner}
+            />
           </span>
-        )}
-        {showSpinner && <span className="spinner-small" aria-label="运行中" />}
-      </div>
-
-      {latestTerminalLine && (
-        <div
-          style={{
-            color: 'var(--text-secondary)',
-            fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
-            fontSize: 12,
-            paddingLeft: 23,
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-          }}
-          title={latestTerminalLine}
-        >
-          {latestTerminalLine}
-        </div>
-      )}
-
-      {latestEdit && (
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            minWidth: 0,
-            paddingLeft: 1,
-            lineHeight: 1.45,
-          }}
-        >
-          <span aria-hidden="true" style={{ color: 'var(--color-secondary)', fontWeight: 800 }}>✎</span>
-          <span style={{ color: 'var(--text-secondary)' }}>{runningEdit ? '正在编辑' : '最近编辑'}</span>
-          <span
-            style={{
-              minWidth: 0,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              color: 'var(--color-primary)',
-              fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
-              fontSize: 12,
-            }}
-            title={latestEdit.path}
+          <button
+            type="button"
+            className="live-execution-copy"
+            title="复制当前执行摘要"
+            aria-label="复制当前执行摘要"
+            onClick={() => writeClipboardText(liveSummaryText)}
           >
-            {activityPathBasename(latestEdit.path)}
-          </span>
-          {(latestEdit.additions > 0 || latestEdit.deletions > 0) && (
-            <span style={{ flex: '0 0 auto', fontFamily: 'monospace', fontSize: 12 }}>
-              <span style={{ color: 'var(--color-success)' }}>+{latestEdit.additions}</span>{' '}
-              <span style={{ color: 'var(--color-error)' }}>-{latestEdit.deletions}</span>
+            <Copy size={14} />
+          </button>
+        </div>
+
+        <div className="live-execution-divider" />
+
+        <div className="live-execution-section-label live-execution-thinking-label">
+          {guidanceLabel}
+          {showTopSpinner && <span className="spinner-small" aria-label="运行中" />}
+        </div>
+
+        {latestPlanNote && (
+          <div className="live-execution-stream-row" title={latestPlanNote}>
+            <span className="live-execution-stream-icon live-execution-output-icon" aria-hidden="true">•</span>
+            <span className="live-execution-stream-text">
+              <span className="live-execution-verb">计划</span>{' '}
+              {truncateActivityText(latestPlanNote, 220)}
+            </span>
+          </div>
+        )}
+
+        {commandActivity && (
+          <div className="live-execution-stream-row" title={commandActivity}>
+            <Terminal size={15} className="live-execution-stream-icon" />
+            <span className="live-execution-stream-text">
+              <span className="live-execution-verb">{commandVerb}</span>{' '}
+              {commandActivity}
+            </span>
+          </div>
+        )}
+
+        {latestEdit && (
+          <div className="live-execution-stream-row" title={latestEdit.path}>
+            <span className="live-execution-stream-icon live-execution-edit-icon" aria-hidden="true">✎</span>
+            <span className="live-execution-stream-text">
+              <span className="live-execution-verb">{runningEdit ? '正在编辑' : '最近编辑'}</span>{' '}
+              {activityPathBasename(latestEdit.path)}
+              {(latestEdit.additions > 0 || latestEdit.deletions > 0) && (
+                <span className="live-execution-diffstat">
+                  {' '}
+                  <span className="diff-add">+{latestEdit.additions}</span>{' '}
+                  <span className="diff-del">-{latestEdit.deletions}</span>
+                </span>
+              )}
+            </span>
+          </div>
+        )}
+
+        {terminalTail.length > 0 && (
+          <div className="live-execution-terminal-tail" aria-label="实时终端输出">
+            {terminalTail.map((line, index) => (
+              <div className="live-execution-terminal-line" title={line} key={`${index}:${line}`}>
+                <span className="live-execution-stream-icon live-execution-output-icon" aria-hidden="true">›</span>
+                <code>{line}</code>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!latestPlanNote && !commandActivity && !latestEdit && !latestTerminalLine && (
+          <div className="live-execution-stream-row">
+            <span className="live-execution-stream-icon live-execution-output-icon" aria-hidden="true">•</span>
+            <span className="live-execution-stream-text">{phaseStatusText}</span>
+          </div>
+        )}
+
+        <div className="live-execution-thinking-text">
+          {summaryParts.length > 0 ? summaryParts.join('  ') : phaseStatusText}
+          {(totalAdditions > 0 || totalDeletions > 0) && (
+            <span className="live-execution-total-diffstat">
+              {' '}
+              <span className="diff-add">+{totalAdditions.toLocaleString()}</span>{' '}
+              <span className="diff-del">-{totalDeletions.toLocaleString()}</span>
             </span>
           )}
         </div>
-      )}
-
-      {!latestEdit && runningCommand && (
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            minWidth: 0,
-            paddingLeft: 1,
-            lineHeight: 1.45,
-          }}
-        >
-          <span aria-hidden="true" style={{ color: 'var(--color-secondary)', fontWeight: 800 }}>⌁</span>
-          <span style={{ color: 'var(--text-secondary)' }}>正在运行</span>
-          <span
-            style={{
-              minWidth: 0,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              color: 'var(--color-primary)',
-              fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
-              fontSize: 12,
-            }}
-            title={formatToolData(runningCommand.input) || runningCommand.name}
-          >
-            {activeToolInputLabel(runningCommand)}
-          </span>
-        </div>
-      )}
+      </div>
 
       {actionableTools.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingLeft: 23 }}>
@@ -1892,68 +2777,12 @@ export function renderTurnEvents(
     return null;
   }
 
-  const visibleEditSummaries = editSummaries.slice(0, 4);
-  const hiddenEditCount = Math.max(0, editSummaries.length - visibleEditSummaries.length);
   const executionItemCount = Math.max(0, displayToolCalls.length - state.editTools.length + editSummaries.length);
   const summaryParts = [
     editCount > 0 ? `已编辑 ${editCount} 个文件` : null,
     commandCount > 0 ? `已运行 ${commandCount} 条命令` : null,
   ].filter(Boolean);
   const summaryTitle = summaryParts.length > 0 ? summaryParts.join(' · ') : '执行详情与日志';
-  const renderEditSummaryRow = (item: EditSummary) => (
-    <div
-      key={item.id}
-      style={{
-        display: 'grid',
-        gridTemplateColumns: 'auto minmax(0, 1fr) auto auto',
-        gap: 8,
-        alignItems: 'center',
-        color: 'var(--text-secondary)',
-        padding: '2px 2px',
-        minWidth: 0,
-        lineHeight: 1.45,
-      }}
-    >
-      <span
-        style={{
-          color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-secondary)',
-          fontWeight: 700,
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {editSummaryVerb(item)}
-      </span>
-      <span
-        style={{
-          minWidth: 0,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-          color: 'var(--color-primary)',
-          fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
-          fontSize: 11,
-        }}
-        title={item.path}
-      >
-        {activityPathBasename(item.path)}
-      </span>
-      <span style={{ fontFamily: 'monospace', fontSize: 11, whiteSpace: 'nowrap' }}>
-        <span style={{ color: 'var(--color-success)' }}>+{item.additions}</span>{' '}
-        <span style={{ color: 'var(--color-error)' }}>-{item.deletions}</span>
-      </span>
-      <span
-        aria-hidden="true"
-        style={{
-          color: item.status === 'failed' ? 'var(--color-error)' : 'var(--text-muted)',
-          fontSize: 13,
-          lineHeight: 1,
-          opacity: 0.8,
-        }}
-      >
-        {editSummaryIndicator(item)}
-      </span>
-    </div>
-  );
 
   return (
     <div
@@ -2010,27 +2839,7 @@ export function renderTurnEvents(
       </div>
 
       {editSummaries.length > 0 && (
-        <div style={{ padding: '7px 12px 9px', display: 'flex', flexDirection: 'column', gap: 4 }}>
-          {visibleEditSummaries.map(renderEditSummaryRow)}
-          {hiddenEditCount > 0 && (
-            <details style={{ marginTop: 2 }}>
-              <summary
-                style={{
-                  color: 'var(--text-muted)',
-                  fontSize: 11,
-                  padding: '3px 2px',
-                  cursor: 'pointer',
-                  userSelect: 'none',
-                }}
-              >
-                再显示 {hiddenEditCount} 个文件
-              </summary>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 4 }}>
-                {editSummaries.slice(4).map(renderEditSummaryRow)}
-              </div>
-            </details>
-          )}
-        </div>
+        <EditSummaryList editSummaries={editSummaries} />
       )}
 
       {actionableTools.length > 0 && (

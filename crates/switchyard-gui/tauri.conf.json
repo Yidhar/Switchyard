@@ -11,11 +11,12 @@
   "app": {
     "windows": [
       {
-        "title": "Switchyard Orchestrator Workspace",
+        "title": "Switchyard",
         "width": 1100,
         "height": 750,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "decorations": false
       }
     ],
     "security": {

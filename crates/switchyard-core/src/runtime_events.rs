@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "event", content = "data")]
 pub enum RuntimeEvent {
     /// Unread callback receipts were injected into the next routed provider-facing turn.
-    CallbackReceiptsInjected { provider: String, count: usize },
+    CallbackReceiptsInjected {
+        session_id: Uuid,
+        provider: String,
+        count: usize,
+    },
     /// GUI/backend pre-flight work started before the canonical turn exists.
     /// This covers slow steps such as persistent CLI warm-start/resume and peer
     /// catalog probing, so frontends can show progress instead of waiting for
@@ -23,15 +27,21 @@ pub enum RuntimeEvent {
         phase: String,
     },
     /// Core provider turn started.
-    CoreTurnStarted { turn_id: Uuid, provider: String },
+    CoreTurnStarted {
+        session_id: Uuid,
+        turn_id: Uuid,
+        provider: String,
+    },
     /// Core provider execution command resolved.
     CoreExecutionTelemetry {
+        session_id: Uuid,
         turn_id: Uuid,
         provider: String,
         execution: ExecutionTelemetry,
     },
     /// Core provider emitted a streaming item (text chunk, JSON event, etc.).
     CoreItemUpdated {
+        session_id: Uuid,
         turn_id: Uuid,
         provider: String,
         /// Canonical provider event type, e.g. `item_started`, `item_updated`,
@@ -44,6 +54,7 @@ pub enum RuntimeEvent {
     },
     /// Raw terminal line mirrored from the core provider subprocess transport.
     CoreTerminalOutput {
+        session_id: Uuid,
         turn_id: Uuid,
         provider: String,
         text: String,
@@ -51,21 +62,28 @@ pub enum RuntimeEvent {
     },
     /// Router detected a delegate request from the core's response.
     DelegateRequested {
+        session_id: Uuid,
         core_turn_id: Uuid,
         peer: String,
         role: String,
         task_summary: String,
     },
     /// Peer provider turn started.
-    PeerTurnStarted { turn_id: Uuid, provider: String },
+    PeerTurnStarted {
+        session_id: Uuid,
+        turn_id: Uuid,
+        provider: String,
+    },
     /// Peer provider execution command resolved.
     PeerExecutionTelemetry {
+        session_id: Uuid,
         turn_id: Uuid,
         provider: String,
         execution: ExecutionTelemetry,
     },
     /// Peer provider emitted a streaming item.
     PeerItemUpdated {
+        session_id: Uuid,
         turn_id: Uuid,
         provider: String,
         /// Canonical provider event type, e.g. `item_started`, `item_updated`,
@@ -76,6 +94,7 @@ pub enum RuntimeEvent {
     },
     /// Raw terminal line mirrored from the peer provider subprocess transport.
     PeerTerminalOutput {
+        session_id: Uuid,
         turn_id: Uuid,
         provider: String,
         text: String,
@@ -83,6 +102,7 @@ pub enum RuntimeEvent {
     },
     /// Delegate completed (success or failure).
     DelegateCompleted {
+        session_id: Uuid,
         core_turn_id: Uuid,
         peer: String,
         status: String,
@@ -90,25 +110,40 @@ pub enum RuntimeEvent {
     },
     /// A HYARD bridge command surfaced a job snapshot (delegate/status/result/await/cancel).
     HyardJobObserved {
+        session_id: Uuid,
         turn_id: Uuid,
         source_provider: String,
         observed_at: String,
         job: HyardJobObservation,
     },
     /// Core provider output is complete (CLI exited). Finalize/archive still pending.
-    CoreOutputCompleted { turn_id: Uuid, provider: String },
+    CoreOutputCompleted {
+        session_id: Uuid,
+        turn_id: Uuid,
+        provider: String,
+    },
     /// Peer provider output is complete. Orchestrator finalize still pending.
-    PeerOutputCompleted { turn_id: Uuid, provider: String },
+    PeerOutputCompleted {
+        session_id: Uuid,
+        turn_id: Uuid,
+        provider: String,
+    },
     /// Core finalization turn started (after delegate result injected).
-    FinalizationStarted { turn_id: Uuid, provider: String },
+    FinalizationStarted {
+        session_id: Uuid,
+        turn_id: Uuid,
+        provider: String,
+    },
     /// Turn completed successfully.
     TurnCompleted {
+        session_id: Uuid,
         turn_id: Uuid,
         provider: String,
         response: Option<String>,
     },
     /// Turn failed.
     TurnFailed {
+        session_id: Uuid,
         turn_id: Uuid,
         provider: String,
         error: String,

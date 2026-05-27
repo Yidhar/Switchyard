@@ -1,7 +1,16 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { ChevronRight, ChevronDown, AlertCircle } from 'lucide-react';
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  FolderPlus,
+  MoreHorizontal,
+  RefreshCw,
+} from 'lucide-react';
+import type { Workspace } from '../types';
 import { iconForFile, iconForFolder } from './fileIcons';
+import { ContextMenu, type ContextMenuItem } from './ui/ContextMenu';
 
 /// Mirrors `DirEntryView` from switchyard-gui/src/main.rs.
 interface DirEntry {
@@ -9,6 +18,12 @@ interface DirEntry {
   path: string;
   is_dir: boolean;
   size: number;
+}
+
+interface TreeNode extends DirEntry {
+  isRoot?: boolean;
+  isExtraRoot?: boolean;
+  rootPath?: string;
 }
 
 /// Subset of `git::GitStatus` we care about for tree decoration —
@@ -56,63 +71,66 @@ interface Decoration {
 }
 
 interface FilesTreeProps {
-  /// Used as a React key so switching workspace fully resets the tree
-  /// state (cached children, expanded folders, errors). Without this
-  /// stale entries from the previous project bleed into the new view.
-  workspaceId: string | null;
+  /// Active workspace. The Explorer renders root nodes explicitly so
+  /// multi-root workspaces look like VS Code: primary root first, then
+  /// extra roots below it.
+  workspace: Workspace | null;
   /// Bumped by App.tsx on `TurnCompleted` and explicit git operations
   /// so the tree re-fetches `git_status` and updates its decorations.
   /// Reused from the same nonce that drives `SourceControl`.
   gitRefreshNonce: number;
   onOpenFile: (path: string) => void;
+  onAddFolder: () => void;
+  onRemoveExtraRoot: (root: string) => void;
 }
 
-/// Top-level: loads the workspace's primary_root and renders each
-/// entry. The tree itself is fully recursive — each folder node
-/// maintains its own expanded / cached-children state, so expanding a
-/// folder deep in the tree doesn't re-fetch the whole hierarchy.
+/// Top-level Explorer. Unlike the first version, it renders synthetic
+/// root nodes instead of only showing the primary root's children, which
+/// makes workspace scope explicit and allows additional project folders.
 export const FilesTree: React.FC<FilesTreeProps> = ({
-  workspaceId,
+  workspace,
   gitRefreshNonce,
   onOpenFile,
+  onAddFolder,
+  onRemoveExtraRoot,
 }) => {
-  const [roots, setRoots] = useState<DirEntry[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
+  const [treeRefreshNonce, setTreeRefreshNonce] = useState(0);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    items: ContextMenuItem[];
+  } | null>(null);
 
-  // Load directory listing whenever the workspace changes. Cancel
-  // any in-flight request via a "cancelled" flag so we don't write
-  // stale results into state.
-  useEffect(() => {
-    if (!workspaceId) return;
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    invoke<DirEntry[]>('list_dir', { path: null })
-      .then((list) => {
-        if (cancelled) return;
-        setRoots(list);
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setError(String(e));
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [workspaceId]);
+  const roots = useMemo<TreeNode[]>(() => {
+    if (!workspace) return [];
+    return [
+      {
+        name: leafName(workspace.primary_root) || workspace.name || workspace.primary_root,
+        path: '',
+        is_dir: true,
+        size: 0,
+        isRoot: true,
+        rootPath: workspace.primary_root,
+      },
+      ...workspace.extra_roots.map((root) => ({
+        name: leafName(root) || root,
+        path: root,
+        is_dir: true,
+        size: 0,
+        isRoot: true,
+        isExtraRoot: true,
+        rootPath: root,
+      })),
+    ];
+  }, [workspace]);
 
   // Re-fetch git status when the workspace switches OR an external
   // refresh trigger fires (typically TurnCompleted). The repo-check
   // before `git_status` keeps the call cheap when the workspace
   // isn't a git repo.
   useEffect(() => {
-    if (!workspaceId) {
+    if (!workspace) {
       setGitStatus(null);
       return;
     }
@@ -136,86 +154,213 @@ export const FilesTree: React.FC<FilesTreeProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, gitRefreshNonce]);
+  }, [workspace?.workspace_id, gitRefreshNonce]);
 
   /// Pre-compute a path → decoration map keyed by workspace-relative
-  /// path (which is what each `DirEntry.path` carries). Building it
-  /// once per render saves re-walking on every node.
+  /// path (which is what primary-root `DirEntry.path` carries). Extra
+  /// roots may come back as absolute paths; those still get ignored-dir
+  /// dimming even if git porcelain decorations are primary-root only.
   const decorations = useMemo(
     () => buildDecorations(gitStatus),
     [gitStatus],
   );
 
-  if (loading) {
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      prompt('Copy this value', text);
+    }
+  };
+
+  const refreshTree = () => {
+    setTreeRefreshNonce((value) => value + 1);
+  };
+
+  const showContextMenu = (
+    event: React.MouseEvent,
+    items: ContextMenuItem[],
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ x: event.clientX, y: event.clientY, items });
+  };
+
+  const handleBackgroundContextMenu = (event: React.MouseEvent) => {
+    showContextMenu(event, [
+      {
+        id: 'add-folder',
+        label: workspace ? 'Add Folder to Workspace…' : 'Open Folder…',
+        onSelect: onAddFolder,
+      },
+      { id: 'refresh', label: 'Refresh Explorer', onSelect: refreshTree },
+    ]);
+  };
+
+  if (!workspace) {
     return (
-      <div style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>
-        Loading files…
-      </div>
-    );
-  }
-  if (error) {
-    return (
-      <div
-        style={{
-          padding: 16,
-          color: 'var(--color-error, #ef4444)',
-          fontSize: 12,
-          display: 'flex',
-          gap: 8,
-          alignItems: 'flex-start',
-        }}
-      >
-        <AlertCircle size={14} />
-        <span style={{ whiteSpace: 'pre-wrap' }}>{error}</span>
-      </div>
-    );
-  }
-  if (roots.length === 0) {
-    return (
-      <div style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>
-        Empty workspace.
+      <div className="files-tree files-tree-empty">
+        <div className="files-tree-header">
+          <span>EXPLORER</span>
+        </div>
+        <div className="files-tree-empty-body">
+          <AlertCircle size={18} />
+          <div>No workspace opened.</div>
+          <button type="button" onClick={onAddFolder}>
+            <FolderPlus size={14} />
+            Open Folder…
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div
-      className="files-tree"
-      style={{
-        padding: '8px 0',
-        overflow: 'auto',
-        flex: 1,
-        minHeight: 0,
-        fontSize: 13,
-      }}
-    >
-      {roots.map((node) => (
-        <FilesTreeNode
-          key={node.path}
-          node={node}
-          depth={0}
-          onOpenFile={onOpenFile}
-          decorations={decorations}
+    <div className="files-tree" onContextMenu={handleBackgroundContextMenu}>
+      <div className="files-tree-header">
+        <div className="files-tree-title-block">
+          <span>EXPLORER</span>
+          <small>
+            {roots.length === 1 ? '1 folder' : `${roots.length} folders`}
+          </small>
+        </div>
+        <div className="files-tree-header-actions">
+          <button
+            type="button"
+            title="Add Folder to Workspace"
+            onClick={onAddFolder}
+          >
+            <FolderPlus size={13} />
+          </button>
+          <button type="button" title="Refresh Explorer" onClick={refreshTree}>
+            <RefreshCw size={13} />
+          </button>
+          <button
+            type="button"
+            title="Explorer Actions"
+            onClick={(event) =>
+              showContextMenu(event, [
+                {
+                  id: 'add-folder',
+                  label: 'Add Folder to Workspace…',
+                  onSelect: onAddFolder,
+                },
+                { id: 'refresh', label: 'Refresh Explorer', onSelect: refreshTree },
+              ])
+            }
+          >
+            <MoreHorizontal size={13} />
+          </button>
+        </div>
+      </div>
+
+      <div className="files-tree-body">
+        {roots.map((node) => (
+          <FilesTreeNode
+            key={`${node.rootPath ?? node.path}-${treeRefreshNonce}`}
+            node={node}
+            depth={0}
+            workspace={workspace}
+            onOpenFile={onOpenFile}
+            onAddFolder={onAddFolder}
+            onRemoveExtraRoot={onRemoveExtraRoot}
+            decorations={decorations}
+            copyText={copyText}
+            showContextMenu={showContextMenu}
+          />
+        ))}
+      </div>
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          items={contextMenu.items}
+          onClose={() => setContextMenu(null)}
         />
-      ))}
+      )}
     </div>
   );
 };
 
 /// Recursive node. Files are leaves (click → open); folders lazy-load
-/// children on first expand. We deliberately don't pre-filter
-/// `node_modules` / `target` etc. — the user's `list_dir` is the
-/// authoritative view; we just dim them via the `ignored` decoration.
+/// children on first expand. Root nodes are folders too, but their label is
+/// the actual workspace folder and they start expanded like VS Code.
 const FilesTreeNode: React.FC<{
-  node: DirEntry;
+  node: TreeNode;
   depth: number;
+  workspace: Workspace;
   onOpenFile: (path: string) => void;
+  onAddFolder: () => void;
+  onRemoveExtraRoot: (root: string) => void;
   decorations: Map<string, Decoration>;
-}> = ({ node, depth, onOpenFile, decorations }) => {
-  const [expanded, setExpanded] = useState(false);
-  const [children, setChildren] = useState<DirEntry[] | null>(null);
+  copyText: (text: string) => Promise<void>;
+  showContextMenu: (event: React.MouseEvent, items: ContextMenuItem[]) => void;
+}> = ({
+  node,
+  depth,
+  workspace,
+  onOpenFile,
+  onAddFolder,
+  onRemoveExtraRoot,
+  decorations,
+  copyText,
+  showContextMenu,
+}) => {
+  const [expanded, setExpanded] = useState(Boolean(node.isRoot));
+  const [children, setChildren] = useState<TreeNode[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const loadChildren = async (force = false) => {
+    if (!node.is_dir) return;
+    if (!force && children !== null) return;
+    setLoading(true);
+    try {
+      const list = await invoke<DirEntry[]>('list_dir', { path: node.path });
+      setChildren(
+        list.map((entry) => ({
+          ...entry,
+          rootPath: node.rootPath,
+          isExtraRoot: node.isExtraRoot,
+        })),
+      );
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!node.isRoot) return;
+    let cancelled = false;
+    setLoading(true);
+    invoke<DirEntry[]>('list_dir', { path: node.path })
+      .then((list) => {
+        if (cancelled) return;
+        setChildren(
+          list.map((entry) => ({
+            ...entry,
+            rootPath: node.rootPath,
+            isExtraRoot: node.isExtraRoot,
+          })),
+        );
+        setError(null);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(String(e));
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [node.path, node.rootPath, node.isRoot, node.isExtraRoot]);
 
   const onActivate = async () => {
     if (!node.is_dir) {
@@ -227,26 +372,30 @@ const FilesTreeNode: React.FC<{
       return;
     }
     setExpanded(true);
-    // Lazy-load children on first expand only. Re-expand reuses the
-    // cached `children` list — refresh requires collapsing then a
-    // future "Reload" affordance (not in v1).
-    if (children === null) {
-      setLoading(true);
-      try {
-        const list = await invoke<DirEntry[]>('list_dir', { path: node.path });
-        setChildren(list);
-        setError(null);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setLoading(false);
-      }
-    }
+    await loadChildren(false);
   };
 
-  const indent = depth * 14 + 10;
-  const decoration = decorationFor(node.path, decorations);
+  const expandNode = async () => {
+    if (!node.is_dir) return;
+    setExpanded(true);
+    await loadChildren(false);
+  };
+
+  const collapseNode = () => {
+    if (node.is_dir) setExpanded(false);
+  };
+
+  const refreshNode = async () => {
+    if (!node.is_dir) return;
+    setExpanded(true);
+    await loadChildren(true);
+  };
+
+  const absolutePath = absoluteNodePath(node, workspace);
+  const relativePath = relativeNodePath(node, workspace);
+  const decoration = decorationFor(node.path || relativePath, decorations);
   const statusColor = colorForStatus(decoration.status);
+  const indent = node.isRoot ? 10 : depth * 14 + 10;
 
   // The row text color: status color wins, otherwise dimmed for
   // ignored, otherwise default primary/secondary.
@@ -256,50 +405,84 @@ const FilesTreeNode: React.FC<{
       (node.is_dir ? 'var(--text-secondary)' : 'var(--text-primary)');
   const nameOpacity = decoration.ignored ? 0.55 : 1;
 
+  const contextItems: ContextMenuItem[] = node.is_dir
+    ? [
+        {
+          id: 'expand-collapse',
+          label: expanded ? 'Collapse' : 'Expand',
+          onSelect: expanded ? collapseNode : expandNode,
+        },
+        { id: 'refresh', label: 'Refresh', onSelect: refreshNode },
+        { id: 'sep-open', separator: true },
+        {
+          id: 'copy-path',
+          label: 'Copy Path',
+          onSelect: () => copyText(absolutePath),
+        },
+        {
+          id: 'copy-relative-path',
+          label: 'Copy Relative Path',
+          onSelect: () => copyText(relativePath),
+        },
+        { id: 'sep-workspace', separator: true },
+        {
+          id: 'add-folder',
+          label: 'Add Folder to Workspace…',
+          onSelect: onAddFolder,
+        },
+        ...(node.isExtraRoot && node.rootPath
+          ? [
+              {
+                id: 'remove-root',
+                label: 'Remove Folder from Workspace',
+                danger: true,
+                onSelect: () => onRemoveExtraRoot(node.rootPath ?? ''),
+              } satisfies ContextMenuItem,
+            ]
+          : []),
+      ]
+    : [
+        { id: 'open', label: 'Open', onSelect: () => onOpenFile(node.path) },
+        { id: 'sep-open', separator: true },
+        {
+          id: 'copy-path',
+          label: 'Copy Path',
+          onSelect: () => copyText(absolutePath),
+        },
+        {
+          id: 'copy-relative-path',
+          label: 'Copy Relative Path',
+          onSelect: () => copyText(relativePath),
+        },
+      ];
+
   return (
     <>
       <button
         type="button"
+        className={`files-tree-row ${node.isRoot ? 'is-root' : ''}`}
         onClick={onActivate}
-        title={node.path}
+        onContextMenu={(event) => showContextMenu(event, contextItems)}
+        title={node.isRoot ? `${node.name}\n${node.rootPath}` : absolutePath}
         style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-          width: '100%',
-          background: 'transparent',
-          border: 'none',
-          color: nameColor,
-          cursor: 'pointer',
           paddingLeft: indent,
-          paddingRight: 8,
-          paddingTop: 3,
-          paddingBottom: 3,
-          textAlign: 'left',
-          fontSize: 13,
-          minHeight: 22,
+          color: nameColor,
           opacity: nameOpacity,
         }}
-        onMouseEnter={(e) =>
-          (e.currentTarget.style.background = 'rgba(255, 255, 255, 0.03)')
-        }
-        onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
       >
         {node.is_dir ? (
           <>
             {expanded ? (
-              <ChevronDown size={12} style={{ flexShrink: 0, opacity: 0.7 }} />
+              <ChevronDown size={12} className="files-tree-chevron" />
             ) : (
-              <ChevronRight size={12} style={{ flexShrink: 0, opacity: 0.7 }} />
+              <ChevronRight size={12} className="files-tree-chevron" />
             )}
-            {/* Folder glyph + per-name tint (src=blue, crates=rust-orange,
-                docs=md-blue, etc.) — matches VS Code's Material Icon
-                Theme's well-known-folder cues. */}
             {(() => {
               const { icon, color } = iconForFolder(node.name, expanded);
               return (
                 <span
-                  style={{ color, display: 'inline-flex', flexShrink: 0 }}
+                  className="files-tree-icon"
+                  style={{ color }}
                   aria-hidden
                 >
                   {icon}
@@ -309,13 +492,13 @@ const FilesTreeNode: React.FC<{
           </>
         ) : (
           <>
-            {/* Spacer matching the chevron column so files align with folder labels. */}
-            <span style={{ width: 12, flexShrink: 0 }} />
+            <span className="files-tree-chevron" />
             {(() => {
               const { icon, color } = iconForFile(node.name);
               return (
                 <span
-                  style={{ color, display: 'inline-flex', flexShrink: 0 }}
+                  className="files-tree-icon"
+                  style={{ color }}
                   aria-hidden
                 >
                   {icon}
@@ -324,16 +507,11 @@ const FilesTreeNode: React.FC<{
             })()}
           </>
         )}
-        <span
-          style={{
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            flex: 1,
-            minWidth: 0,
-          }}
-        >
+        <span className="files-tree-name">
           {node.name}
+          {node.isRoot && node.isExtraRoot && (
+            <em className="files-tree-root-tag">extra</em>
+          )}
         </span>
 
         {/* Right-side status indicator.
@@ -345,13 +523,8 @@ const FilesTreeNode: React.FC<{
           <>
             {!node.is_dir && decoration.status && (
               <span
-                style={{
-                  color: statusColor ?? 'var(--text-muted)',
-                  fontSize: 11,
-                  fontWeight: 600,
-                  marginLeft: 4,
-                  flexShrink: 0,
-                }}
+                className="files-tree-status-badge"
+                style={{ color: statusColor ?? 'var(--text-muted)' }}
                 title={statusLabel(decoration.status)}
               >
                 {statusBadge(decoration.status)}
@@ -361,14 +534,8 @@ const FilesTreeNode: React.FC<{
               <span
                 aria-label="Folder contains changes"
                 title="Folder contains changes"
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: '50%',
-                  background: statusColor ?? '#e2c08d',
-                  marginLeft: 4,
-                  flexShrink: 0,
-                }}
+                className="files-tree-status-dot"
+                style={{ background: statusColor ?? '#e2c08d' }}
               />
             )}
           </>
@@ -379,49 +546,38 @@ const FilesTreeNode: React.FC<{
         <>
           {loading && (
             <div
-              style={{
-                paddingLeft: indent + 32,
-                color: 'var(--text-muted)',
-                fontSize: 11,
-                paddingTop: 2,
-                paddingBottom: 2,
-              }}
+              className="files-tree-inline-state"
+              style={{ paddingLeft: indent + 32 }}
             >
               Loading…
             </div>
           )}
           {error && (
             <div
-              style={{
-                paddingLeft: indent + 32,
-                color: 'var(--color-error, #ef4444)',
-                fontSize: 11,
-                paddingTop: 2,
-                paddingBottom: 2,
-              }}
+              className="files-tree-inline-state is-error"
+              style={{ paddingLeft: indent + 32 }}
             >
               {error}
             </div>
           )}
           {children?.map((child) => (
             <FilesTreeNode
-              key={child.path}
+              key={`${child.rootPath ?? ''}:${child.path}`}
               node={child}
               depth={depth + 1}
+              workspace={workspace}
               onOpenFile={onOpenFile}
+              onAddFolder={onAddFolder}
+              onRemoveExtraRoot={onRemoveExtraRoot}
               decorations={decorations}
+              copyText={copyText}
+              showContextMenu={showContextMenu}
             />
           ))}
           {children?.length === 0 && (
             <div
-              style={{
-                paddingLeft: indent + 32,
-                color: 'var(--text-muted)',
-                fontSize: 11,
-                fontStyle: 'italic',
-                paddingTop: 2,
-                paddingBottom: 2,
-              }}
+              className="files-tree-inline-state is-empty"
+              style={{ paddingLeft: indent + 32 }}
             >
               (empty)
             </div>
@@ -437,6 +593,54 @@ const EMPTY_DECORATION: Decoration = {
   ignored: false,
   hasDescendantChanges: false,
 };
+
+// ---------- Path helpers ----------
+
+function leafName(path: string): string {
+  if (!path) return '';
+  const normalised = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  const idx = normalised.lastIndexOf('/');
+  return idx >= 0 ? normalised.slice(idx + 1) : normalised;
+}
+
+function stripTrailingSeparator(path: string): string {
+  return path.replace(/[\\/]+$/, '');
+}
+
+function isAbsoluteLike(path: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('/') || path.startsWith('\\\\');
+}
+
+function joinFsPath(root: string, child: string): string {
+  if (!child) return root;
+  const separator = root.includes('\\') ? '\\' : '/';
+  return `${stripTrailingSeparator(root)}${separator}${child.replace(/^[\\/]+/, '')}`;
+}
+
+function rootCandidates(workspace: Workspace): string[] {
+  return [workspace.primary_root, ...workspace.extra_roots];
+}
+
+function absoluteNodePath(node: TreeNode, workspace: Workspace): string {
+  if (node.isRoot) return node.rootPath ?? node.path;
+  if (isAbsoluteLike(node.path)) return node.path;
+  const root = node.rootPath || workspace.primary_root;
+  return joinFsPath(root, node.path);
+}
+
+function relativeNodePath(node: TreeNode, workspace: Workspace): string {
+  if (node.isRoot) return '.';
+  if (!isAbsoluteLike(node.path)) return normalisePath(node.path) || '.';
+  const nodePath = normalisePath(stripTrailingSeparator(node.path)).toLowerCase();
+  for (const root of rootCandidates(workspace)) {
+    const rootPath = normalisePath(stripTrailingSeparator(root)).toLowerCase();
+    if (nodePath === rootPath) return '.';
+    if (nodePath.startsWith(`${rootPath}/`)) {
+      return normalisePath(node.path).slice(rootPath.length + 1) || '.';
+    }
+  }
+  return normalisePath(node.path);
+}
 
 // ---------- Decoration computation ----------
 
@@ -553,14 +757,10 @@ function isIgnoredPath(path: string): boolean {
 /// slashes and strip a leading `./` if present. Porcelain output uses
 /// `/` even on Windows, but the workspace-relative `DirEntry.path`
 /// values from `list_dir` use the OS-native separator on Windows.
-function normalisePath(p: string): string {
-  return p.replace(/\\/g, '/').replace(/^\.\//, '');
+function normalisePath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '');
 }
 
-/// Patched lookup that injects the "ignored" flag based on the
-/// heuristic. Called via the decorations map's getter — well, actually
-/// the lookup at the call site does this in a separate ternary; we
-/// keep the helper here for tests if we add them later.
 export function decorationFor(
   path: string,
   decorations: Map<string, Decoration>,
@@ -572,9 +772,6 @@ export function decorationFor(
     ignored: base.ignored || isIgnoredPath(norm),
   };
 }
-
-// Patch the map's `.get` semantics by replacing the lookup at the
-// node call site. (Done above — the node manually merges ignored.)
 
 // ---------- Status visuals ----------
 

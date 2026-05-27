@@ -67,3 +67,4 @@ tokio-util = "0.7"
 portable-pty = "0.8"
 vte = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
+base64 = "0.22"

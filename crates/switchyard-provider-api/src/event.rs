@@ -251,14 +251,38 @@ fn extract_delta_text(value: &serde_json::Value, inherited_text_hint: bool) -> O
         })
 }
 
+fn normalize_runtime_token(value: &str, separator: char) -> String {
+    let mut out = String::new();
+    let mut prev_was_lower_or_digit = false;
+    let mut last_was_separator = false;
+
+    for ch in value.trim().chars() {
+        if ch.is_ascii_uppercase() && prev_was_lower_or_digit && !last_was_separator {
+            out.push(separator);
+        }
+
+        if ch == '.' || ch == '/' || ch == '-' || ch == '_' || ch.is_whitespace() {
+            if !out.is_empty() && !last_was_separator {
+                out.push(separator);
+                last_was_separator = true;
+            }
+            prev_was_lower_or_digit = false;
+            continue;
+        }
+
+        out.push(ch.to_ascii_lowercase());
+        last_was_separator = false;
+        prev_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+
+    while out.ends_with(separator) {
+        out.pop();
+    }
+    out
+}
+
 fn normalize_runtime_kind(value: &str) -> String {
-    value
-        .trim()
-        .replace(
-            |c: char| c == '/' || c == '_' || c == '-' || c.is_whitespace(),
-            ".",
-        )
-        .to_ascii_lowercase()
+    normalize_runtime_token(value, '.')
 }
 
 fn is_textish_delta_kind(kind: &str) -> bool {
@@ -313,13 +337,7 @@ fn allows_plain_display_text_field(
 }
 
 fn normalize_item_type_for_display(value: &str) -> String {
-    value
-        .trim()
-        .replace(
-            |c: char| c == '.' || c == '/' || c == '-' || c.is_whitespace(),
-            "_",
-        )
-        .to_ascii_lowercase()
+    normalize_runtime_token(value, '_')
 }
 
 fn item_type_from_loose_display_value(value: Option<&serde_json::Value>) -> Option<String> {
@@ -364,6 +382,11 @@ fn is_non_assistant_display_item(item_type: &str) -> bool {
             | "function_call"
             | "custom_tool_call"
             | "mcp_tool_call"
+            | "dynamic_tool_call"
+            | "collab_agent_tool_call"
+            | "web_search"
+            | "image_view"
+            | "image_generation"
             | "local_shell_call"
             | "tool_result"
             | "tool_response"
@@ -375,6 +398,13 @@ fn is_non_assistant_display_item(item_type: &str) -> bool {
             | "file_change"
             | "diff_ready"
             | "todo_list"
+            | "plan"
+            | "hook"
+            | "runtime_status"
+            | "auto_approval_review"
+            | "terminal_interaction"
+            | "mcp_tool_call_progress"
+            | "raw_response_item"
             | "delegate_request"
             | "delegate_result"
             | "approval_request"
@@ -387,6 +417,7 @@ fn is_non_assistant_display_item(item_type: &str) -> bool {
             | "shell_output_delta"
             | "stdout_delta"
             | "stderr_delta"
+            | "process_output_delta"
             | "file_change_delta"
             | "diff_delta"
             | "patch_delta"
@@ -580,7 +611,17 @@ fn json_has_visible_text(value: &serde_json::Value) -> bool {
 pub fn extract_hyard_job_observation(payload: &serde_json::Value) -> Option<HyardJobObservation> {
     let payload = normalized_event_body(payload);
     let item = payload.get("item")?;
-    if item.get("type").and_then(|t| t.as_str()) != Some("command_execution") {
+    let item_type = item
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(normalize_item_type_for_display)
+        .or_else(|| {
+            payload
+                .get("item_type")
+                .and_then(|t| t.as_str())
+                .map(normalize_item_type_for_display)
+        });
+    if item_type.as_deref() != Some("command_execution") {
         return None;
     }
 
@@ -594,6 +635,7 @@ pub fn extract_hyard_job_observation(payload: &serde_json::Value) -> Option<Hyar
 
     let aggregated_output = item
         .get("aggregated_output")
+        .or_else(|| item.get("aggregatedOutput"))
         .and_then(|o| o.as_str())
         .unwrap_or_default()
         .trim();
@@ -692,12 +734,13 @@ pub fn extract_activity_summary(payload: &serde_json::Value) -> Option<String> {
         .get("item")
         .and_then(|item| item.get("type"))
         .and_then(|t| t.as_str())
+        .map(normalize_item_type_for_display)
     {
         let item = payload.get("item").unwrap_or(payload);
         if item_type == "reasoning" {
             return None;
         }
-        if let Some(summary) = summarize_item_activity(item_type, item, payload) {
+        if let Some(summary) = summarize_item_activity(&item_type, item, payload) {
             return Some(summary);
         }
         return Some(
@@ -756,17 +799,23 @@ fn summarize_item_activity(
     };
 
     Some(match item_type {
-        "tool_call" | "tool_use" | "function_call" | "custom_tool_call" | "mcp_tool_call" => {
-            with_label("[工具] 正在调用工具")
-        }
-        "local_shell_call" => with_label("[命令] 正在调用本地 Shell"),
+        "tool_call"
+        | "tool_use"
+        | "function_call"
+        | "custom_tool_call"
+        | "mcp_tool_call"
+        | "dynamic_tool_call"
+        | "collab_agent_tool_call" => with_label("[工具] 正在调用工具"),
+        "web_search" => with_label("[搜索] 正在检索"),
+        "local_shell_call" | "command_execution" => with_label("[命令] 正在执行"),
         "tool_result"
         | "tool_response"
         | "function_call_output"
         | "custom_tool_call_output"
         | "mcp_tool_call_output" => with_label("[工具] 工具结果已返回"),
-        "local_shell_call_output" => with_label("[命令] 本地 Shell 输出已返回"),
-        "file_change" => "[文件] 正在修改".to_string(),
+        "local_shell_call_output" | "command_output_delta" => with_label("[命令] 输出已更新"),
+        "terminal_interaction" => with_label("[终端] 已发送交互输入"),
+        "file_change" | "file_change_delta" | "patch_delta" => "[文件] 正在修改".to_string(),
         "diff_ready" => "[Diff] 已生成差异".to_string(),
         "approval_request" => "[权限] 等待用户确认".to_string(),
         "approval_decision" => {
@@ -785,7 +834,19 @@ fn summarize_item_activity(
                 .unwrap_or("request");
             format!("[请求] Codex 已处理：{method}")
         }
-        "todo_list" => "[待办] 已更新".to_string(),
+        "todo_list" | "plan" => "[计划] 已更新".to_string(),
+        "hook" => with_label("[Hook] 正在执行"),
+        "runtime_status" => item
+            .get("summary")
+            .or_else(|| payload.get("summary"))
+            .and_then(|value| value.as_str())
+            .map(|summary| format!("[运行] {}", preview(summary, 80)))
+            .unwrap_or_else(|| "[运行] Codex 已开始执行".to_string()),
+        "auto_approval_review" => "[权限] 自动审查已更新".to_string(),
+        "mcp_tool_call_progress" => with_label("[MCP] 工具进度已更新"),
+        "raw_response_item" => "[响应] 原始项已完成".to_string(),
+        "image_view" => "[图片] 已查看".to_string(),
+        "image_generation" => "[图片] 正在生成".to_string(),
         "delegate_request" => "[委托] 已生成请求".to_string(),
         "delegate_result" => "[委托] 已返回结果".to_string(),
         "error" => item
@@ -808,8 +869,16 @@ fn item_activity_label(item: &serde_json::Value, payload: &serde_json::Value) ->
         payload.get("function"),
         item.get("command"),
         payload.get("command"),
+        item.get("aggregatedOutput"),
+        payload.get("aggregatedOutput"),
         item.get("cmd"),
         payload.get("cmd"),
+        item.get("eventName"),
+        payload.get("eventName"),
+        item.get("sourcePath"),
+        payload.get("sourcePath"),
+        item.get("message"),
+        payload.get("message"),
     ]
     .into_iter()
     .flatten()
@@ -870,7 +939,17 @@ fn preview_path_leaf(path: &str) -> String {
 fn extract_command_execution_summary(payload: &serde_json::Value) -> Option<String> {
     let payload = normalized_event_body(payload);
     let item = payload.get("item")?;
-    if item.get("type").and_then(|t| t.as_str()) != Some("command_execution") {
+    let item_type = item
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(normalize_item_type_for_display)
+        .or_else(|| {
+            payload
+                .get("item_type")
+                .and_then(|t| t.as_str())
+                .map(normalize_item_type_for_display)
+        });
+    if item_type.as_deref() != Some("command_execution") {
         return None;
     }
 
@@ -888,9 +967,13 @@ fn extract_command_execution_summary(payload: &serde_json::Value) -> Option<Stri
                 .and_then(|t| (t == "item.started").then_some("in_progress"))
         })
         .unwrap_or("unknown");
-    let exit_code = item.get("exit_code").and_then(|c| c.as_i64());
+    let exit_code = item
+        .get("exit_code")
+        .or_else(|| item.get("exitCode"))
+        .and_then(|c| c.as_i64());
     let aggregated_output = item
         .get("aggregated_output")
+        .or_else(|| item.get("aggregatedOutput"))
         .and_then(|o| o.as_str())
         .unwrap_or_default()
         .trim();
@@ -1320,6 +1403,39 @@ mod tests {
         assert_eq!(
             extract_activity_summary(&tool_payload).as_deref(),
             Some("[命令] 开始执行：cargo check")
+        );
+    }
+
+    #[test]
+    fn camel_case_codex_item_types_extract_text_and_activity() {
+        let text_payload = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "type": "item.completed",
+                "item": { "type": "agentMessage", "text": "camel final" }
+            }
+        });
+        assert_eq!(
+            extract_display_text(&text_payload).as_deref(),
+            Some("camel final")
+        );
+
+        let command_payload = serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "type": "item.started",
+                "item": {
+                    "type": "commandExecution",
+                    "status": "in_progress",
+                    "command": "cargo test",
+                    "aggregatedOutput": "",
+                    "exitCode": 0
+                }
+            }
+        });
+        assert_eq!(
+            extract_activity_summary(&command_payload).as_deref(),
+            Some("[命令] 开始执行：cargo test")
         );
     }
 

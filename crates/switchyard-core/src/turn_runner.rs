@@ -292,6 +292,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     mut policy: ExecutionPolicy,
 ) -> Result<TurnOutput, CoreError> {
     policy.cwd = cwd;
+    let session_id = session.session_id;
 
     // 1. Create Turn
     let turn = match phase {
@@ -315,10 +316,12 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     if let Some(tx) = runtime_tx {
         let event = match phase {
             TurnPhase::Normal => crate::runtime_events::RuntimeEvent::CoreTurnStarted {
+                session_id,
                 turn_id,
                 provider: session.active_core.clone(),
             },
             TurnPhase::Finalization => crate::runtime_events::RuntimeEvent::FinalizationStarted {
+                session_id,
                 turn_id,
                 provider: session.active_core.clone(),
             },
@@ -356,6 +359,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     };
 
     let rendered_context = switchyard_provider_subprocess::render_context_bundle(&context);
+    let provider_user_message_for_echo_check = provider_user_message.clone();
     let input = TurnInput {
         user_message: provider_user_message,
         system_prompt: if rendered_context.is_empty() {
@@ -367,7 +371,10 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     };
 
     // Bounded channel prevents backpressure deadlock when provider emits faster than we drain.
-    let (event_tx, mut event_rx) = mpsc::channel(256);
+    // Codex app-server can burst terminal/process deltas while tools run; keep
+    // this aligned with the GUI runtime bridge so those bursts are streamed
+    // instead of appearing only after the provider finishes.
+    let (event_tx, mut event_rx) = mpsc::channel(4096);
     let provider_fut =
         provider.start_turn(turn_id, input, policy, context, event_tx, cancel.clone());
 
@@ -382,6 +389,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
         output_completed: &mut bool,
         runtime_tx: Option<&mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
         store: &mut (impl CanonicalStore + ?Sized),
+        session_id: uuid::Uuid,
     ) -> Result<(), CoreError> {
         if pe.event_type == switchyard_provider_api::EventType::TurnFailed {
             *failed = true;
@@ -392,6 +400,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
                 let _ = tx
                     .send(
                         crate::runtime_events::RuntimeEvent::CoreExecutionTelemetry {
+                            session_id,
                             turn_id: pe.turn_id,
                             provider: pe.provider.clone(),
                             execution,
@@ -402,6 +411,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
             if let Some(job) = extract_hyard_job_observation(&pe.payload) {
                 let _ = tx
                     .send(crate::runtime_events::RuntimeEvent::HyardJobObserved {
+                        session_id,
                         turn_id: pe.turn_id,
                         source_provider: pe.provider.clone(),
                         observed_at: pe.timestamp.to_rfc3339(),
@@ -412,6 +422,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
             if let Some(terminal) = extract_terminal_output(&pe.payload) {
                 let _ = tx
                     .send(crate::runtime_events::RuntimeEvent::CoreTerminalOutput {
+                        session_id,
                         turn_id: pe.turn_id,
                         provider: pe.provider.clone(),
                         text: terminal.line,
@@ -424,6 +435,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
             {
                 *output_completed = true;
                 tx.send(crate::runtime_events::RuntimeEvent::CoreOutputCompleted {
+                    session_id,
                     turn_id: pe.turn_id,
                     provider: pe.provider.clone(),
                 })
@@ -456,6 +468,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
             {
                 let _ = tx
                     .send(crate::runtime_events::RuntimeEvent::CoreItemUpdated {
+                        session_id,
                         turn_id: pe.turn_id,
                         provider: pe.provider.clone(),
                         event_type: pe.event_type.to_string(),
@@ -494,7 +507,15 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
             }
             Some(pe) = event_rx.recv() => {
                 update_accumulated_response(&mut accumulated_response, &pe);
-                drain_event(&pe, &mut failed, &mut output_completed, runtime_tx, store).await?;
+                drain_event(
+                    &pe,
+                    &mut failed,
+                    &mut output_completed,
+                    runtime_tx,
+                    store,
+                    session_id,
+                )
+                .await?;
             }
             _ = active_turn_heartbeat.tick() => {
                 if session.active_turn_id == Some(turn_id) {
@@ -508,7 +529,15 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     // Drain remaining events after provider completes
     while let Some(pe) = event_rx.recv().await {
         update_accumulated_response(&mut accumulated_response, &pe);
-        drain_event(&pe, &mut failed, &mut output_completed, runtime_tx, store).await?;
+        drain_event(
+            &pe,
+            &mut failed,
+            &mut output_completed,
+            runtime_tx,
+            store,
+            session_id,
+        )
+        .await?;
     }
 
     if provider_result.is_err() || cancel.is_cancelled() {
@@ -520,8 +549,11 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
         failed_turn.status = TurnStatus::Failed;
         failed_turn.error_message = Some(err_msg.clone());
         failed_turn.completed_at = Some(chrono::Utc::now());
-        let cleaned_response = clean_system_status_lines(&accumulated_response);
-        if !cleaned_response.trim().is_empty() {
+        if let Some(cleaned_response) = clean_provider_response_text(
+            &accumulated_response,
+            &stored_user_message,
+            &provider_user_message_for_echo_check,
+        ) {
             failed_turn.provider_response = Some(cleaned_response);
         }
         store.append_turn(&failed_turn)?;
@@ -529,6 +561,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
         store.save_session(session)?;
         if let Some(tx) = runtime_tx {
             tx.send(crate::runtime_events::RuntimeEvent::TurnFailed {
+                session_id,
                 turn_id,
                 provider: session.active_core.clone(),
                 error: err_msg,
@@ -545,6 +578,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     // Provider output is done — signal UI before slow finalize/archive work.
     if !output_completed && let Some(tx) = runtime_tx {
         tx.send(crate::runtime_events::RuntimeEvent::CoreOutputCompleted {
+            session_id,
             turn_id,
             provider: session.active_core.clone(),
         })
@@ -618,8 +652,11 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
 
     // 5. Update Turn in store
     let mut updated_turn = turn;
-    let cleaned_response = clean_system_status_lines(&result.response_text);
-    updated_turn.provider_response = Some(cleaned_response);
+    updated_turn.provider_response = clean_provider_response_text(
+        &result.response_text,
+        &stored_user_message,
+        &provider_user_message_for_echo_check,
+    );
     if failed || result.exit_code.is_some_and(|c| c != 0) {
         updated_turn.status = TurnStatus::Failed;
         updated_turn.error_message = result
@@ -645,6 +682,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     if let Some(tx) = runtime_tx {
         if updated_turn.status == TurnStatus::Completed {
             tx.send(crate::runtime_events::RuntimeEvent::TurnCompleted {
+                session_id,
                 turn_id,
                 provider: session.active_core.clone(),
                 response: updated_turn.provider_response.clone(),
@@ -653,6 +691,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
             .ok();
         } else {
             tx.send(crate::runtime_events::RuntimeEvent::TurnFailed {
+                session_id,
                 turn_id,
                 provider: session.active_core.clone(),
                 error: updated_turn.error_message.clone().unwrap_or_default(),
@@ -719,6 +758,31 @@ fn clean_system_status_lines(text: &str) -> String {
     lines.join("\n")
 }
 
+fn normalize_provider_echo_comparison_text(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn clean_provider_response_text(
+    response_text: &str,
+    stored_user_message: &str,
+    provider_user_message: &str,
+) -> Option<String> {
+    let cleaned_response = clean_system_status_lines(response_text);
+    if cleaned_response.trim().is_empty() {
+        return None;
+    }
+
+    let normalized_response = normalize_provider_echo_comparison_text(&cleaned_response);
+    for user_message in [stored_user_message, provider_user_message] {
+        let normalized_user_message = normalize_provider_echo_comparison_text(user_message);
+        if !normalized_user_message.is_empty() && normalized_response == normalized_user_message {
+            return None;
+        }
+    }
+
+    Some(cleaned_response)
+}
+
 fn normalize_activity_kind(value: &str) -> String {
     value
         .trim()
@@ -779,6 +843,11 @@ fn is_non_assistant_activity_item(item_type: &str) -> bool {
             | "function_call"
             | "custom_tool_call"
             | "mcp_tool_call"
+            | "dynamic_tool_call"
+            | "collab_agent_tool_call"
+            | "web_search"
+            | "image_view"
+            | "image_generation"
             | "local_shell_call"
             | "tool_result"
             | "tool_response"
@@ -790,6 +859,15 @@ fn is_non_assistant_activity_item(item_type: &str) -> bool {
             | "file_change"
             | "diff_ready"
             | "todo_list"
+            | "plan"
+            | "hook"
+            | "runtime_status"
+            | "auto_approval_review"
+            | "terminal_interaction"
+            | "mcp_tool_call_progress"
+            | "raw_response_item"
+            | "delegate_request"
+            | "delegate_result"
             | "approval_request"
             | "approval_decision"
             | "server_request"
@@ -800,11 +878,13 @@ fn is_non_assistant_activity_item(item_type: &str) -> bool {
             | "shell_output_delta"
             | "stdout_delta"
             | "stderr_delta"
+            | "process_output_delta"
             | "file_change_delta"
             | "diff_delta"
             | "patch_delta"
             | "execution_telemetry"
             | "reasoning"
+            | "error"
     )
 }
 
@@ -1356,6 +1436,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_turn_does_not_persist_echoed_user_message_as_response() {
+        let (mut store, _dir) = temp_store();
+        let mut session = Session::new("fake".to_string());
+        store.save_session(&session).unwrap();
+
+        let provider = FakeProvider::success("什么原因");
+        let output = run_turn(
+            &mut store,
+            &mut session,
+            &provider,
+            "什么原因".to_string(),
+            PathBuf::from("."),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.response, None);
+
+        let turns = store.list_turns(session.session_id).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Completed);
+        assert_eq!(turns[0].provider_response, None);
+    }
+
+    #[tokio::test]
     async fn run_turn_forwards_payload_only_lifecycle_items_to_runtime() {
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -1752,5 +1857,21 @@ mod tests {
         let mixed_text = "Hello\n[命令] Executing shell\nWorld\n[系统反馈] Done";
         let cleaned = clean_system_status_lines(mixed_text);
         assert_eq!(cleaned, "Hello\nWorld");
+    }
+
+    #[test]
+    fn clean_provider_response_text_drops_exact_user_echo_after_status_cleanup() {
+        assert_eq!(
+            clean_provider_response_text("[系统] running\n什么原因", "什么原因", "什么原因"),
+            None
+        );
+        assert_eq!(
+            clean_provider_response_text("  什么原因  ", "什么原因", "什么原因"),
+            None
+        );
+        assert_eq!(
+            clean_provider_response_text("真实助手回复", "什么原因", "什么原因").as_deref(),
+            Some("真实助手回复")
+        );
     }
 }

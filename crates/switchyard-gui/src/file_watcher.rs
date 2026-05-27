@@ -209,6 +209,46 @@ impl FileWatcherState {
         Ok(())
     }
 
+    /// Stop watching any workspace and clear all in-memory capture
+    /// state. Used when the workbench enters the VS Code-like "no
+    /// workspace opened" state.
+    pub fn clear_workspace(&self) -> Result<(), String> {
+        {
+            let mut w = self
+                .inner
+                .watcher
+                .lock()
+                .map_err(|_| "watcher mutex poisoned")?;
+            *w = None;
+        }
+        {
+            let mut b = self
+                .inner
+                .baseline
+                .lock()
+                .map_err(|_| "baseline mutex poisoned")?;
+            b.clear();
+        }
+        {
+            let mut p = self
+                .inner
+                .pending_before
+                .lock()
+                .map_err(|_| "pending mutex poisoned")?;
+            p.clear();
+        }
+        if let Ok(mut active) = self.inner.active_turn.lock() {
+            *active = false;
+        }
+        if let Ok(mut started_at) = self.inner.turn_started_at.lock() {
+            *started_at = None;
+        }
+        if let Ok(mut roots) = self.inner.roots.lock() {
+            roots.clear();
+        }
+        Ok(())
+    }
+
     /// Begin recording AI-driven changes. Clears any pending state from
     /// a prior turn (defensive — `end_turn` should already have drained).
     /// Stamps the start time so the fallback scan in `end_turn` can

@@ -28,6 +28,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -395,7 +396,7 @@ impl LiveInstance for CodexAppServerInstance {
         .await
         .map_err(|e| ProviderError::ExecutionFailed(format!("turn/start write: {e}")))?;
 
-        let (event_tx, event_rx) = mpsc::channel::<ProviderEvent>(256);
+        let (event_tx, event_rx) = mpsc::channel::<ProviderEvent>(4096);
         let rx_lock = Arc::clone(&self.frame_rx);
         // Approval responses (Slice H) need to land on the same stdin the
         // turn/start invocation used. We share the lock — the per-frame write
@@ -405,6 +406,7 @@ impl LiveInstance for CodexAppServerInstance {
         // from the codex-server-side turn id we filter by.
         let canonical_turn_id = Uuid::now_v7();
         let turn_start_req_id = Value::from(req_id);
+        let stream_debug = debug_codex_stream_enabled();
 
         tokio::spawn(async move {
             let mut rx = rx_lock.lock().await;
@@ -589,15 +591,29 @@ impl LiveInstance for CodexAppServerInstance {
                 if let Some(tid) = notification_turn_id(&frame) {
                     if let Some(expected) = server_turn_id.as_deref() {
                         if tid != expected {
+                            if stream_debug {
+                                eprintln!(
+                                    "[switchyard codex stream] drop method={method} server_turn_id={tid} expected={expected}"
+                                );
+                            }
                             continue;
                         }
-                    } else {
+                    } else if should_bind_server_turn_id(method) {
                         // Some app-server versions emit turn notifications
-                        // before replying to `turn/start`. In the single-turn
-                        // Switchyard flow this first observed turn id is the
-                        // safest way to avoid dropping early lifecycle events.
+                        // before replying to `turn/start`. Only bind from
+                        // turn-scoped notifications; process/status frames can
+                        // carry unrelated ids and would otherwise make us drop
+                        // the real Codex turn stream.
                         server_turn_id = Some(tid.to_string());
                     }
+                }
+                if stream_debug {
+                    debug_codex_stream_notification(
+                        method,
+                        frame.get("params").unwrap_or(&Value::Null),
+                        server_turn_id.as_deref(),
+                        canonical_turn_id,
+                    );
                 }
 
                 match method {
@@ -631,6 +647,129 @@ impl LiveInstance for CodexAppServerInstance {
                         };
                         let pe =
                             ProviderEvent::new(canonical_turn_id, event_type, "codex", payload);
+                        if event_tx.send(pe).await.is_err() {
+                            return;
+                        }
+                    }
+                    "turn/started" => {
+                        let mut payload = frame
+                            .get("params")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(Default::default()));
+                        annotate_protocol_payload(&mut payload, method);
+                        set_payload_field_if_absent(&mut payload, "item_type", "runtime_status");
+                        set_payload_field_if_absent(&mut payload, "status", "running");
+                        set_payload_field_if_absent(&mut payload, "summary", "Codex turn started");
+                        let pe = ProviderEvent::new(
+                            canonical_turn_id,
+                            EventType::ItemUpdated,
+                            "codex",
+                            payload,
+                        );
+                        if event_tx.send(pe).await.is_err() {
+                            return;
+                        }
+                    }
+                    "hook/started"
+                    | "hook/completed"
+                    | "turn/diff/updated"
+                    | "turn/plan/updated"
+                    | "item/autoApprovalReview/started"
+                    | "item/autoApprovalReview/completed"
+                    | "item/fileChange/patchUpdated"
+                    | "item/fileChange/outputDelta"
+                    | "item/plan/delta"
+                    | "item/reasoning/summaryTextDelta"
+                    | "item/reasoning/summaryPartAdded"
+                    | "item/reasoning/textDelta"
+                    | "item/mcpToolCall/progress"
+                    | "item/commandExecution/terminalInteraction"
+                    | "rawResponseItem/completed" => {
+                        let mut payload = frame
+                            .get("params")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(Default::default()));
+                        annotate_protocol_payload(&mut payload, method);
+                        let event_type = if method.ends_with("/started") || method == "hook/started"
+                        {
+                            EventType::ItemStarted
+                        } else if method.ends_with("/completed") || method == "hook/completed" {
+                            EventType::ItemCompleted
+                        } else {
+                            EventType::ItemUpdated
+                        };
+                        let pe =
+                            ProviderEvent::new(canonical_turn_id, event_type, "codex", payload);
+                        if event_tx.send(pe).await.is_err() {
+                            return;
+                        }
+                    }
+                    "item/commandExecution/outputDelta"
+                    | "command/exec/outputDelta"
+                    | "process/outputDelta" => {
+                        let params = frame.get("params").unwrap_or(&Value::Null);
+                        let decoded_delta = extract_codex_output_delta(params);
+                        if stream_debug {
+                            debug_codex_output_delta(
+                                method,
+                                params,
+                                decoded_delta.as_deref().map(str::len).unwrap_or(0),
+                            );
+                        }
+                        if let Some(delta) = decoded_delta {
+                            let stream = params
+                                .get("stream")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("merged");
+                            if event_tx
+                                .send(ProviderEvent::terminal_output(
+                                    canonical_turn_id,
+                                    "codex",
+                                    delta,
+                                    Some(stream),
+                                    Some("codex_app_server"),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+
+                        let mut payload = frame
+                            .get("params")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(Default::default()));
+                        annotate_protocol_payload(&mut payload, method);
+                        set_payload_field_if_absent(
+                            &mut payload,
+                            "item_type",
+                            "command_output_delta",
+                        );
+                        let pe = ProviderEvent::new(
+                            canonical_turn_id,
+                            EventType::ItemUpdated,
+                            "codex",
+                            payload,
+                        );
+                        if event_tx.send(pe).await.is_err() {
+                            return;
+                        }
+                    }
+                    "process/exited" => {
+                        let mut payload = frame
+                            .get("params")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(Default::default()));
+                        annotate_protocol_payload(&mut payload, method);
+                        set_payload_field_if_absent(&mut payload, "item_type", "command_execution");
+                        set_payload_field_if_absent(&mut payload, "status", "completed");
+                        let pe = ProviderEvent::new(
+                            canonical_turn_id,
+                            EventType::ItemUpdated,
+                            "codex",
+                            payload,
+                        );
                         if event_tx.send(pe).await.is_err() {
                             return;
                         }
@@ -672,8 +811,7 @@ impl LiveInstance for CodexAppServerInstance {
                     | "thread/status/changed"
                     | "thread/started"
                     | "thread/tokenUsage/updated"
-                    | "account/rateLimits/updated"
-                    | "turn/started" => {}
+                    | "account/rateLimits/updated" => {}
                     _ => {
                         // Unknown notification — surface as raw ItemUpdated for
                         // forward compatibility.
@@ -790,12 +928,181 @@ impl LiveInstance for CodexAppServerInstance {
 }
 
 fn annotate_protocol_payload(payload: &mut Value, method: &str) {
+    let derived_item_type = payload_item_type_from_payload(payload)
+        .or_else(|| codex_item_type_from_method(method).map(ToString::to_string));
     if let Value::Object(map) = payload {
         map.entry("method".to_string())
             .or_insert_with(|| Value::String(method.to_string()));
         map.entry("type".to_string())
             .or_insert_with(|| Value::String(method.replace('/', ".")));
+        if let Some(item_type) = derived_item_type {
+            map.entry("item_type".to_string())
+                .or_insert_with(|| Value::String(item_type));
+        }
     }
+}
+
+fn set_payload_field_if_absent(payload: &mut Value, key: &str, value: &str) {
+    if let Value::Object(map) = payload {
+        map.entry(key.to_string())
+            .or_insert_with(|| Value::String(value.to_string()));
+    }
+}
+
+fn debug_codex_stream_enabled() -> bool {
+    std::env::var("SWITCHYARD_DEBUG_CODEX_STREAM")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn debug_json_keys(value: &Value) -> Vec<String> {
+    value
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn debug_codex_stream_notification(
+    method: &str,
+    params: &Value,
+    server_turn_id: Option<&str>,
+    canonical_turn_id: Uuid,
+) {
+    let item_type = payload_item_type_from_payload(params).unwrap_or_else(|| "-".to_string());
+    eprintln!(
+        "[switchyard codex stream] method={method} canonical_turn_id={canonical_turn_id} server_turn_id={} item_type={item_type} keys={:?}",
+        server_turn_id.unwrap_or("-"),
+        debug_json_keys(params),
+    );
+}
+
+fn debug_codex_output_delta(method: &str, params: &Value, decoded_len: usize) {
+    let stream = params
+        .get("stream")
+        .and_then(|value| value.as_str())
+        .unwrap_or("merged");
+    eprintln!(
+        "[switchyard codex outputDelta] method={method} stream={stream} decoded_len={decoded_len} keys={:?}",
+        debug_json_keys(params),
+    );
+}
+
+fn payload_item_type_from_payload(payload: &Value) -> Option<String> {
+    [
+        payload.get("item_type"),
+        payload.get("item").and_then(|item| item.get("type")),
+        payload
+            .get("params")
+            .and_then(|params| params.get("item_type")),
+        payload
+            .get("params")
+            .and_then(|params| params.get("item"))
+            .and_then(|item| item.get("type")),
+        payload.get("type").filter(|value| {
+            value
+                .as_str()
+                .map(|text| !text.contains('.') && !text.contains('/'))
+                .unwrap_or(false)
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(normalize_codex_item_type)
+    .find(|item_type| !item_type.is_empty())
+}
+
+fn codex_item_type_from_method(method: &str) -> Option<&'static str> {
+    match method {
+        "turn/started" => Some("runtime_status"),
+        "turn/diff/updated" => Some("file_change"),
+        "turn/plan/updated" => Some("plan"),
+        "hook/started" | "hook/completed" => Some("hook"),
+        "rawResponseItem/completed" => Some("raw_response_item"),
+        "item/commandExecution/outputDelta" | "command/exec/outputDelta" => {
+            Some("command_output_delta")
+        }
+        "process/outputDelta" => Some("terminal_output"),
+        "process/exited" => Some("command_execution"),
+        "item/commandExecution/terminalInteraction" => Some("terminal_interaction"),
+        "item/fileChange/patchUpdated" => Some("file_change"),
+        "item/fileChange/outputDelta" => Some("file_change_delta"),
+        "item/plan/delta" => Some("plan"),
+        "item/reasoning/summaryTextDelta"
+        | "item/reasoning/summaryPartAdded"
+        | "item/reasoning/textDelta" => Some("reasoning"),
+        "item/mcpToolCall/progress" => Some("mcp_tool_call"),
+        "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
+            Some("auto_approval_review")
+        }
+        _ => None,
+    }
+}
+
+fn normalize_codex_item_type(value: &str) -> String {
+    let mut out = String::new();
+    let mut prev_was_lower_or_digit = false;
+    let mut last_was_separator = false;
+
+    for ch in value.trim().chars() {
+        if ch.is_ascii_uppercase() && prev_was_lower_or_digit && !last_was_separator {
+            out.push('_');
+        }
+
+        if ch == '.' || ch == '/' || ch == '-' || ch == '_' || ch.is_whitespace() {
+            if !out.is_empty() && !last_was_separator {
+                out.push('_');
+                last_was_separator = true;
+            }
+            prev_was_lower_or_digit = false;
+            continue;
+        }
+
+        out.push(ch.to_ascii_lowercase());
+        last_was_separator = false;
+        prev_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+fn extract_codex_output_delta(params: &Value) -> Option<String> {
+    params
+        .get("delta")
+        .and_then(|delta| {
+            non_empty_string(delta)
+                .or_else(|| delta.get("text").and_then(non_empty_string))
+                .or_else(|| delta.get("content").and_then(content_text))
+                .or_else(|| delta.get("deltaBase64").and_then(decode_base64_text))
+                .or_else(|| delta.get("delta_base64").and_then(decode_base64_text))
+                .or_else(|| {
+                    delta
+                        .get("delta")
+                        .and_then(|inner| extract_codex_output_delta(&json!({ "delta": inner })))
+                })
+        })
+        .or_else(|| params.get("deltaBase64").and_then(decode_base64_text))
+        .or_else(|| params.get("delta_base64").and_then(decode_base64_text))
+        .or_else(|| params.get("text").and_then(non_empty_string))
+        .or_else(|| params.get("output").and_then(non_empty_string))
+}
+
+fn decode_base64_text(value: &Value) -> Option<String> {
+    let encoded = value.as_str()?.trim();
+    if encoded.is_empty() {
+        return None;
+    }
+    let bytes = STANDARD.decode(encoded).ok()?;
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 fn is_text_delta_method(method: &str) -> bool {
@@ -844,8 +1151,12 @@ fn extract_codex_text_delta(method: &str, params: &Value) -> Option<String> {
     let item = params.get("item");
     let item_type = item
         .and_then(|item| item.get("type"))
-        .and_then(|value| value.as_str());
-    if matches!(item_type, Some("agent_message" | "assistant" | "message")) {
+        .and_then(|value| value.as_str())
+        .map(normalize_codex_item_type);
+    if matches!(
+        item_type.as_deref(),
+        Some("agent_message" | "assistant" | "message")
+    ) {
         if let Some(text) = item
             .and_then(|item| item.get("text"))
             .and_then(non_empty_string)
@@ -979,6 +1290,17 @@ fn notification_turn_id(frame: &Value) -> Option<&str> {
                 .and_then(|t| t.get("id"))
                 .and_then(|v| v.as_str())
         })
+}
+
+fn should_bind_server_turn_id(method: &str) -> bool {
+    method == "turn/started"
+        || method == "turn/completed"
+        || method == "turn/failed"
+        || method.starts_with("item/")
+        || method.starts_with("hook/")
+        || method.starts_with("turn/diff")
+        || method.starts_with("turn/plan")
+        || method == "rawResponseItem/completed"
 }
 
 fn is_approval_method(method: &str) -> bool {
@@ -1373,6 +1695,55 @@ mod tests {
             payload.get("type").and_then(|v| v.as_str()),
             Some("item.started")
         );
+        assert_eq!(
+            payload.get("item_type").and_then(|v| v.as_str()),
+            Some("command_execution")
+        );
+    }
+
+    #[test]
+    fn annotate_protocol_payload_normalizes_camel_case_item_type() {
+        let mut payload =
+            json!({ "turnId": "server-turn", "item": { "type": "commandExecution" } });
+
+        annotate_protocol_payload(&mut payload, "item/started");
+
+        assert_eq!(
+            payload.get("item_type").and_then(|v| v.as_str()),
+            Some("command_execution")
+        );
+    }
+
+    #[test]
+    fn annotate_protocol_payload_maps_codex_stream_methods() {
+        let mut payload = json!({ "turnId": "server-turn", "itemId": "item-1", "delta": "stdout" });
+
+        annotate_protocol_payload(&mut payload, "item/commandExecution/outputDelta");
+
+        assert_eq!(
+            payload.get("item_type").and_then(|v| v.as_str()),
+            Some("command_output_delta")
+        );
+    }
+
+    #[test]
+    fn extract_codex_output_delta_decodes_delta_base64() {
+        let payload = json!({ "deltaBase64": "aGVsbG8K" });
+
+        assert_eq!(
+            extract_codex_output_delta(&payload).as_deref(),
+            Some("hello\n")
+        );
+    }
+
+    #[test]
+    fn extract_codex_output_delta_decodes_nested_delta_base64() {
+        let payload = json!({ "delta": { "deltaBase64": "c3Rkb3V0" } });
+
+        assert_eq!(
+            extract_codex_output_delta(&payload).as_deref(),
+            Some("stdout")
+        );
     }
 
     #[test]
@@ -1423,6 +1794,17 @@ mod tests {
         assert_eq!(
             extract_codex_text_delta("item/updated", &content_blocks).as_deref(),
             Some("foobar")
+        );
+
+        let camel_case_item = json!({
+            "item": {
+                "type": "agentMessage",
+                "text": "camel"
+            }
+        });
+        assert_eq!(
+            extract_codex_text_delta("item/completed", &camel_case_item).as_deref(),
+            Some("camel")
         );
     }
 
@@ -1480,6 +1862,17 @@ mod tests {
             })),
             Some("nested-turn")
         );
+    }
+
+    #[test]
+    fn server_turn_id_binding_is_limited_to_turn_scoped_notifications() {
+        assert!(should_bind_server_turn_id("turn/started"));
+        assert!(should_bind_server_turn_id(
+            "item/commandExecution/outputDelta"
+        ));
+        assert!(should_bind_server_turn_id("hook/started"));
+        assert!(!should_bind_server_turn_id("thread/status/changed"));
+        assert!(!should_bind_server_turn_id("process/outputDelta"));
     }
 
     #[tokio::test]

@@ -54,7 +54,7 @@ use windows_sys::Win32::{
 pub const DEFAULT_WAIT_SECS: u64 = 1;
 const HYARD_PROTOCOL: &str = "hyard_v2";
 
-const POLL_INTERVAL_MS: u64 = 200;
+const POLL_INTERVAL_MS: u64 = 500;
 const INLINE_WORKER_ENV: &str = "SWITCHYARD_HOST_WORKER_INLINE";
 const WORKER_BOOT_TIMEOUT_MS: u64 = 1_500;
 const WORKER_BOOT_POLL_MS: u64 = 50;

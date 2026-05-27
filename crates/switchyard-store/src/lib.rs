@@ -3,6 +3,7 @@ pub mod jsonl;
 pub mod sqlite;
 pub mod workspace_index;
 
+use chrono::{DateTime, Utc};
 use switchyard_session::{Artifact, Event, InboxEntry, Session, Turn};
 use uuid::Uuid;
 
@@ -58,6 +59,24 @@ pub trait SessionCatalog {
 
 pub trait SessionEventRepository {
     fn list_session_events(&self, session_id: Uuid) -> Result<Vec<Event>, StoreError>;
+
+    fn list_session_events_since(
+        &self,
+        session_id: Uuid,
+        after_timestamp: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Event>, StoreError> {
+        let mut events = self.list_session_events(session_id)?;
+        if let Some(after_timestamp) = after_timestamp {
+            // Use >= rather than > so the GUI can safely keep a timestamp-only
+            // cursor without losing events that share the same millisecond.
+            events.retain(|event| event.timestamp >= after_timestamp);
+        }
+        if let Some(limit) = limit {
+            events.truncate(limit);
+        }
+        Ok(events)
+    }
 }
 
 pub trait SessionInboxRepository {
@@ -222,6 +241,22 @@ impl SessionEventRepository for StoreHandle {
         match self {
             Self::Jsonl(store) => store.list_session_events(session_id),
             Self::Sqlite(store) => store.list_session_events(session_id),
+        }
+    }
+
+    fn list_session_events_since(
+        &self,
+        session_id: Uuid,
+        after_timestamp: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Event>, StoreError> {
+        match self {
+            Self::Jsonl(store) => {
+                store.list_session_events_since(session_id, after_timestamp, limit)
+            }
+            Self::Sqlite(store) => {
+                store.list_session_events_since(session_id, after_timestamp, limit)
+            }
         }
     }
 }

@@ -34,7 +34,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       className="status-bar"
       style={{
         gridColumn: '2 / -1',
-        gridRow: 2,
+        gridRow: 3,
         display: 'flex',
         alignItems: 'center',
         height: 22,
@@ -104,7 +104,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
           VS Code's status bar (the "Ports", "Problems", "Output" etc
           items there work the same way). */}
       <StatusItem
-        title="Workers — total agent count for this session (open diagnostics for details)"
+        title="Workers — live team workers plus active background delegates (open diagnostics for details)"
         onClick={onOpenDiagnostics}
       >
         <span>Workers:</span>

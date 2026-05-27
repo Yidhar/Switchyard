@@ -48,6 +48,20 @@ export const saveClipboardAttachment = (
   return invoke<string>('save_clipboard_attachment', { nameHint, mimeType, dataUrl });
 };
 
+export const persistAttachmentFile = (
+  path: string,
+  mimeType?: string | null,
+): Promise<string> => {
+  return invoke<string>('persist_attachment_file', { path, mimeType });
+};
+
+export const readImageAttachmentDataUrl = (
+  path: string,
+  mimeType?: string | null,
+): Promise<string> => {
+  return invoke<string>('read_image_attachment_data_url', { path, mimeType });
+};
+
 export const resolveToolApproval = (
   requestId: string,
   decision: 'approve' | 'deny',

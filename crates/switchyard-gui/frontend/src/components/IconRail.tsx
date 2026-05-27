@@ -77,7 +77,8 @@ export const IconRail: React.FC<IconRailProps> = ({
     <div
       className="icon-rail"
       style={{
-        gridRow: '1 / -1',
+        gridColumn: 1,
+        gridRow: '2 / 4',
         width: 56,
         minHeight: 0,
         background: 'rgba(0, 0, 0, 0.35)',

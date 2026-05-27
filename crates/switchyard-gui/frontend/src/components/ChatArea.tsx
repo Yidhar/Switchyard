@@ -1,11 +1,12 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useLayoutEffect, useMemo } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { Send, RefreshCw, MessageSquare, Pencil, Check, Square, Plus, ChevronDown, X, FileText, Image as ImageIcon } from 'lucide-react';
 import type { Session, Turn, SandboxMode, SendPayload, InputAttachment } from '../types';
 import { completeSlash } from './slashCommands';
-import { saveClipboardAttachment } from '../services/api';
+import { persistAttachmentFile, readImageAttachmentDataUrl, saveClipboardAttachment } from '../services/api';
+import type { RuntimeTurnPhase, RenderTurnEventsOptions } from './ui/RenderHelpers';
 import {
   attachmentFromPath,
   extractAttachmentsFromAttachmentReferences,
@@ -19,6 +20,10 @@ interface ChatAreaProps {
   isGenerating: boolean;
   turns: Turn[];
   turnAttachments?: Record<string, InputAttachment[]>;
+  runtimeDispatchStartedAt?: number | null;
+  runtimeDispatchPhase?: string | null;
+  activeCoreRuntimePhase?: RuntimeTurnPhase;
+  activePeerRuntimePhase?: RuntimeTurnPhase;
   handleSend: (payload: SendPayload, restoreText?: (text: string) => void) => void | Promise<void>;
   handleCancel: () => void;
   activeCoreText: string | null;
@@ -35,8 +40,22 @@ interface ChatAreaProps {
     onOpenFile?: (path: string) => void,
     onProposeForCanvas?: (path: string, content: string) => void,
   ) => React.ReactNode;
-  renderTurnEvents: (turnId: string, events: any[], turns: Turn[], realtimeLines?: string[], hyardJobs?: Record<string, any>) => React.ReactNode;
-  renderTurnActivitySummary: (turnId: string, events: any[], turns: Turn[], realtimeLines?: string[], hyardJobs?: Record<string, any>) => React.ReactNode;
+  renderTurnEvents: (
+    turnId: string,
+    events: any[],
+    turns: Turn[],
+    realtimeLines?: string[],
+    hyardJobs?: Record<string, any>,
+    options?: RenderTurnEventsOptions,
+  ) => React.ReactNode;
+  renderTurnActivitySummary: (
+    turnId: string,
+    events: any[],
+    turns: Turn[],
+    realtimeLines?: string[],
+    hyardJobs?: Record<string, any>,
+    options?: RenderTurnEventsOptions,
+  ) => React.ReactNode;
   queuedMessages: SendPayload[];
   onClearQueue: () => void;
   sandboxMode: SandboxMode;
@@ -87,8 +106,63 @@ const SANDBOX_OPTIONS: Array<{
   },
 ];
 
+const SESSION_ENTRY_AUTO_SCROLL_SETTLE_MS = 2_500;
+const VIRTUAL_TURN_ESTIMATED_HEIGHT = 180;
+const VIRTUAL_TURN_GAP = 14;
+const VIRTUAL_TURN_OVERSCAN = 8;
+const VIRTUAL_TURN_SCROLL_SEEK_OVERSCAN = 3;
+const VIRTUAL_SCROLL_SEEK_IDLE_MS = 120;
+const VIRTUAL_SCROLL_SEEK_MIN_DELTA_PX = 420;
+const VIRTUAL_SCROLL_SEEK_VELOCITY_PX_PER_MS = 2.2;
+const VIRTUAL_ROW_MEASURE_EPSILON_PX = 2;
+const USER_SCROLL_INTERACTION_IDLE_MS = 260;
+const SCROLL_BOTTOM_PIN_THRESHOLD_PX = 128;
+const EMPTY_EVENT_LIST: any[] = [];
+const EMPTY_TURN_LIST: Turn[] = [];
+
+function scrollClockNow(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
 function sandboxOptionFor(mode: SandboxMode) {
   return SANDBOX_OPTIONS.find((option) => option.mode === mode) ?? SANDBOX_OPTIONS[1];
+}
+
+function formatChatRuntimeElapsed(ms?: number): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '已处理 0s';
+  if (ms < 60_000) return `已处理 ${(Math.max(0, ms) / 1000).toFixed(1)}s`;
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `已处理 ${minutes}m ${String(seconds).padStart(2, '0')}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `已处理 ${hours}h ${String(remainingMinutes).padStart(2, '0')}m`;
+}
+
+function useChatLiveNow(active: boolean, intervalMs = 250): number {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!active) return;
+    const tick = () => setNow(Date.now());
+    tick();
+    const timer = window.setInterval(tick, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [active, intervalMs]);
+
+  return now;
+}
+
+function ChatLiveElapsedLabel({ startedAt }: { startedAt?: number | null }) {
+  const active = typeof startedAt === 'number' && Number.isFinite(startedAt);
+  const now = useChatLiveNow(active);
+  const elapsedMs = active ? Math.max(0, now - startedAt!) : undefined;
+  return <>{formatChatRuntimeElapsed(elapsedMs)}</>;
+}
+
+function isRuntimePhaseActive(phase?: RuntimeTurnPhase): boolean {
+  return phase === 'running' || phase === 'output_completed' || phase === 'finalizing';
 }
 
 function readFileAsDataUrl(file: File): Promise<string> {
@@ -106,6 +180,32 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+function nativePathForFile(file: File): string | null {
+  const path = (file as File & { path?: string }).path;
+  return typeof path === 'string' && path.trim() ? path.trim() : null;
+}
+
+function looksLikeEphemeralAttachmentPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, '/').toLowerCase();
+  return /(^|\/)(\.cache|cache|temp|tmp)(\/|$)/.test(normalized)
+    || normalized.includes('/appdata/local/temp/')
+    || normalized.includes('/appdata/local/microsoft/windows/inetcache/');
+}
+
+function attachmentNameHintForFile(file: File, nativePath?: string | null): string | undefined {
+  const name = file.name?.trim();
+  if (name) return name;
+  if (nativePath?.trim()) return filenameFromPath(nativePath);
+  return undefined;
+}
+
+function mimeTypeHintForFile(file: File, nativePath?: string | null): string | undefined {
+  const mimeType = file.type?.trim();
+  if (mimeType) return mimeType;
+  if (nativePath?.trim()) return attachmentFromPath(nativePath).mimeType ?? undefined;
+  return undefined;
+}
+
 interface RenderedMessageBodyProps {
   text: string | null;
   renderMessageBody: ChatAreaProps['renderMessageBody'];
@@ -121,6 +221,328 @@ const RenderedMessageBody: React.FC<RenderedMessageBodyProps> = React.memo(({
   onOpenFile,
 }) => {
   return <>{renderMessageBody(text, undefined, onOpenFile)}</>;
+}, (prev, next) => (
+  prev.text === next.text &&
+  prev.onOpenFile === next.onOpenFile
+));
+
+const IMAGE_PREVIEW_CACHE_LIMIT = 96;
+const imagePreviewSrcCache = new Map<string, string>();
+const imagePreviewErrorCache = new Map<string, string>();
+const imagePreviewPendingCache = new Map<string, Promise<string>>();
+
+interface ImagePreviewLoadState {
+  src: string | null;
+  error: string | null;
+  loading: boolean;
+  retry: () => void;
+}
+
+function imagePreviewCacheKey(path: string, mimeType?: string | null): string {
+  return `${path}\u0000${mimeType ?? ''}`;
+}
+
+function setLimitedImagePreviewCacheValue<T>(cache: Map<string, T>, key: string, value: T): T {
+  cache.set(key, value);
+  if (cache.size > IMAGE_PREVIEW_CACHE_LIMIT) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey);
+    }
+  }
+  return value;
+}
+
+function clearImagePreviewCacheValue(key: string) {
+  imagePreviewSrcCache.delete(key);
+  imagePreviewErrorCache.delete(key);
+  imagePreviewPendingCache.delete(key);
+}
+
+function normalizeImagePreviewError(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  const text = String(error ?? '').trim();
+  return text || '图片加载失败';
+}
+
+function shouldFallbackToTauriAssetPreview(error: unknown): boolean {
+  const message = normalizeImagePreviewError(error).toLowerCase();
+  return message.includes('command read_image_attachment_data_url not found')
+    || message.includes('read_image_attachment_data_url')
+    || message.includes('not found')
+    || message.includes('not allowed')
+    || message.includes('forbidden');
+}
+
+function tauriAssetPreviewSrc(path: string): string | null {
+  try {
+    const src = convertFileSrc(path);
+    return typeof src === 'string' && src.trim() ? src : null;
+  } catch (error) {
+    console.warn('Failed to convert image attachment path via Tauri asset protocol', error);
+    return null;
+  }
+}
+
+function truncatePreviewText(text: string, maxLength = 96): string {
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function loadImageAttachmentDataUrl(path: string, mimeType?: string | null): Promise<string> {
+  const key = imagePreviewCacheKey(path, mimeType);
+  const cachedSrc = imagePreviewSrcCache.get(key);
+  if (cachedSrc) return Promise.resolve(cachedSrc);
+  const cachedError = imagePreviewErrorCache.get(key);
+  if (cachedError) return Promise.reject(new Error(cachedError));
+  const pending = imagePreviewPendingCache.get(key);
+  if (pending) return pending;
+
+  const request = readImageAttachmentDataUrl(path, mimeType)
+    .then((src) => {
+      imagePreviewErrorCache.delete(key);
+      return setLimitedImagePreviewCacheValue(imagePreviewSrcCache, key, src);
+    })
+    .catch((error) => {
+      if (shouldFallbackToTauriAssetPreview(error)) {
+        const fallbackSrc = tauriAssetPreviewSrc(path);
+        if (fallbackSrc) {
+          imagePreviewErrorCache.delete(key);
+          return setLimitedImagePreviewCacheValue(imagePreviewSrcCache, key, fallbackSrc);
+        }
+      }
+      const message = normalizeImagePreviewError(error);
+      setLimitedImagePreviewCacheValue(imagePreviewErrorCache, key, message);
+      throw new Error(message);
+    })
+    .finally(() => {
+      imagePreviewPendingCache.delete(key);
+    });
+  imagePreviewPendingCache.set(key, request);
+  return request;
+}
+
+function useImageAttachmentDataUrl(attachment: InputAttachment): ImagePreviewLoadState {
+  const path = attachment.path;
+  const mimeType = attachment.mimeType ?? null;
+  const key = imagePreviewCacheKey(path, mimeType);
+  const [reloadToken, setReloadToken] = useState(0);
+  const [state, setState] = useState<ImagePreviewLoadState>(() => {
+    const src = imagePreviewSrcCache.get(key) ?? null;
+    const error = imagePreviewErrorCache.get(key) ?? null;
+    return { src, error, loading: !src && !error, retry: () => {} };
+  });
+
+  const retry = useCallback(() => {
+    clearImagePreviewCacheValue(key);
+    setReloadToken((value) => value + 1);
+  }, [key]);
+
+  useEffect(() => {
+    const src = imagePreviewSrcCache.get(key) ?? null;
+    const error = imagePreviewErrorCache.get(key) ?? null;
+    if (src || error) {
+      setState({ src, error, loading: false, retry });
+      return;
+    }
+
+    let cancelled = false;
+    setState({ src: null, error: null, loading: true, retry });
+    loadImageAttachmentDataUrl(path, mimeType)
+      .then((loadedSrc) => {
+        if (!cancelled) {
+          setState({ src: loadedSrc, error: null, loading: false, retry });
+        }
+      })
+      .catch((loadError) => {
+        if (!cancelled) {
+          setState({ src: null, error: normalizeImagePreviewError(loadError), loading: false, retry });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [key, path, mimeType, retry, reloadToken]);
+
+  return state;
+}
+
+const AttachmentImageThumb: React.FC<{
+  attachment: InputAttachment;
+  onOpenImage: (attachment: InputAttachment) => void;
+}> = React.memo(({ attachment, onOpenImage }) => {
+  const { src, error, loading } = useImageAttachmentDataUrl(attachment);
+  const [decodeError, setDecodeError] = useState<string | null>(null);
+  const label = attachment.name || filenameFromPath(attachment.path);
+  const cacheKey = imagePreviewCacheKey(attachment.path, attachment.mimeType ?? null);
+
+  useEffect(() => {
+    setDecodeError(null);
+  }, [cacheKey, src]);
+
+  const displayError = error || decodeError;
+  const title = `${label}\n${attachment.path}${displayError ? `\n\n图片加载失败：${displayError}` : ''}`;
+
+  return (
+    <button
+      key={attachment.path}
+      type="button"
+      onClick={() => onOpenImage(attachment)}
+      title={title}
+      style={{
+        width: 104,
+        height: 78,
+        border: `1px solid ${displayError ? 'rgba(248, 113, 113, 0.42)' : 'rgba(148, 163, 184, 0.28)'}`,
+        borderRadius: 8,
+        padding: 0,
+        overflow: 'hidden',
+        background: displayError ? 'rgba(127, 29, 29, 0.28)' : 'rgba(15, 23, 42, 0.55)',
+        cursor: 'zoom-in',
+        position: 'relative',
+      }}
+    >
+      {src && !displayError ? (
+        <img
+          src={src}
+          alt={label}
+          onError={() => {
+            const message = '浏览器无法解码该图片格式';
+            setLimitedImagePreviewCacheValue(imagePreviewErrorCache, cacheKey, message);
+            setDecodeError(message);
+          }}
+          style={{
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            display: 'block',
+          }}
+        />
+      ) : (
+        <div
+          style={{
+            width: '100%',
+            height: '100%',
+            boxSizing: 'border-box',
+            padding: '6px 7px',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 3,
+            color: displayError ? '#fecaca' : 'var(--text-muted)',
+            textAlign: 'center',
+          }}
+        >
+          <ImageIcon size={17} style={{ opacity: 0.9 }} />
+          <div style={{ fontSize: 11, fontWeight: 700, lineHeight: 1.15 }}>
+            {displayError ? '加载失败' : loading ? '加载中…' : '无预览'}
+          </div>
+          <div
+            style={{
+              width: '100%',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              fontSize: 10,
+              lineHeight: 1.15,
+              color: displayError ? 'rgba(254, 202, 202, 0.78)' : 'var(--text-muted)',
+            }}
+          >
+            {label}
+          </div>
+        </div>
+      )}
+    </button>
+  );
+});
+
+const ImageAttachmentModalBody: React.FC<{ attachment: InputAttachment }> = React.memo(({ attachment }) => {
+  const { src, error, loading, retry } = useImageAttachmentDataUrl(attachment);
+  const [decodeError, setDecodeError] = useState<string | null>(null);
+  const label = attachment.name || filenameFromPath(attachment.path);
+  const cacheKey = imagePreviewCacheKey(attachment.path, attachment.mimeType ?? null);
+
+  useEffect(() => {
+    setDecodeError(null);
+  }, [cacheKey, src]);
+
+  const displayError = error || decodeError;
+  if (src && !displayError) {
+    return (
+      <img
+        src={src}
+        alt={label}
+        onError={() => {
+          const message = '浏览器无法解码该图片格式';
+          setLimitedImagePreviewCacheValue(imagePreviewErrorCache, cacheKey, message);
+          setDecodeError(message);
+        }}
+        style={{
+          maxWidth: 'min(86vw, 1100px)',
+          maxHeight: '78vh',
+          objectFit: 'contain',
+          borderRadius: 8,
+          background: '#020617',
+        }}
+      />
+    );
+  }
+
+  return (
+    <div
+      style={{
+        width: 'min(86vw, 760px)',
+        minHeight: 240,
+        borderRadius: 8,
+        border: `1px solid ${displayError ? 'rgba(248, 113, 113, 0.36)' : 'rgba(148, 163, 184, 0.22)'}`,
+        background: displayError ? 'rgba(127, 29, 29, 0.18)' : '#020617',
+        color: displayError ? '#fecaca' : 'var(--text-muted)',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 8,
+        padding: 24,
+        textAlign: 'center',
+      }}
+    >
+      <ImageIcon size={28} />
+      <div style={{ color: displayError ? '#fecaca' : 'var(--text-secondary)', fontSize: 13, fontWeight: 800 }}>
+        {displayError ? '图片加载失败' : loading ? '图片加载中…' : '无可用预览'}
+      </div>
+      <div style={{ maxWidth: '100%', color: 'var(--text-muted)', fontSize: 12, overflowWrap: 'anywhere' }}>
+        {label}
+      </div>
+      {displayError && (
+        <div style={{ maxWidth: '100%', color: 'rgba(254, 202, 202, 0.82)', fontSize: 11, overflowWrap: 'anywhere' }}>
+          {truncatePreviewText(displayError, 220)}
+        </div>
+      )}
+      {displayError && (
+        <button
+          type="button"
+          onClick={() => {
+            setDecodeError(null);
+            retry();
+          }}
+          style={{
+            marginTop: 4,
+            border: '1px solid rgba(147, 197, 253, 0.38)',
+            borderRadius: 999,
+            padding: '6px 12px',
+            background: 'rgba(37, 99, 235, 0.16)',
+            color: '#bfdbfe',
+            fontSize: 12,
+            fontWeight: 800,
+            cursor: 'pointer',
+          }}
+        >
+          重新加载图片
+        </button>
+      )}
+    </div>
+  );
 });
 
 interface UserAttachmentPreviewGridProps {
@@ -146,37 +568,7 @@ const UserAttachmentPreviewGrid: React.FC<UserAttachmentPreviewGridProps> = Reac
     >
       {attachments.map((attachment) => {
         if (attachment.kind === 'image') {
-          const src = convertFileSrc(attachment.path);
-          return (
-            <button
-              key={attachment.path}
-              type="button"
-              onClick={() => onOpenImage(attachment)}
-              title={`${attachment.name || filenameFromPath(attachment.path)}\n${attachment.path}`}
-              style={{
-                width: 104,
-                height: 78,
-                border: '1px solid rgba(148, 163, 184, 0.28)',
-                borderRadius: 8,
-                padding: 0,
-                overflow: 'hidden',
-                background: 'rgba(15, 23, 42, 0.55)',
-                cursor: 'zoom-in',
-                position: 'relative',
-              }}
-            >
-              <img
-                src={src}
-                alt={attachment.name || filenameFromPath(attachment.path)}
-                style={{
-                  width: '100%',
-                  height: '100%',
-                  objectFit: 'cover',
-                  display: 'block',
-                }}
-              />
-            </button>
-          );
+          return <AttachmentImageThumb key={attachment.path} attachment={attachment} onOpenImage={onOpenImage} />;
         }
         return (
           <button
@@ -209,6 +601,753 @@ const UserAttachmentPreviewGrid: React.FC<UserAttachmentPreviewGridProps> = Reac
   );
 });
 
+const CHAT_RENDER_CACHE_LIMIT = 600;
+const strippedAttachmentTextCache = new Map<string, string>();
+const attachmentReferenceCache = new Map<string, InputAttachment[]>();
+const systemFeedbackResultsCache = new Map<string, any[] | null>();
+
+function setLimitedCacheValue<T>(cache: Map<string, T>, key: string, value: T): T {
+  cache.set(key, value);
+  if (cache.size > CHAT_RENDER_CACHE_LIMIT) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey);
+    }
+  }
+  return value;
+}
+
+function cachedStripAttachmentReferences(text: string): string {
+  const cached = strippedAttachmentTextCache.get(text);
+  if (cached !== undefined) return cached;
+  return setLimitedCacheValue(strippedAttachmentTextCache, text, stripAttachmentReferences(text));
+}
+
+function cachedExtractAttachmentReferences(text: string): InputAttachment[] {
+  const cached = attachmentReferenceCache.get(text);
+  if (cached !== undefined) return cached;
+  return setLimitedCacheValue(
+    attachmentReferenceCache,
+    text,
+    extractAttachmentsFromAttachmentReferences(text),
+  );
+}
+
+function cachedParseSystemFeedbackResults(text: string): any[] | null {
+  if (!text.includes('<<<SWITCHYARD_JSON_BEGIN>>>')) return null;
+  if (systemFeedbackResultsCache.has(text)) {
+    return systemFeedbackResultsCache.get(text) ?? null;
+  }
+  let parsedResults: any[] | null = null;
+  try {
+    const match = text.match(/<<<SWITCHYARD_JSON_BEGIN>>>([\s\S]*?)<<<SWITCHYARD_JSON_END>>>/);
+    if (match?.[1]) {
+      const parsed = JSON.parse(match[1]);
+      if (Array.isArray(parsed?.results)) {
+        parsedResults = parsed.results;
+      }
+    }
+  } catch {
+    parsedResults = null;
+  }
+  return setLimitedCacheValue(systemFeedbackResultsCache, text, parsedResults);
+}
+
+const SystemFeedbackResults: React.FC<{ results: any[] | null }> = React.memo(({ results }) => {
+  if (!results || results.length === 0) return null;
+  return (
+    <div
+      className="message-bubble message-system"
+      style={{
+        alignSelf: 'center',
+        width: '100%',
+        background: 'rgba(255, 255, 255, 0.02)',
+        border: '1px dashed var(--border-muted)',
+        borderRadius: '4px',
+        padding: '12px',
+        fontSize: '13px',
+        color: 'var(--text-secondary)',
+        marginBottom: '16px'
+      }}
+    >
+      <div style={{ fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--color-primary)', marginBottom: '8px' }}>
+        <span>Aggregated Delegation Results</span>
+        <span style={{ fontSize: '11px', padding: '2px 6px', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-primary)', borderRadius: '3px' }}>
+          System Feedback
+        </span>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {results.map((res: any, rIdx: number) => (
+          <div key={res.id || rIdx} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 12px', background: 'rgba(0, 0, 0, 0.2)', borderRadius: '4px', borderLeft: `3px solid ${res.status === 'success' ? '#10b981' : '#ef4444'}` }}>
+            <div>
+              <span style={{ fontWeight: 'bold', color: 'var(--text-primary)' }}>{res.id}</span>
+              <span style={{ marginLeft: '8px', color: 'var(--text-muted)' }}>({res.provider})</span>
+            </div>
+            <div style={{ display: 'flex', gap: '12px', fontSize: '11px' }}>
+              <span>Status: <span style={{ color: res.status === 'success' ? '#10b981' : '#ef4444' }}>{res.status}</span></span>
+              <span>Duration: {res.duration_ms}ms</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+interface VirtualTurnEntry {
+  key: string;
+  turn: Turn;
+  originalIndex: number;
+}
+
+interface VirtualTurnMetric extends VirtualTurnEntry {
+  start: number;
+  size: number;
+}
+
+interface GroupedSessionEvents {
+  eventsByTurnId: Map<string, any[]>;
+  eventActivityTurnIds: Set<string>;
+}
+
+interface CachedGroupedSessionEvents extends GroupedSessionEvents {
+  sourceEvents: any[];
+}
+
+function shallowArrayEqual<T>(left: readonly T[] | undefined, right: readonly T[]): boolean {
+  if (!left || left.length !== right.length) return false;
+  for (let i = 0; i < right.length; i += 1) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function setShallowEqual<T>(left: ReadonlySet<T>, right: ReadonlySet<T>): boolean {
+  if (left.size !== right.size) return false;
+  for (const value of right) {
+    if (!left.has(value)) return false;
+  }
+  return true;
+}
+
+function eventTurnId(event: any): string {
+  return typeof event?.turn_id === 'string' ? event.turn_id : '';
+}
+
+function buildGroupedSessionEvents(
+  sessionEvents: any[],
+  previous?: CachedGroupedSessionEvents | null,
+): GroupedSessionEvents {
+  const grouped = new Map<string, any[]>();
+  const activityIds = new Set<string>();
+  for (const event of sessionEvents) {
+    const turnId = eventTurnId(event);
+    if (!turnId) continue;
+    const existing = grouped.get(turnId);
+    if (existing) {
+      existing.push(event);
+    } else {
+      grouped.set(turnId, [event]);
+    }
+    if (eventHasRenderableArtifact(event)) {
+      activityIds.add(turnId);
+    }
+  }
+
+  if (!previous) {
+    return { eventsByTurnId: grouped, eventActivityTurnIds: activityIds };
+  }
+
+  const stableGrouped = new Map<string, any[]>();
+  for (const [turnId, events] of grouped) {
+    const previousEvents = previous.eventsByTurnId.get(turnId);
+    const stableEvents = previousEvents && shallowArrayEqual(previousEvents, events)
+      ? previousEvents
+      : events;
+    stableGrouped.set(turnId, stableEvents);
+  }
+
+  return {
+    eventsByTurnId: stableGrouped,
+    eventActivityTurnIds: setShallowEqual(previous.eventActivityTurnIds, activityIds)
+      ? previous.eventActivityTurnIds
+      : activityIds,
+  };
+}
+
+function cloneEventActivityIds(
+  previous: CachedGroupedSessionEvents,
+  turnId: string,
+  nextEventsForTurn: any[],
+): Set<string> {
+  const shouldHaveActivity = nextEventsForTurn.some(eventHasRenderableArtifact);
+  const alreadyHasActivity = previous.eventActivityTurnIds.has(turnId);
+  if (shouldHaveActivity === alreadyHasActivity) {
+    return previous.eventActivityTurnIds;
+  }
+  const nextActivityIds = new Set(previous.eventActivityTurnIds);
+  if (shouldHaveActivity) {
+    nextActivityIds.add(turnId);
+  } else {
+    nextActivityIds.delete(turnId);
+  }
+  return nextActivityIds;
+}
+
+function appendGroupedSessionEvent(
+  previous: CachedGroupedSessionEvents,
+  nextEvent: any,
+): GroupedSessionEvents | null {
+  const turnId = eventTurnId(nextEvent);
+  if (!turnId) return null;
+  const previousEventsForTurn = previous.eventsByTurnId.get(turnId) ?? EMPTY_EVENT_LIST;
+  const nextEventsForTurn = [...previousEventsForTurn, nextEvent];
+  const nextGrouped = new Map(previous.eventsByTurnId);
+  nextGrouped.set(turnId, nextEventsForTurn);
+  const nextActivityIds = eventHasRenderableArtifact(nextEvent) && !previous.eventActivityTurnIds.has(turnId)
+    ? new Set(previous.eventActivityTurnIds).add(turnId)
+    : previous.eventActivityTurnIds;
+  return { eventsByTurnId: nextGrouped, eventActivityTurnIds: nextActivityIds };
+}
+
+function replaceGroupedSessionEvent(
+  previous: CachedGroupedSessionEvents,
+  oldEvent: any,
+  nextEvent: any,
+): GroupedSessionEvents | null {
+  const oldTurnId = eventTurnId(oldEvent);
+  const nextTurnId = eventTurnId(nextEvent);
+  if (!oldTurnId || oldTurnId !== nextTurnId) return null;
+  const previousEventsForTurn = previous.eventsByTurnId.get(oldTurnId);
+  if (!previousEventsForTurn) return null;
+  const eventIndex = previousEventsForTurn.indexOf(oldEvent);
+  if (eventIndex < 0) return null;
+
+  const nextEventsForTurn = previousEventsForTurn.slice();
+  nextEventsForTurn[eventIndex] = nextEvent;
+  const nextGrouped = new Map(previous.eventsByTurnId);
+  nextGrouped.set(oldTurnId, nextEventsForTurn);
+  return {
+    eventsByTurnId: nextGrouped,
+    eventActivityTurnIds: cloneEventActivityIds(previous, oldTurnId, nextEventsForTurn),
+  };
+}
+
+function deriveGroupedSessionEvents(
+  sessionEvents: any[],
+  previous?: CachedGroupedSessionEvents | null,
+): GroupedSessionEvents {
+  if (previous?.sourceEvents === sessionEvents) {
+    return previous;
+  }
+
+  if (previous) {
+    const previousEvents = previous.sourceEvents;
+    const previousLength = previousEvents.length;
+    const nextLength = sessionEvents.length;
+
+    // The live event stream is overwhelmingly append-only. Keep the per-turn
+    // arrays stable and update only the touched turn so historical rows do not
+    // re-render on every terminal/reasoning tick.
+    if (
+      nextLength === previousLength + 1 &&
+      (previousLength === 0 || sessionEvents[previousLength - 1] === previousEvents[previousLength - 1])
+    ) {
+      const appended = appendGroupedSessionEvent(previous, sessionEvents[nextLength - 1]);
+      if (appended) return appended;
+    }
+
+    // Runtime item updates usually replace the active tail event in-place.
+    // Handle that path without rebuilding every historical turn group.
+    if (
+      nextLength === previousLength &&
+      nextLength > 0 &&
+      sessionEvents[nextLength - 1] !== previousEvents[nextLength - 1] &&
+      (nextLength === 1 || sessionEvents[nextLength - 2] === previousEvents[nextLength - 2])
+    ) {
+      const replaced = replaceGroupedSessionEvent(
+        previous,
+        previousEvents[nextLength - 1],
+        sessionEvents[nextLength - 1],
+      );
+      if (replaced) return replaced;
+    }
+  }
+
+  return buildGroupedSessionEvents(sessionEvents, previous);
+}
+
+interface VirtualTurnRowProps {
+  itemKey: string;
+  top: number;
+  onMeasure: (key: string, height: number) => void;
+  shouldMeasure?: boolean;
+  children: React.ReactNode;
+}
+
+/// One history turn can contain several actual message cards (user prompt,
+/// assistant answer, tool summary). The virtualizer treats that whole block as
+/// a single variable-height row and observes its real height after markdown,
+/// images, diff expand/collapse, and tool cards settle.
+const VirtualTurnRow: React.FC<VirtualTurnRowProps> = React.memo(({
+  itemKey,
+  top,
+  onMeasure,
+  shouldMeasure = true,
+  children,
+}) => {
+  const rowRef = useRef<HTMLDivElement>(null);
+  const measureRafRef = useRef<number | null>(null);
+  const pendingMeasureHeightRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (!shouldMeasure) return;
+    const node = rowRef.current;
+    if (!node) return;
+    let disposed = false;
+    const report = () => {
+      if (disposed) return;
+      const pendingHeight = pendingMeasureHeightRef.current;
+      pendingMeasureHeightRef.current = null;
+      onMeasure(itemKey, pendingHeight ?? node.getBoundingClientRect().height);
+    };
+    const scheduleReport = (height?: number) => {
+      if (typeof height === 'number' && Number.isFinite(height)) {
+        pendingMeasureHeightRef.current = height;
+      }
+      if (measureRafRef.current !== null) return;
+      measureRafRef.current = requestAnimationFrame(() => {
+        measureRafRef.current = null;
+        report();
+      });
+    };
+    report();
+    if (typeof ResizeObserver === 'undefined') {
+      return () => {
+        disposed = true;
+        if (measureRafRef.current !== null) {
+          cancelAnimationFrame(measureRafRef.current);
+          measureRafRef.current = null;
+        }
+      };
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      const borderBox = entry?.borderBoxSize;
+      const borderBoxSize = Array.isArray(borderBox) ? borderBox[0] : borderBox;
+      const observedHeight = borderBoxSize?.blockSize ?? entry?.contentRect.height;
+      if (typeof observedHeight === 'number' && Number.isFinite(observedHeight)) {
+        scheduleReport(observedHeight);
+        return;
+      }
+      scheduleReport();
+    });
+    observer.observe(node);
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      if (measureRafRef.current !== null) {
+        cancelAnimationFrame(measureRafRef.current);
+        measureRafRef.current = null;
+      }
+    };
+  }, [itemKey, onMeasure, shouldMeasure]);
+
+  return (
+    <div
+      ref={rowRef}
+      data-virtual-turn-row={itemKey}
+      style={{
+        position: 'absolute',
+        left: 0,
+        right: 0,
+        top: 0,
+        overflowAnchor: 'none',
+        transform: `translateY(${top}px)`,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: VIRTUAL_TURN_GAP,
+      }}
+    >
+      {children}
+    </div>
+  );
+});
+
+const VirtualTurnPlaceholder: React.FC<{ height: number }> = React.memo(({ height }) => {
+  const blockHeight = Math.max(56, Math.ceil(height));
+  return (
+    <div
+      aria-hidden="true"
+      style={{
+        height: blockHeight,
+        boxSizing: 'border-box',
+        borderRadius: 10,
+        border: '1px solid rgba(148, 163, 184, 0.07)',
+        background: 'rgba(148, 163, 184, 0.035)',
+        padding: 12,
+        overflow: 'hidden',
+        opacity: 0.72,
+      }}
+    >
+      <div
+        style={{
+          width: '22%',
+          height: 10,
+          borderRadius: 999,
+          background: 'rgba(148, 163, 184, 0.12)',
+          marginBottom: 12,
+        }}
+      />
+      <div
+        style={{
+          width: '78%',
+          height: 8,
+          borderRadius: 999,
+          background: 'rgba(148, 163, 184, 0.09)',
+          marginBottom: 8,
+        }}
+      />
+      <div
+        style={{
+          width: '58%',
+          height: 8,
+          borderRadius: 999,
+          background: 'rgba(148, 163, 184, 0.07)',
+        }}
+      />
+    </div>
+  );
+});
+
+interface HistoricalTurnContentProps {
+  turn: Turn;
+  originalIndex: number;
+  lastUserTurnId: string | null;
+  editingTurnId: string | null;
+  editingDraft: string;
+  isGenerating: boolean;
+  storedAttachments?: InputAttachment[];
+  hasAssistantActivity: boolean;
+  turnEvents: any[];
+  relatedTurns: Turn[];
+  realtimeLines?: string[];
+  hyardJob?: any;
+  renderMessageBody: ChatAreaProps['renderMessageBody'];
+  renderTurnEvents: ChatAreaProps['renderTurnEvents'];
+  scopedRenderOptions: RenderTurnEventsOptions;
+  onOpenFile: (path: string) => void;
+  onPreviewAttachment: (attachment: InputAttachment) => void;
+  onBeginEdit: (turn: Turn) => void;
+  onRetryLastUserTurn: (turnId: string) => void;
+  onEditingDraftChange: (value: string) => void;
+  onCommitEdit: () => void;
+  onCancelEdit: () => void;
+}
+
+const HistoricalTurnContentBase: React.FC<HistoricalTurnContentProps> = ({
+  turn: t,
+  originalIndex: idx,
+  lastUserTurnId,
+  editingTurnId,
+  editingDraft,
+  isGenerating,
+  storedAttachments,
+  hasAssistantActivity,
+  turnEvents,
+  relatedTurns,
+  realtimeLines,
+  hyardJob,
+  renderMessageBody,
+  renderTurnEvents,
+  scopedRenderOptions,
+  onOpenFile,
+  onPreviewAttachment,
+  onBeginEdit,
+  onRetryLastUserTurn,
+  onEditingDraftChange,
+  onCommitEdit,
+  onCancelEdit,
+}) => {
+  const isSystemFeedback = t.user_message.includes('<<<SWITCHYARD_JSON_BEGIN>>>');
+  const assistantContent = t.provider_response || t.error_message;
+  const scopedHyardJobs = t.turn_id && hyardJob ? { [t.turn_id]: hyardJob } : undefined;
+
+  if (t.origin === 'user') {
+    if (isSystemFeedback) {
+      const parsedResults = cachedParseSystemFeedbackResults(t.user_message);
+      return (
+        <React.Fragment key={t.turn_id || idx}>
+          <SystemFeedbackResults results={parsedResults} />
+          {(assistantContent || hasAssistantActivity) && (
+            <div className="message-assistant-flow">
+              <div className="message-header">{t.provider} ({t.role})</div>
+              {assistantContent ? (
+                <RenderedMessageBody
+                  text={assistantContent}
+                  renderMessageBody={renderMessageBody}
+                  onOpenFile={onOpenFile}
+                />
+              ) : null}
+              {renderTurnEvents(t.turn_id, turnEvents, relatedTurns, realtimeLines, scopedHyardJobs, scopedRenderOptions)}
+            </div>
+          )}
+        </React.Fragment>
+      );
+    }
+
+    const isLastUser = Boolean(t.turn_id && t.turn_id === lastUserTurnId);
+    const isEditing = editingTurnId === t.turn_id;
+    const showActions = isLastUser && !isGenerating && !isEditing && Boolean(t.turn_id);
+    const stamp = t.started_at
+      ? new Date(t.started_at).toLocaleTimeString(undefined, {
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      : '';
+    const visibleUserMessage = cachedStripAttachmentReferences(t.user_message);
+    const attachmentsForTurn = mergeInputAttachments(
+      storedAttachments,
+      cachedExtractAttachmentReferences(t.user_message),
+    );
+    return (
+      <React.Fragment key={t.turn_id || idx}>
+        <div className="message-bubble message-user">
+          <div
+            className="message-header"
+            style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
+          >
+            <span>{isEditing ? 'You (editing)' : 'You'}</span>
+            {/* Hover-reveal meta strip — timestamp + Edit /
+                Retry. Actions only render on the latest user
+                turn; the timestamp always renders so hovering
+                any past message surfaces when it was sent. */}
+            <span className="message-meta" style={{ marginLeft: 'auto' }}>
+              {stamp && (
+                <span
+                  style={{
+                    fontSize: '11px',
+                    color: 'var(--text-muted)',
+                    textTransform: 'none',
+                    letterSpacing: 0,
+                    fontWeight: 400,
+                  }}
+                >
+                  {stamp}
+                </span>
+              )}
+              {showActions && (
+                <>
+                  <button
+                    onClick={() => onBeginEdit(t)}
+                    title="Edit & resend — discards history after this turn, restarts core, then re-sends the edited message"
+                    style={{
+                      background: 'transparent',
+                      border: '1px solid var(--border-muted)',
+                      color: 'var(--text-muted)',
+                      borderRadius: '3px',
+                      padding: '2px 6px',
+                      cursor: 'pointer',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      fontSize: '11px',
+                    }}
+                  >
+                    <Pencil size={12} />
+                    <span>Edit</span>
+                  </button>
+                  <button
+                    onClick={() => onRetryLastUserTurn(t.turn_id)}
+                    title="Retry — discards history after this turn and re-sends the same message"
+                    style={{
+                      background: 'transparent',
+                      border: '1px solid var(--border-muted)',
+                      color: 'var(--text-muted)',
+                      borderRadius: '3px',
+                      padding: '2px 6px',
+                      cursor: 'pointer',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      fontSize: '11px',
+                    }}
+                  >
+                    <RefreshCw size={12} />
+                    <span>Retry</span>
+                  </button>
+                </>
+              )}
+            </span>
+          </div>
+          {isEditing ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <textarea
+                value={editingDraft}
+                onChange={(e) => onEditingDraftChange(e.target.value)}
+                rows={Math.min(8, Math.max(2, editingDraft.split('\n').length))}
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
+                    onCommitEdit();
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    onCancelEdit();
+                  }
+                }}
+                style={{
+                  width: '100%',
+                  background: 'rgba(0, 0, 0, 0.2)',
+                  color: 'var(--text-primary)',
+                  border: '1px solid var(--border-muted)',
+                  borderRadius: '4px',
+                  padding: '6px 8px',
+                  fontFamily: 'inherit',
+                  fontSize: '14px',
+                  resize: 'vertical',
+                }}
+              />
+              <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
+                <button
+                  onClick={onCancelEdit}
+                  style={{
+                    background: 'transparent',
+                    border: '1px solid var(--border-muted)',
+                    color: 'var(--text-muted)',
+                    fontSize: '12px',
+                    padding: '4px 10px',
+                    borderRadius: '3px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={onCommitEdit}
+                  disabled={!editingDraft.trim()}
+                  title="Ctrl/⌘+Enter"
+                  style={{
+                    background: 'var(--color-primary)',
+                    border: '1px solid var(--color-primary)',
+                    color: '#fff',
+                    fontSize: '12px',
+                    padding: '4px 10px',
+                    borderRadius: '3px',
+                    cursor: editingDraft.trim() ? 'pointer' : 'not-allowed',
+                    opacity: editingDraft.trim() ? 1 : 0.5,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                  }}
+                >
+                  <Check size={12} />
+                  Save &amp; Resend
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <RenderedMessageBody
+                text={visibleUserMessage}
+                renderMessageBody={renderMessageBody}
+                onOpenFile={onOpenFile}
+              />
+              <UserAttachmentPreviewGrid
+                attachments={attachmentsForTurn}
+                onOpenImage={onPreviewAttachment}
+                onOpenFile={onOpenFile}
+              />
+            </>
+          )}
+        </div>
+        {!isEditing && (assistantContent || hasAssistantActivity) && (
+          <div className="message-assistant-flow">
+            <div className="message-header">{t.provider} ({t.role})</div>
+            {assistantContent ? (
+              <RenderedMessageBody
+                text={assistantContent}
+                renderMessageBody={renderMessageBody}
+                onOpenFile={onOpenFile}
+              />
+            ) : null}
+            {renderTurnEvents(t.turn_id, turnEvents, relatedTurns, realtimeLines, scopedHyardJobs, scopedRenderOptions)}
+          </div>
+        )}
+      </React.Fragment>
+    );
+  }
+
+  if (t.origin === 'system') {
+    const parsedResults = cachedParseSystemFeedbackResults(t.user_message);
+    return (
+      <React.Fragment key={t.turn_id || idx}>
+        <SystemFeedbackResults results={parsedResults} />
+        {(assistantContent || hasAssistantActivity) && (
+          <div className="message-assistant-flow">
+            <div className="message-header">{t.provider} ({t.role})</div>
+            {assistantContent ? (
+              <RenderedMessageBody
+                text={assistantContent}
+                renderMessageBody={renderMessageBody}
+                onOpenFile={onOpenFile}
+              />
+            ) : null}
+            {renderTurnEvents(t.turn_id, turnEvents, relatedTurns, realtimeLines, scopedHyardJobs, scopedRenderOptions)}
+          </div>
+        )}
+      </React.Fragment>
+    );
+  }
+
+  if (t.origin === 'delegate') {
+    return null;
+  }
+
+  return (
+    <div key={t.turn_id || idx} className="message-bubble message-assistant">
+      <div className="message-header">{t.provider} ({t.role})</div>
+      {assistantContent ? (
+        <RenderedMessageBody
+          text={assistantContent}
+          renderMessageBody={renderMessageBody}
+          onOpenFile={onOpenFile}
+        />
+      ) : null}
+      {renderTurnEvents(t.turn_id, turnEvents, relatedTurns, realtimeLines, scopedHyardJobs, scopedRenderOptions)}
+    </div>
+  );
+};
+
+function historicalTurnContentPropsEqual(
+  prev: HistoricalTurnContentProps,
+  next: HistoricalTurnContentProps,
+): boolean {
+  if (prev.turn !== next.turn) return false;
+  if (prev.originalIndex !== next.originalIndex) return false;
+  if (prev.storedAttachments !== next.storedAttachments) return false;
+  if (prev.hasAssistantActivity !== next.hasAssistantActivity) return false;
+  if (prev.turnEvents !== next.turnEvents) return false;
+  if (prev.relatedTurns !== next.relatedTurns) return false;
+  if (prev.realtimeLines !== next.realtimeLines) return false;
+  if (prev.hyardJob !== next.hyardJob) return false;
+
+  const turnId = next.turn.turn_id;
+  const wasLastUser = Boolean(prev.turn.turn_id && prev.turn.turn_id === prev.lastUserTurnId);
+  const isLastUser = Boolean(turnId && turnId === next.lastUserTurnId);
+  if (wasLastUser !== isLastUser) return false;
+  if ((wasLastUser || isLastUser) && prev.isGenerating !== next.isGenerating) return false;
+
+  const wasEditing = prev.editingTurnId === prev.turn.turn_id;
+  const isEditing = next.editingTurnId === turnId;
+  if (wasEditing !== isEditing) return false;
+  if ((wasEditing || isEditing) && prev.editingDraft !== next.editingDraft) return false;
+
+  return true;
+}
+
+const HistoricalTurnContent = React.memo(HistoricalTurnContentBase, historicalTurnContentPropsEqual);
+
 function useRafThrottledValue<T>(value: T): T {
   const [throttled, setThrottled] = useState(value);
   const latestRef = useRef(value);
@@ -235,11 +1374,106 @@ function useRafThrottledValue<T>(value: T): T {
   return throttled;
 }
 
+function hasMeaningfulArtifactValue(value: any): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (Array.isArray(value)) return value.some(hasMeaningfulArtifactValue);
+  if (typeof value === 'object') {
+    return Object.entries(value).some(([key, nested]) => {
+      if (['type', 'role', 'status', 'id', 'call_id', 'tool_call_id', 'request_id', 'index', 'encrypted_content'].includes(key)) {
+        return false;
+      }
+      return hasMeaningfulArtifactValue(nested);
+    });
+  }
+  return false;
+}
+
+function eventHasRenderableArtifact(event: any): boolean {
+  const payload = event?.payload;
+  if (!payload) return false;
+  const item = (
+    payload.item ||
+    payload.params?.item ||
+    payload.event?.item ||
+    payload.msg?.item ||
+    payload.message?.item ||
+    payload.data?.item ||
+    payload.params ||
+    payload.event ||
+    payload.msg ||
+    payload
+  );
+  const itemTypeCandidate = String(item?.type || '').toLowerCase();
+  const itemTypeFromItem = itemTypeCandidate && !itemTypeCandidate.includes('.') && !itemTypeCandidate.includes('/')
+    ? itemTypeCandidate
+    : '';
+  const rawPayloadType = String(payload?.type || payload?.params?.type || '').toLowerCase();
+  const payloadTypeAsItem = rawPayloadType && !rawPayloadType.includes('.') && !rawPayloadType.includes('/')
+    ? rawPayloadType
+    : '';
+  const itemType = String(
+    payload?.item_type ||
+    payload?.params?.item_type ||
+    itemTypeFromItem ||
+    payloadTypeAsItem,
+  ).toLowerCase();
+  const protocolType = String(payload?.method || payload?.params?.method || payload?.type || '').toLowerCase().replace(/\//g, '.');
+  if (!itemType) {
+    return Boolean(
+      item?.execution ||
+      payload.execution ||
+      payload.params?.execution ||
+      item?.line ||
+      payload.line ||
+      payload.params?.line ||
+      item?.output ||
+      payload.output ||
+      payload.params?.output ||
+      item?.result ||
+      payload.result ||
+      payload.params?.result ||
+      item?.aggregated_output ||
+      payload.aggregated_output ||
+      payload.params?.aggregated_output,
+    );
+  }
+  if (['agent_message', 'assistant'].includes(itemType)) return false;
+  if (itemType === 'reasoning') {
+    return [
+      item?.summary,
+      payload?.summary,
+      payload?.params?.summary,
+      item?.text,
+      payload?.text,
+      payload?.params?.text,
+      item?.content,
+      payload?.content,
+      payload?.params?.content,
+      item?.delta?.summary,
+      payload?.delta?.summary,
+      payload?.params?.delta?.summary,
+      item?.delta?.text,
+      payload?.delta?.text,
+      payload?.params?.delta?.text,
+      item?.delta?.content,
+      payload?.delta?.content,
+      payload?.params?.delta?.content,
+    ].some(hasMeaningfulArtifactValue);
+  }
+  if (protocolType.startsWith('turn.')) return false;
+  return true;
+}
+
 export const ChatArea: React.FC<ChatAreaProps> = ({
   selectedSession,
   isGenerating,
   turns,
   turnAttachments = {},
+  runtimeDispatchStartedAt,
+  runtimeDispatchPhase,
+  activeCoreRuntimePhase,
+  activePeerRuntimePhase,
   handleSend,
   handleCancel,
   activeCoreText,
@@ -261,8 +1495,26 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onRetryLastUserTurn,
   onOpenFile,
 }) => {
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const messagesContentRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollRafRef = useRef<number | null>(null);
+  const virtualScrollRafRef = useRef<number | null>(null);
+  const virtualMeasureRafRef = useRef<number | null>(null);
+  const deferredVirtualMeasureTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const scrollSeekIdleTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const isVirtualScrollSeekingRef = useRef(false);
+  const lastVirtualScrollSampleRef = useRef<{ top: number; at: number } | null>(null);
+  const suppressScrollSeekUntilRef = useRef(0);
+  const userPinnedToBottomRef = useRef(true);
+  const userScrollInteractionUntilRef = useRef(0);
+  const groupedSessionEventsCacheRef = useRef<CachedGroupedSessionEvents | null>(null);
+  const virtualRowHeightsRef = useRef<Map<string, number>>(new Map());
+  const virtualRowLayoutRef = useRef<Map<string, Pick<VirtualTurnMetric, 'start' | 'size'>>>(new Map());
+  const settleScrollTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const settleAutoScrollUntilRef = useRef<number>(0);
+  const lastAutoScrollSessionIdRef = useRef<string | null | undefined>(undefined);
+  const pendingInitialScrollSessionIdRef = useRef<string | null>(null);
   const handleSendRef = useRef(handleSend);
   const handleCancelRef = useRef(handleCancel);
   handleSendRef.current = handleSend;
@@ -278,122 +1530,343 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // Inline-edit state for the last user-message bubble. We keep this at the
   // ChatArea level (not inside the bubble) so a session switch or new turn
   // appended above doesn't accidentally trap us in edit mode.
+  const [virtualViewport, setVirtualViewport] = useState({ scrollTop: 0, height: 0 });
+  const [virtualMeasureVersion, setVirtualMeasureVersion] = useState(0);
+  const [isVirtualScrollSeeking, setIsVirtualScrollSeeking] = useState(false);
   const [editingTurnId, setEditingTurnId] = useState<string | null>(null);
   const [editingDraft, setEditingDraft] = useState<string>('');
   const [previewAttachment, setPreviewAttachment] = useState<InputAttachment | null>(null);
+  const currentSessionId = selectedSession?.session_id ?? null;
 
-  // Index of the most recent "real" user-origin turn (excludes the structured
+  // Id of the most recent "real" user-origin turn (excludes the structured
   // system-feedback turns the orchestrator stamps with origin=user but a JSON
   // sentinel payload). Used to gate the edit/retry affordance — only the
   // tail user turn gets the buttons because deleting older ones would also
   // discard everything that came after.
-  const lastUserTurnIdx = (() => {
+  const lastUserTurnId = useMemo(() => {
     for (let i = turns.length - 1; i >= 0; i--) {
       const t = turns[i];
       if (t.origin === 'user' && !t.user_message.includes('<<<SWITCHYARD_JSON_BEGIN>>>')) {
-        return i;
+        return t.turn_id || null;
       }
     }
-    return -1;
-  })();
+    return null;
+  }, [turns]);
 
-  const eventHasRenderableArtifact = (event: any) => {
-    const hasMeaningfulArtifactValue = (value: any): boolean => {
-      if (value === undefined || value === null) return false;
-      if (typeof value === 'string') return value.trim().length > 0;
-      if (Array.isArray(value)) return value.some(hasMeaningfulArtifactValue);
-      if (typeof value === 'object') {
-        return Object.entries(value).some(([key, nested]) => {
-          if (['type', 'role', 'status', 'id', 'call_id', 'tool_call_id', 'request_id', 'index', 'encrypted_content'].includes(key)) {
-            return false;
-          }
-          return hasMeaningfulArtifactValue(nested);
-        });
-      }
-      return false;
+  const { eventsByTurnId, eventActivityTurnIds } = useMemo(() => {
+    const grouped = deriveGroupedSessionEvents(sessionEvents, groupedSessionEventsCacheRef.current);
+    groupedSessionEventsCacheRef.current = {
+      sourceEvents: sessionEvents,
+      eventsByTurnId: grouped.eventsByTurnId,
+      eventActivityTurnIds: grouped.eventActivityTurnIds,
     };
-    const payload = event?.payload;
-    if (!payload) return false;
-    const item = (
-      payload.item ||
-      payload.params?.item ||
-      payload.event?.item ||
-      payload.msg?.item ||
-      payload.message?.item ||
-      payload.data?.item ||
-      payload.params ||
-      payload.event ||
-      payload.msg ||
-      payload
-    );
-    const itemTypeCandidate = String(item?.type || '').toLowerCase();
-    const itemTypeFromItem = itemTypeCandidate && !itemTypeCandidate.includes('.') && !itemTypeCandidate.includes('/')
-      ? itemTypeCandidate
-      : '';
-    const rawPayloadType = String(payload?.type || payload?.params?.type || '').toLowerCase();
-    const payloadTypeAsItem = rawPayloadType && !rawPayloadType.includes('.') && !rawPayloadType.includes('/')
-      ? rawPayloadType
-      : '';
-    const itemType = String(
-      payload?.item_type ||
-      payload?.params?.item_type ||
-      itemTypeFromItem ||
-      payloadTypeAsItem,
-    ).toLowerCase();
-    const protocolType = String(payload?.method || payload?.params?.method || payload?.type || '').toLowerCase().replace(/\//g, '.');
-    if (!itemType) {
-      return Boolean(
-        item?.execution ||
-        payload.execution ||
-        payload.params?.execution ||
-        item?.line ||
-        payload.line ||
-        payload.params?.line ||
-        item?.output ||
-        payload.output ||
-        payload.params?.output ||
-        item?.result ||
-        payload.result ||
-        payload.params?.result ||
-        item?.aggregated_output ||
-        payload.aggregated_output ||
-        payload.params?.aggregated_output,
-      );
-    }
-    if (['agent_message', 'assistant'].includes(itemType)) return false;
-    if (itemType === 'reasoning') {
-      return [
-        item?.summary,
-        payload?.summary,
-        payload?.params?.summary,
-        item?.text,
-        payload?.text,
-        payload?.params?.text,
-        item?.content,
-        payload?.content,
-        payload?.params?.content,
-        item?.delta?.summary,
-        payload?.delta?.summary,
-        payload?.params?.delta?.summary,
-        item?.delta?.text,
-        payload?.delta?.text,
-        payload?.params?.delta?.text,
-        item?.delta?.content,
-        payload?.delta?.content,
-        payload?.params?.delta?.content,
-      ].some(hasMeaningfulArtifactValue);
-    }
-    if (protocolType.startsWith('turn.')) return false;
-    return true;
-  };
+    return grouped;
+  }, [sessionEvents]);
 
-  const hasRenderableActivityForTurn = (turnId?: string | null) => {
+  const delegateTurnsByParent = useMemo(() => {
+    const grouped = new Map<string, Turn[]>();
+    for (const turn of turns) {
+      const parentId = turn.delegated_by;
+      if (!parentId) continue;
+      const existing = grouped.get(parentId);
+      if (existing) {
+        existing.push(turn);
+      } else {
+        grouped.set(parentId, [turn]);
+      }
+    }
+    return grouped;
+  }, [turns]);
+
+  const relatedTurnsByTurnId = useMemo(() => {
+    const grouped = new Map<string, Turn[]>();
+    for (const turn of turns) {
+      if (!turn.turn_id) continue;
+      const delegates = delegateTurnsByParent.get(turn.turn_id);
+      grouped.set(turn.turn_id, delegates?.length ? [turn, ...delegates] : [turn]);
+    }
+    return grouped;
+  }, [delegateTurnsByParent, turns]);
+
+  const scopedRenderOptions = useMemo<RenderTurnEventsOptions>(() => ({
+    eventsAlreadyScoped: true,
+    turnsAlreadyScoped: true,
+  }), []);
+
+  // Keep high-frequency realtime terminal chunks out of the history-row
+  // inclusion set. Otherwise every 33ms terminal flush makes the virtual list
+  // rescan the full turn history even though only the active/visible rows need
+  // to know about live terminal output.
+  const historyRenderableActivityTurnIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const turnId of eventActivityTurnIds) {
+      ids.add(turnId);
+    }
+    for (const turnId of delegateTurnsByParent.keys()) {
+      ids.add(turnId);
+    }
+    if (hyardJobs) {
+      for (const turnId of Object.keys(hyardJobs)) {
+        ids.add(turnId);
+      }
+    }
+    return ids;
+  }, [delegateTurnsByParent, eventActivityTurnIds, hyardJobs]);
+
+  const hasRenderableActivityForTurn = useCallback((turnId?: string | null) => {
     if (!turnId) return false;
+    if (historyRenderableActivityTurnIds.has(turnId)) return true;
     if ((realtimeTerminalLines[turnId]?.length ?? 0) > 0) return true;
-    if (hyardJobs?.[turnId]) return true;
-    if (turns.some((candidate) => candidate.delegated_by === turnId)) return true;
-    return sessionEvents.some((event) => event.turn_id === turnId && eventHasRenderableArtifact(event));
-  };
+    return Boolean(hyardJobs?.[turnId]);
+  }, [historyRenderableActivityTurnIds, hyardJobs, realtimeTerminalLines]);
+  const activeCoreEvents = activeCoreTurnId ? (eventsByTurnId.get(activeCoreTurnId) ?? EMPTY_EVENT_LIST) : EMPTY_EVENT_LIST;
+  const activeCoreRelatedTurns = activeCoreTurnId ? (relatedTurnsByTurnId.get(activeCoreTurnId) ?? EMPTY_TURN_LIST) : EMPTY_TURN_LIST;
+  const activePeerEvents = activePeerTurnId ? (eventsByTurnId.get(activePeerTurnId) ?? EMPTY_EVENT_LIST) : EMPTY_EVENT_LIST;
+  const activePeerRelatedTurns = activePeerTurnId ? (relatedTurnsByTurnId.get(activePeerTurnId) ?? EMPTY_TURN_LIST) : EMPTY_TURN_LIST;
+  const activeCoreHasRenderableActivity = hasRenderableActivityForTurn(activeCoreTurnId);
+  const activePeerHasRenderableActivity = hasRenderableActivityForTurn(activePeerTurnId);
+  const activeCoreRuntimeIsActive = activeCoreTurnId ? isRuntimePhaseActive(activeCoreRuntimePhase) : false;
+  const activePeerRuntimeIsActive = activePeerTurnId ? isRuntimePhaseActive(activePeerRuntimePhase) : false;
+  const showActiveCorePanel = Boolean(
+    activeCoreText ||
+    (
+      activeCoreTurnId &&
+      !activePeerName &&
+      (isGenerating || activeCoreRuntimeIsActive || activeCoreHasRenderableActivity)
+    ),
+  );
+  const showActivePeerPanel = Boolean(
+    activePeerName &&
+    (
+      activePeerText ||
+      isGenerating ||
+      activePeerRuntimeIsActive ||
+      activePeerHasRenderableActivity
+    ),
+  );
+  const showRuntimeDispatchPanel =
+    typeof runtimeDispatchStartedAt === 'number' &&
+    Number.isFinite(runtimeDispatchStartedAt) &&
+    !activeCoreText &&
+    !activeCoreTurnId &&
+    !activePeerName;
+
+  const endVirtualScrollSeek = useCallback(() => {
+    if (scrollSeekIdleTimerRef.current !== null) {
+      window.clearTimeout(scrollSeekIdleTimerRef.current);
+      scrollSeekIdleTimerRef.current = null;
+    }
+    if (isVirtualScrollSeekingRef.current) {
+      isVirtualScrollSeekingRef.current = false;
+      setIsVirtualScrollSeeking(false);
+    }
+  }, []);
+
+  const markProgrammaticScroll = useCallback((durationMs = 220) => {
+    const now = scrollClockNow();
+    suppressScrollSeekUntilRef.current = Math.max(
+      suppressScrollSeekUntilRef.current,
+      now + durationMs,
+    );
+    endVirtualScrollSeek();
+  }, [endVirtualScrollSeek]);
+
+  const updateScrollPinState = useCallback((container: HTMLDivElement) => {
+    const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    userPinnedToBottomRef.current = distanceToBottom <= SCROLL_BOTTOM_PIN_THRESHOLD_PX;
+    return distanceToBottom;
+  }, []);
+
+  const shouldAutoScrollToLatest = useCallback((force = false) => {
+    if (force) return true;
+    if (userPinnedToBottomRef.current) return true;
+    return Date.now() <= settleAutoScrollUntilRef.current;
+  }, []);
+
+  const readVirtualViewport = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const now = scrollClockNow();
+    const next = {
+      scrollTop: container.scrollTop,
+      height: container.clientHeight,
+    };
+    updateScrollPinState(container);
+    const previousSample = lastVirtualScrollSampleRef.current;
+    lastVirtualScrollSampleRef.current = { top: next.scrollTop, at: now };
+    const isProgrammaticScroll = now <= suppressScrollSeekUntilRef.current;
+    if (!isProgrammaticScroll && previousSample) {
+      const deltaPx = Math.abs(next.scrollTop - previousSample.top);
+      const deltaMs = Math.max(1, now - previousSample.at);
+      const velocity = deltaPx / deltaMs;
+      const shouldSeek =
+        deltaPx >= VIRTUAL_SCROLL_SEEK_MIN_DELTA_PX ||
+        velocity >= VIRTUAL_SCROLL_SEEK_VELOCITY_PX_PER_MS;
+      if (shouldSeek || isVirtualScrollSeekingRef.current) {
+        if (!isVirtualScrollSeekingRef.current) {
+          isVirtualScrollSeekingRef.current = true;
+          setIsVirtualScrollSeeking(true);
+        }
+        if (scrollSeekIdleTimerRef.current !== null) {
+          window.clearTimeout(scrollSeekIdleTimerRef.current);
+        }
+        scrollSeekIdleTimerRef.current = window.setTimeout(() => {
+          scrollSeekIdleTimerRef.current = null;
+          isVirtualScrollSeekingRef.current = false;
+          setIsVirtualScrollSeeking(false);
+        }, VIRTUAL_SCROLL_SEEK_IDLE_MS);
+      }
+    }
+    setVirtualViewport((prev) => {
+      if (
+        Math.abs(prev.scrollTop - next.scrollTop) < 0.5 &&
+        Math.abs(prev.height - next.height) < 0.5
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, [updateScrollPinState]);
+
+  const scheduleVirtualViewportRead = useCallback(() => {
+    if (virtualScrollRafRef.current !== null) return;
+    virtualScrollRafRef.current = requestAnimationFrame(() => {
+      virtualScrollRafRef.current = null;
+      readVirtualViewport();
+    });
+  }, [readVirtualViewport]);
+
+  const handleMessagesScroll = useCallback(() => {
+    const container = messagesContainerRef.current;
+    const now = scrollClockNow();
+    const isProgrammaticScroll = now <= suppressScrollSeekUntilRef.current;
+    if (container) {
+      const distanceToBottom = updateScrollPinState(container);
+      const isUserOverrideDuringProgrammaticScroll =
+        isProgrammaticScroll && distanceToBottom > SCROLL_BOTTOM_PIN_THRESHOLD_PX;
+      if (!isProgrammaticScroll && distanceToBottom <= SCROLL_BOTTOM_PIN_THRESHOLD_PX) {
+        scheduleVirtualViewportRead();
+        return;
+      }
+      if (!isProgrammaticScroll || isUserOverrideDuringProgrammaticScroll) {
+        if (isUserOverrideDuringProgrammaticScroll) {
+          suppressScrollSeekUntilRef.current = 0;
+        }
+        userScrollInteractionUntilRef.current = Math.max(
+          userScrollInteractionUntilRef.current,
+          now + USER_SCROLL_INTERACTION_IDLE_MS,
+        );
+        // A stream/update may have queued an auto-scroll while the user was still
+        // pinned. If the user then wheels/drags upward before that RAF fires,
+        // cancel it immediately so the viewport does not snap back to the live
+        // process panel.
+        if (distanceToBottom > SCROLL_BOTTOM_PIN_THRESHOLD_PX) {
+          if (scrollRafRef.current !== null) {
+            cancelAnimationFrame(scrollRafRef.current);
+            scrollRafRef.current = null;
+          }
+          if (settleScrollTimerRef.current !== null) {
+            window.clearTimeout(settleScrollTimerRef.current);
+            settleScrollTimerRef.current = null;
+          }
+          settleAutoScrollUntilRef.current = 0;
+        }
+      }
+    }
+    scheduleVirtualViewportRead();
+  }, [scheduleVirtualViewportRead, updateScrollPinState]);
+
+  const virtualHistoryTurns = useMemo<VirtualTurnEntry[]>(() => {
+    const sessionKey = currentSessionId ?? 'new-session';
+    const entries: VirtualTurnEntry[] = [];
+    turns.forEach((turn, originalIndex) => {
+      if (turn.origin === 'delegate') return;
+      const assistantContent = turn.provider_response || turn.error_message;
+      const containsSystemFeedback = turn.user_message.includes('<<<SWITCHYARD_JSON_BEGIN>>>');
+      const hasActivity = Boolean(turn.turn_id && historyRenderableActivityTurnIds.has(turn.turn_id));
+      const shouldRender =
+        turn.origin === 'user'
+          ? true
+          : turn.origin === 'system'
+            ? Boolean(assistantContent || hasActivity || containsSystemFeedback)
+            : true;
+      if (!shouldRender) return;
+      entries.push({
+        key: `${sessionKey}:${turn.turn_id || `${turn.origin}-${originalIndex}`}`,
+        turn,
+        originalIndex,
+      });
+    });
+    return entries;
+  }, [currentSessionId, historyRenderableActivityTurnIds, turns]);
+
+  const virtualMetrics = useMemo(() => {
+    const metrics: VirtualTurnMetric[] = [];
+    let cursor = 0;
+    virtualHistoryTurns.forEach((entry, idx) => {
+      const size = virtualRowHeightsRef.current.get(entry.key) ?? VIRTUAL_TURN_ESTIMATED_HEIGHT;
+      metrics.push({
+        ...entry,
+        start: cursor,
+        size,
+      });
+      cursor += size;
+      if (idx < virtualHistoryTurns.length - 1) {
+        cursor += VIRTUAL_TURN_GAP;
+      }
+    });
+    return {
+      totalHeight: cursor,
+      metrics,
+    };
+  }, [virtualHistoryTurns, virtualMeasureVersion]);
+
+  const virtualVisibleRows = useMemo(() => {
+    const { metrics } = virtualMetrics;
+    const viewportHeight = Math.max(virtualViewport.height || 0, 1);
+    const rowOverscan = isVirtualScrollSeeking
+      ? VIRTUAL_TURN_SCROLL_SEEK_OVERSCAN
+      : VIRTUAL_TURN_OVERSCAN;
+    const overscanPx = isVirtualScrollSeeking
+      ? Math.max(VIRTUAL_TURN_ESTIMATED_HEIGHT, viewportHeight * 0.25)
+      : Math.max(
+          VIRTUAL_TURN_ESTIMATED_HEIGHT * 2,
+          viewportHeight * 0.75,
+        );
+    const visibleTop = Math.max(0, virtualViewport.scrollTop - overscanPx);
+    const visibleBottom = virtualViewport.scrollTop + viewportHeight + overscanPx;
+
+    let low = 0;
+    let high = metrics.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (metrics[mid].start + metrics[mid].size < visibleTop) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    const startIndex = Math.max(0, low - rowOverscan);
+
+    low = startIndex;
+    high = metrics.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (metrics[mid].start <= visibleBottom) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    const endIndex = Math.min(metrics.length, low + rowOverscan);
+
+    return metrics.slice(startIndex, endIndex);
+  }, [
+    isVirtualScrollSeeking,
+    virtualMetrics,
+    virtualViewport.height,
+    virtualViewport.scrollTop,
+  ]);
 
   // No cleanup effect needed: the bubble only enters edit UI when
   // `editingTurnId === t.turn_id`, so a stale id whose turn has been wiped
@@ -405,7 +1878,177 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // text/tool logs can update many times per second; repeatedly starting
   // `behavior: "smooth"` animations on every chunk is a real input/paint
   // bottleneck on long transcripts. Throttle to at most one layout scroll per
-  // animation frame and use an immediate scroll.
+  // animation frame and use an immediate scroll. Use the scroll container
+  // directly instead of only `scrollIntoView()` so selecting/restoring a
+  // historical session cannot preserve the previous container offset and leave
+  // the user above the latest turn.
+  const scrollMessagesToLatest = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (container) {
+      markProgrammaticScroll();
+      container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      const now = scrollClockNow();
+      const nextViewport = {
+        scrollTop: container.scrollTop,
+        height: container.clientHeight,
+      };
+      lastVirtualScrollSampleRef.current = { top: nextViewport.scrollTop, at: now };
+      userPinnedToBottomRef.current = true;
+      setVirtualViewport((prev) => {
+        if (
+          Math.abs(prev.scrollTop - nextViewport.scrollTop) < 0.5 &&
+          Math.abs(prev.height - nextViewport.height) < 0.5
+        ) {
+          return prev;
+        }
+        return nextViewport;
+      });
+      return;
+    }
+    markProgrammaticScroll();
+    messagesEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [markProgrammaticScroll]);
+
+  const scheduleVirtualMeasureVersionBump = useCallback((deferWhileUserScrolling = false) => {
+    const now = scrollClockNow();
+    const userScrollIdleInMs = Math.max(0, userScrollInteractionUntilRef.current - now);
+    if (deferWhileUserScrolling && (userScrollIdleInMs > 0 || isVirtualScrollSeekingRef.current)) {
+      const delayMs = Math.max(
+        VIRTUAL_SCROLL_SEEK_IDLE_MS,
+        Math.min(USER_SCROLL_INTERACTION_IDLE_MS, userScrollIdleInMs || VIRTUAL_SCROLL_SEEK_IDLE_MS),
+      );
+      if (deferredVirtualMeasureTimerRef.current !== null) {
+        window.clearTimeout(deferredVirtualMeasureTimerRef.current);
+      }
+      deferredVirtualMeasureTimerRef.current = window.setTimeout(() => {
+        deferredVirtualMeasureTimerRef.current = null;
+        if (virtualMeasureRafRef.current !== null) return;
+        virtualMeasureRafRef.current = requestAnimationFrame(() => {
+          virtualMeasureRafRef.current = null;
+          setVirtualMeasureVersion((version) => version + 1);
+        });
+      }, delayMs);
+      return;
+    }
+    if (deferredVirtualMeasureTimerRef.current !== null) {
+      window.clearTimeout(deferredVirtualMeasureTimerRef.current);
+      deferredVirtualMeasureTimerRef.current = null;
+    }
+    if (virtualMeasureRafRef.current !== null) return;
+    virtualMeasureRafRef.current = requestAnimationFrame(() => {
+      virtualMeasureRafRef.current = null;
+      setVirtualMeasureVersion((version) => version + 1);
+    });
+  }, []);
+
+  const handleVirtualRowMeasure = useCallback((key: string, height: number) => {
+    const nextHeight = Math.max(0, Math.ceil(height));
+    const previousStoredHeight = virtualRowHeightsRef.current.get(key);
+    if (previousStoredHeight !== undefined && Math.abs(previousStoredHeight - nextHeight) < VIRTUAL_ROW_MEASURE_EPSILON_PX) {
+      return;
+    }
+
+    const container = messagesContainerRef.current;
+    const previousHeight = previousStoredHeight ?? VIRTUAL_TURN_ESTIMATED_HEIGHT;
+    const delta = nextHeight - previousHeight;
+    const rowLayout = virtualRowLayoutRef.current.get(key);
+    const isSettlingToBottom = Date.now() <= settleAutoScrollUntilRef.current;
+    const wasNearBottom = container
+      ? container.scrollHeight - container.scrollTop - container.clientHeight < 96
+      : false;
+
+    virtualRowHeightsRef.current.set(key, nextHeight);
+
+    const isUserActivelyScrolling =
+      scrollClockNow() <= userScrollInteractionUntilRef.current ||
+      isVirtualScrollSeekingRef.current;
+
+    if (container && rowLayout && Math.abs(delta) >= 4 && !wasNearBottom && !isUserActivelyScrolling) {
+      const previousRowBottom = rowLayout.start + previousHeight;
+      if (previousRowBottom <= container.scrollTop) {
+        markProgrammaticScroll();
+        container.scrollTop = Math.max(0, container.scrollTop + delta);
+        const now = scrollClockNow();
+        const nextViewport = {
+          scrollTop: container.scrollTop,
+          height: container.clientHeight,
+        };
+        lastVirtualScrollSampleRef.current = { top: nextViewport.scrollTop, at: now };
+        setVirtualViewport((prev) => {
+          if (
+            Math.abs(prev.scrollTop - nextViewport.scrollTop) < 0.5 &&
+            Math.abs(prev.height - nextViewport.height) < 0.5
+          ) {
+            return prev;
+          }
+          return nextViewport;
+        });
+      }
+    }
+
+    scheduleVirtualMeasureVersionBump(isUserActivelyScrolling);
+
+    if ((wasNearBottom || isSettlingToBottom) && !isUserActivelyScrolling) {
+      requestAnimationFrame(scrollMessagesToLatest);
+    }
+  }, [markProgrammaticScroll, scheduleVirtualMeasureVersionBump, scrollMessagesToLatest]);
+
+  const scheduleSettleScrollPulse = useCallback(() => {
+    if (settleScrollTimerRef.current !== null) {
+      window.clearTimeout(settleScrollTimerRef.current);
+      settleScrollTimerRef.current = null;
+    }
+
+    const pulse = () => {
+      settleScrollTimerRef.current = null;
+      if (!shouldAutoScrollToLatest(false)) {
+        return;
+      }
+      scrollMessagesToLatest();
+      const remainingMs = settleAutoScrollUntilRef.current - Date.now();
+      if (remainingMs <= 0) {
+        return;
+      }
+      settleScrollTimerRef.current = window.setTimeout(
+        pulse,
+        Math.min(240, Math.max(50, remainingMs)),
+      );
+    };
+
+    settleScrollTimerRef.current = window.setTimeout(pulse, 80);
+  }, [scrollMessagesToLatest, shouldAutoScrollToLatest]);
+
+  const scheduleScrollMessagesToLatest = useCallback((settleAfterLoad = false, immediate = false, force = false) => {
+    if (settleAfterLoad) {
+      settleAutoScrollUntilRef.current = Math.max(
+        settleAutoScrollUntilRef.current,
+        Date.now() + SESSION_ENTRY_AUTO_SCROLL_SETTLE_MS,
+      );
+    }
+    if (!shouldAutoScrollToLatest(force)) {
+      return;
+    }
+    if (immediate) {
+      scrollMessagesToLatest();
+    }
+    if (scrollRafRef.current === null) {
+      const forceThisScroll = force;
+      scrollRafRef.current = requestAnimationFrame(() => {
+        scrollRafRef.current = null;
+        if (!shouldAutoScrollToLatest(forceThisScroll)) {
+          return;
+        }
+        scrollMessagesToLatest();
+      });
+    }
+    if (settleAfterLoad) {
+      // Session history can expand after the first paint as markdown,
+      // syntax blocks, attachment previews, and Chromium content-visibility
+      // estimates settle. Re-assert the bottom after that settle window so
+      // "enter session" lands on the newest message instead of a stale offset.
+      scheduleSettleScrollPulse();
+    }
+  }, [scheduleSettleScrollPulse, scrollMessagesToLatest, shouldAutoScrollToLatest]);
   const activeCoreTerminalLineCount = activeCoreTurnId ? (realtimeTerminalLines[activeCoreTurnId]?.length ?? 0) : 0;
   const activePeerTerminalLineCount = activePeerTurnId ? (realtimeTerminalLines[activePeerTurnId]?.length ?? 0) : 0;
   useEffect(() => {
@@ -414,15 +2057,117 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         cancelAnimationFrame(scrollRafRef.current);
         scrollRafRef.current = null;
       }
+      if (virtualScrollRafRef.current !== null) {
+        cancelAnimationFrame(virtualScrollRafRef.current);
+        virtualScrollRafRef.current = null;
+      }
+      if (virtualMeasureRafRef.current !== null) {
+        cancelAnimationFrame(virtualMeasureRafRef.current);
+        virtualMeasureRafRef.current = null;
+      }
+      if (deferredVirtualMeasureTimerRef.current !== null) {
+        window.clearTimeout(deferredVirtualMeasureTimerRef.current);
+        deferredVirtualMeasureTimerRef.current = null;
+      }
+      if (scrollSeekIdleTimerRef.current !== null) {
+        window.clearTimeout(scrollSeekIdleTimerRef.current);
+        scrollSeekIdleTimerRef.current = null;
+      }
+      if (settleScrollTimerRef.current !== null) {
+        window.clearTimeout(settleScrollTimerRef.current);
+        settleScrollTimerRef.current = null;
+      }
     };
   }, []);
   useEffect(() => {
-    if (scrollRafRef.current !== null) return;
-    scrollRafRef.current = requestAnimationFrame(() => {
-      scrollRafRef.current = null;
-      messagesEndRef.current?.scrollIntoView({ block: 'end' });
+    virtualRowHeightsRef.current.clear();
+    virtualRowLayoutRef.current.clear();
+    lastVirtualScrollSampleRef.current = null;
+    suppressScrollSeekUntilRef.current = 0;
+    userPinnedToBottomRef.current = true;
+    userScrollInteractionUntilRef.current = 0;
+    isVirtualScrollSeekingRef.current = false;
+    setIsVirtualScrollSeeking(false);
+    if (virtualMeasureRafRef.current !== null) {
+      cancelAnimationFrame(virtualMeasureRafRef.current);
+      virtualMeasureRafRef.current = null;
+    }
+    if (deferredVirtualMeasureTimerRef.current !== null) {
+      window.clearTimeout(deferredVirtualMeasureTimerRef.current);
+      deferredVirtualMeasureTimerRef.current = null;
+    }
+    if (scrollSeekIdleTimerRef.current !== null) {
+      window.clearTimeout(scrollSeekIdleTimerRef.current);
+      scrollSeekIdleTimerRef.current = null;
+    }
+    setVirtualMeasureVersion((version) => version + 1);
+    readVirtualViewport();
+  }, [currentSessionId, readVirtualViewport]);
+  useEffect(() => {
+    const validKeys = new Set(virtualHistoryTurns.map((entry) => entry.key));
+    let removedAny = false;
+    for (const key of virtualRowHeightsRef.current.keys()) {
+      if (!validKeys.has(key)) {
+        virtualRowHeightsRef.current.delete(key);
+        removedAny = true;
+      }
+    }
+    if (removedAny) {
+      setVirtualMeasureVersion((version) => version + 1);
+    }
+  }, [virtualHistoryTurns]);
+  useLayoutEffect(() => {
+    const next = new Map<string, Pick<VirtualTurnMetric, 'start' | 'size'>>();
+    for (const metric of virtualMetrics.metrics) {
+      next.set(metric.key, {
+        start: metric.start,
+        size: metric.size,
+      });
+    }
+    virtualRowLayoutRef.current = next;
+  }, [virtualMetrics.metrics]);
+  useEffect(() => {
+    const target = messagesContainerRef.current;
+    readVirtualViewport();
+    if (!target || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      scheduleVirtualViewportRead();
     });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [readVirtualViewport, scheduleVirtualViewportRead]);
+  useEffect(() => {
+    const target = messagesContentRef.current;
+    if (!target || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      if (Date.now() <= settleAutoScrollUntilRef.current) {
+        scheduleScrollMessagesToLatest(false, false, true);
+      }
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [scheduleScrollMessagesToLatest]);
+  useLayoutEffect(() => {
+    if (shouldAutoScrollToLatest(false)) {
+      scrollMessagesToLatest();
+    }
+  }, [scrollMessagesToLatest, shouldAutoScrollToLatest, virtualMetrics.totalHeight]);
+  useLayoutEffect(() => {
+    const sessionId = currentSessionId;
+    const sessionChanged = lastAutoScrollSessionIdRef.current !== sessionId;
+    if (sessionChanged) {
+      lastAutoScrollSessionIdRef.current = sessionId;
+      pendingInitialScrollSessionIdRef.current = sessionId;
+    }
+    const isInitialSessionLoad =
+      sessionId !== null && pendingInitialScrollSessionIdRef.current === sessionId;
+    const forceAutoScroll = sessionChanged || isInitialSessionLoad;
+    scheduleScrollMessagesToLatest(forceAutoScroll, forceAutoScroll, forceAutoScroll);
+    if (isInitialSessionLoad && turns.length > 0) {
+      pendingInitialScrollSessionIdRef.current = null;
+    }
   }, [
+    currentSessionId,
     turns,
     isGenerating,
     renderedActiveCoreText,
@@ -433,24 +2178,25 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     sessionEvents.length,
     activeCoreTerminalLineCount,
     activePeerTerminalLineCount,
+    scheduleScrollMessagesToLatest,
   ]);
 
-  const beginEdit = (turn: Turn) => {
+  const beginEdit = useCallback((turn: Turn) => {
     setEditingTurnId(turn.turn_id);
-    setEditingDraft(stripAttachmentReferences(turn.user_message));
-  };
-  const cancelEdit = () => {
+    setEditingDraft(cachedStripAttachmentReferences(turn.user_message));
+  }, []);
+  const cancelEdit = useCallback(() => {
     setEditingTurnId(null);
     setEditingDraft('');
-  };
-  const commitEdit = () => {
+  }, []);
+  const commitEdit = useCallback(() => {
     const trimmed = editingDraft.trim();
     if (!trimmed || !editingTurnId) return;
     const id = editingTurnId;
     setEditingTurnId(null);
     setEditingDraft('');
     onEditAndResend(id, trimmed);
-  };
+  }, [editingDraft, editingTurnId, onEditAndResend]);
 
   return (
     <div className="main-content glass-panel" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>
@@ -517,17 +2263,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 <X size={14} />
               </button>
             </div>
-            <img
-              src={convertFileSrc(previewAttachment.path)}
-              alt={previewAttachment.name || filenameFromPath(previewAttachment.path)}
-              style={{
-                maxWidth: 'min(86vw, 1100px)',
-                maxHeight: '78vh',
-                objectFit: 'contain',
-                borderRadius: 8,
-                background: '#020617',
-              }}
-            />
+            <ImageAttachmentModalBody attachment={previewAttachment} />
           </div>
         </div>
       )}
@@ -552,368 +2288,130 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
       </div>
 
-      <div className="chat-messages" style={{ flex: 1, overflowY: 'auto', padding: '12px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
-        {turns.length === 0 && !activeCoreText && !isGenerating && !activeCoreTurnId ? (
-          <div className="empty-chat">
-            <MessageSquare size={48} className="empty-chat-logo" />
-            <div>
-              <h3>Start a Conversation</h3>
-              <p style={{ fontSize: '13px', marginTop: '6px' }}>
-                Send a message to run the central orchestrator and delegate tasks to peers.
-              </p>
+      <div
+        ref={messagesContainerRef}
+        className="chat-messages"
+        onScroll={handleMessagesScroll}
+        style={{ flex: 1, overflowY: 'auto', padding: '12px', overflowAnchor: 'none' }}
+      >
+        <div ref={messagesContentRef} style={{ minHeight: '100%', display: 'flex', flexDirection: 'column', gap: '14px', overflowAnchor: 'none' }}>
+          {turns.length === 0 &&
+          !showRuntimeDispatchPanel &&
+          !showActiveCorePanel &&
+          !showActivePeerPanel ? (
+            <div className="empty-chat">
+              <MessageSquare size={48} className="empty-chat-logo" />
+              <div>
+                <h3>Start a Conversation</h3>
+                <p style={{ fontSize: '13px', marginTop: '6px' }}>
+                  Send a message to run the central orchestrator and delegate tasks to peers.
+                </p>
+              </div>
             </div>
-          </div>
-        ) : (
-          turns.map((t, idx) => {
-            const isSystemFeedback = t.user_message.includes('<<<SWITCHYARD_JSON_BEGIN>>>');
-            const assistantContent = t.provider_response || t.error_message;
-            const renderedByActiveCorePanel = isGenerating && activeCoreTurnId === t.turn_id && !activePeerName;
-            const renderedByActivePeerPanel = isGenerating && activePeerTurnId === t.turn_id && Boolean(activePeerName);
-            const hasAssistantActivity =
-              !renderedByActiveCorePanel &&
-              !renderedByActivePeerPanel &&
-              hasRenderableActivityForTurn(t.turn_id);
+          ) : (
+            <>
+              {virtualHistoryTurns.length > 0 && (
+                <div
+                  style={{
+                    position: 'relative',
+                    height: virtualMetrics.totalHeight,
+                    flex: '0 0 auto',
+                    overflowAnchor: 'none',
+                    pointerEvents: isVirtualScrollSeeking ? 'none' : undefined,
+                  }}
+                >
+                  {virtualVisibleRows.map((virtualRow) => {
+                    const hasMeasuredHeight = virtualRowHeightsRef.current.has(virtualRow.key);
+                    if (isVirtualScrollSeeking && !hasMeasuredHeight) {
+                      return (
+                        <VirtualTurnRow
+                          key={virtualRow.key}
+                          itemKey={virtualRow.key}
+                          top={virtualRow.start}
+                          onMeasure={handleVirtualRowMeasure}
+                          shouldMeasure={false}
+                        >
+                          <VirtualTurnPlaceholder height={virtualRow.size} />
+                        </VirtualTurnRow>
+                      );
+                    }
+                    const t = virtualRow.turn;
+                    const renderedByActiveCorePanel = showActiveCorePanel && activeCoreTurnId === t.turn_id && !activePeerName;
+                    const renderedByActivePeerPanel = showActivePeerPanel && activePeerTurnId === t.turn_id && Boolean(activePeerName);
+                    const hasAssistantActivity =
+                      !renderedByActiveCorePanel &&
+                      !renderedByActivePeerPanel &&
+                      hasRenderableActivityForTurn(t.turn_id);
+                    const turnEvents = eventsByTurnId.get(t.turn_id) ?? EMPTY_EVENT_LIST;
+                    const relatedTurns = t.turn_id ? (relatedTurnsByTurnId.get(t.turn_id) ?? [t]) : [t];
 
-            if (t.origin === 'user') {
-              if (isSystemFeedback) {
-                let parsedResults = null;
-                try {
-                  const match = t.user_message.match(/<<<SWITCHYARD_JSON_BEGIN>>>([\s\S]*?)<<<SWITCHYARD_JSON_END>>>/);
-                  if (match && match[1]) {
-                    parsedResults = JSON.parse(match[1]);
-                  }
-                } catch (e) {
-                  // Ignore parsing error
-                }
-
-                return (
-                  <React.Fragment key={t.turn_id || idx}>
-                    {parsedResults && parsedResults.results && (
-                      <div 
-                        className="message-bubble message-system"
-                        style={{ 
-                          alignSelf: 'center', 
-                          width: '100%', 
-                          background: 'rgba(255, 255, 255, 0.02)', 
-                          border: '1px dashed var(--border-muted)', 
-                          borderRadius: '4px', 
-                          padding: '12px',
-                          fontSize: '13px',
-                          color: 'var(--text-secondary)',
-                          marginBottom: '16px'
-                        }}
+                    return (
+                      <VirtualTurnRow
+                        key={virtualRow.key}
+                        itemKey={virtualRow.key}
+                        top={virtualRow.start}
+                        onMeasure={handleVirtualRowMeasure}
+                        shouldMeasure={!isVirtualScrollSeeking}
                       >
-                        <div style={{ fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--color-primary)', marginBottom: '8px' }}>
-                          <span>Aggregated Delegation Results</span>
-                          <span style={{ fontSize: '11px', padding: '2px 6px', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-primary)', borderRadius: '3px' }}>
-                            System Feedback
-                          </span>
-                        </div>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                          {parsedResults.results.map((res: any, rIdx: number) => (
-                            <div key={res.id || rIdx} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 12px', background: 'rgba(0, 0, 0, 0.2)', borderRadius: '4px', borderLeft: `3px solid ${res.status === 'success' ? '#10b981' : '#ef4444'}` }}>
-                              <div>
-                                <span style={{ fontWeight: 'bold', color: 'var(--text-primary)' }}>{res.id}</span>
-                                <span style={{ marginLeft: '8px', color: 'var(--text-muted)' }}>({res.provider})</span>
-                              </div>
-                              <div style={{ display: 'flex', gap: '12px', fontSize: '11px' }}>
-                                <span>Status: <span style={{ color: res.status === 'success' ? '#10b981' : '#ef4444' }}>{res.status}</span></span>
-                                <span>Duration: {res.duration_ms}ms</span>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                    {(assistantContent || hasAssistantActivity) && (
-                      <div className="message-assistant-flow">
-                        <div className="message-header">{t.provider} ({t.role})</div>
-                        {assistantContent ? (
-                          <RenderedMessageBody
-                            text={assistantContent}
-                            renderMessageBody={renderMessageBody}
-                            onOpenFile={onOpenFile}
-                          />
-                        ) : null}
-                        {renderTurnEvents(t.turn_id, sessionEvents, turns, realtimeTerminalLines[t.turn_id], hyardJobs)}
-                      </div>
-                    )}
-                  </React.Fragment>
-                );
-              }
-
-              const isLastUser = idx === lastUserTurnIdx;
-              const isEditing = editingTurnId === t.turn_id;
-              const showActions = isLastUser && !isGenerating && !isEditing && Boolean(t.turn_id);
-              const stamp = t.started_at
-                ? new Date(t.started_at).toLocaleTimeString(undefined, {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })
-                : '';
-              const visibleUserMessage = stripAttachmentReferences(t.user_message);
-              const attachmentsForTurn = mergeInputAttachments(
-                turnAttachments[t.turn_id],
-                extractAttachmentsFromAttachmentReferences(t.user_message),
-              );
-              return (
-                <React.Fragment key={t.turn_id || idx}>
-                  <div className="message-bubble message-user">
-                    <div
-                      className="message-header"
-                      style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
-                    >
-                      <span>{isEditing ? 'You (editing)' : 'You'}</span>
-                      {/* Hover-reveal meta strip — timestamp + Edit /
-                          Retry. Actions only render on the latest user
-                          turn; the timestamp always renders so hovering
-                          any past message surfaces when it was sent. */}
-                      <span className="message-meta" style={{ marginLeft: 'auto' }}>
-                        {stamp && (
-                          <span
-                            style={{
-                              fontSize: '11px',
-                              color: 'var(--text-muted)',
-                              textTransform: 'none',
-                              letterSpacing: 0,
-                              fontWeight: 400,
-                            }}
-                          >
-                            {stamp}
-                          </span>
-                        )}
-                        {showActions && (
-                          <>
-                          <button
-                            onClick={() => beginEdit(t)}
-                            title="Edit & resend — discards history after this turn, restarts core, then re-sends the edited message"
-                            style={{
-                              background: 'transparent',
-                              border: '1px solid var(--border-muted)',
-                              color: 'var(--text-muted)',
-                              borderRadius: '3px',
-                              padding: '2px 6px',
-                              cursor: 'pointer',
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              gap: '4px',
-                              fontSize: '11px',
-                            }}
-                          >
-                            <Pencil size={12} />
-                            <span>Edit</span>
-                          </button>
-                          <button
-                            onClick={() => onRetryLastUserTurn(t.turn_id)}
-                            title="Retry — discards history after this turn and re-sends the same message"
-                            style={{
-                              background: 'transparent',
-                              border: '1px solid var(--border-muted)',
-                              color: 'var(--text-muted)',
-                              borderRadius: '3px',
-                              padding: '2px 6px',
-                              cursor: 'pointer',
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              gap: '4px',
-                              fontSize: '11px',
-                            }}
-                          >
-                            <RefreshCw size={12} />
-                            <span>Retry</span>
-                          </button>
-                          </>
-                        )}
-                      </span>
-                    </div>
-                    {isEditing ? (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                        <textarea
-                          value={editingDraft}
-                          onChange={(e) => setEditingDraft(e.target.value)}
-                          rows={Math.min(8, Math.max(2, editingDraft.split('\n').length))}
-                          autoFocus
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-                              e.preventDefault();
-                              commitEdit();
-                            } else if (e.key === 'Escape') {
-                              e.preventDefault();
-                              cancelEdit();
-                            }
-                          }}
-                          style={{
-                            width: '100%',
-                            background: 'rgba(0, 0, 0, 0.2)',
-                            color: 'var(--text-primary)',
-                            border: '1px solid var(--border-muted)',
-                            borderRadius: '4px',
-                            padding: '6px 8px',
-                            fontFamily: 'inherit',
-                            fontSize: '14px',
-                            resize: 'vertical',
-                          }}
-                        />
-                        <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
-                          <button
-                            onClick={cancelEdit}
-                            style={{
-                              background: 'transparent',
-                              border: '1px solid var(--border-muted)',
-                              color: 'var(--text-muted)',
-                              fontSize: '12px',
-                              padding: '4px 10px',
-                              borderRadius: '3px',
-                              cursor: 'pointer',
-                            }}
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            onClick={commitEdit}
-                            disabled={!editingDraft.trim()}
-                            title="Ctrl/⌘+Enter"
-                            style={{
-                              background: 'var(--color-primary)',
-                              border: '1px solid var(--color-primary)',
-                              color: '#fff',
-                              fontSize: '12px',
-                              padding: '4px 10px',
-                              borderRadius: '3px',
-                              cursor: editingDraft.trim() ? 'pointer' : 'not-allowed',
-                              opacity: editingDraft.trim() ? 1 : 0.5,
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              gap: '4px',
-                            }}
-                          >
-                            <Check size={12} />
-                            Save &amp; Resend
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <>
-                        <RenderedMessageBody
-                          text={visibleUserMessage}
+                        <HistoricalTurnContent
+                          turn={t}
+                          originalIndex={virtualRow.originalIndex}
+                          lastUserTurnId={lastUserTurnId}
+                          editingTurnId={editingTurnId}
+                          editingDraft={editingDraft}
+                          isGenerating={isGenerating}
+                          storedAttachments={turnAttachments[t.turn_id]}
+                          hasAssistantActivity={hasAssistantActivity}
+                          turnEvents={turnEvents}
+                          relatedTurns={relatedTurns}
+                          realtimeLines={realtimeTerminalLines[t.turn_id]}
+                          hyardJob={t.turn_id ? hyardJobs?.[t.turn_id] : undefined}
                           renderMessageBody={renderMessageBody}
+                          renderTurnEvents={renderTurnEvents}
+                          scopedRenderOptions={scopedRenderOptions}
                           onOpenFile={onOpenFile}
+                          onPreviewAttachment={setPreviewAttachment}
+                          onBeginEdit={beginEdit}
+                          onRetryLastUserTurn={onRetryLastUserTurn}
+                          onEditingDraftChange={setEditingDraft}
+                          onCommitEdit={commitEdit}
+                          onCancelEdit={cancelEdit}
                         />
-                        <UserAttachmentPreviewGrid
-                          attachments={attachmentsForTurn}
-                          onOpenImage={setPreviewAttachment}
-                          onOpenFile={onOpenFile}
-                        />
-                      </>
-                    )}
-                  </div>
-                  {!isEditing && (assistantContent || hasAssistantActivity) && (
-                    <div className="message-assistant-flow">
-                      <div className="message-header">{t.provider} ({t.role})</div>
-                      {assistantContent ? (
-                        <RenderedMessageBody
-                          text={assistantContent}
-                          renderMessageBody={renderMessageBody}
-                          onOpenFile={onOpenFile}
-                        />
-                      ) : null}
-                      {renderTurnEvents(t.turn_id, sessionEvents, turns, realtimeTerminalLines[t.turn_id], hyardJobs)}
-                    </div>
-                  )}
-                </React.Fragment>
-              );
-            } else if (t.origin === 'system') {
-              let parsedResults = null;
-              try {
-                const match = t.user_message.match(/<<<SWITCHYARD_JSON_BEGIN>>>([\s\S]*?)<<<SWITCHYARD_JSON_END>>>/);
-                if (match && match[1]) {
-                  parsedResults = JSON.parse(match[1]);
-                }
-              } catch (e) {
-                // Ignore parsing error
-              }
-
-              return (
-                <React.Fragment key={t.turn_id || idx}>
-                  {parsedResults && parsedResults.results && (
-                    <div 
-                      className="message-bubble message-system"
-                      style={{ 
-                        alignSelf: 'center', 
-                        width: '100%', 
-                        background: 'rgba(255, 255, 255, 0.02)', 
-                        border: '1px dashed var(--border-muted)', 
-                        borderRadius: '4px', 
-                        padding: '12px',
-                        fontSize: '13px',
-                        color: 'var(--text-secondary)',
-                        marginBottom: '16px'
-                      }}
-                    >
-                      <div style={{ fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--color-primary)', marginBottom: '8px' }}>
-                        <span>Aggregated Delegation Results</span>
-                        <span style={{ fontSize: '11px', padding: '2px 6px', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-primary)', borderRadius: '3px' }}>
-                          System Feedback
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                        {parsedResults.results.map((res: any, rIdx: number) => (
-                          <div key={res.id || rIdx} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 12px', background: 'rgba(0, 0, 0, 0.2)', borderRadius: '4px', borderLeft: `3px solid ${res.status === 'success' ? '#10b981' : '#ef4444'}` }}>
-                            <div>
-                              <span style={{ fontWeight: 'bold', color: 'var(--text-primary)' }}>{res.id}</span>
-                              <span style={{ marginLeft: '8px', color: 'var(--text-muted)' }}>({res.provider})</span>
-                            </div>
-                            <div style={{ display: 'flex', gap: '12px', fontSize: '11px' }}>
-                              <span>Status: <span style={{ color: res.status === 'success' ? '#10b981' : '#ef4444' }}>{res.status}</span></span>
-                              <span>Duration: {res.duration_ms}ms</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {(assistantContent || hasAssistantActivity) && (
-                    <div className="message-assistant-flow">
-                      <div className="message-header">{t.provider} ({t.role})</div>
-                      {assistantContent ? (
-                        <RenderedMessageBody
-                          text={assistantContent}
-                          renderMessageBody={renderMessageBody}
-                          onOpenFile={onOpenFile}
-                        />
-                      ) : null}
-                      {renderTurnEvents(t.turn_id, sessionEvents, turns, realtimeTerminalLines[t.turn_id], hyardJobs)}
-                    </div>
-                  )}
-                </React.Fragment>
-              );
-            } else if (t.origin === 'delegate') {
-              return null;
-            } else {
-              return (
-                <div key={t.turn_id || idx} className="message-bubble message-assistant">
-                  <div className="message-header">{t.provider} ({t.role})</div>
-                  {assistantContent ? (
-                    <RenderedMessageBody
-                      text={assistantContent}
-                      renderMessageBody={renderMessageBody}
-                      onOpenFile={onOpenFile}
-                    />
-                  ) : null}
-                  {renderTurnEvents(t.turn_id, sessionEvents, turns, realtimeTerminalLines[t.turn_id], hyardJobs)}
+                      </VirtualTurnRow>
+                    );
+                  })}
                 </div>
-              );
-            }
-          })
-        )}
+              )}
+            </>
+          )}
 
         {/* Active Core fallback before the backend reports the canonical turn id. */}
-        {isGenerating && !activeCoreText && !activeCoreTurnId && !activePeerName && (
+        {showRuntimeDispatchPanel && (
           <div className="message-assistant-flow">
             <div className="message-header">{selectedSession?.active_core ?? 'Core'} (core)</div>
-            <div className="message-body" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)' }}>
-              <span className="thinking-dots">正在准备并启动 core provider…</span>
-              <span className="spinner-small"></span>
+            <div className="message-body live-execution-activity">
+              <div className="live-execution-card">
+                <div className="live-execution-topline">
+                  <span className="live-execution-elapsed">
+                    <ChatLiveElapsedLabel startedAt={runtimeDispatchStartedAt} />
+                  </span>
+                </div>
+                <div className="live-execution-divider" />
+                <div className="live-execution-section-label">正在建立运行时</div>
+                <div className="live-execution-stream-row">
+                  <span className="live-execution-stream-icon live-execution-output-icon" aria-hidden="true">•</span>
+                  <span className="live-execution-stream-text">
+                    {runtimeDispatchPhase || '正在准备并启动 core provider，等待首个流式事件…'}
+                  </span>
+                </div>
+                <div className="live-execution-section-label live-execution-thinking-label">
+                  正在思考
+                  <span className="spinner-small" aria-label="运行中" />
+                </div>
+                <div className="live-execution-thinking-text">
+                  发送已经进入后端调度队列；若 provider 预热、恢复 persistent instance 或权限握手较慢，这里会持续实时计时。
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -921,7 +2419,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         {/* Active Core Streaming response container.
             Keep this visible even during tool-only/status-only phases, otherwise
             the user sees a silent wait while runtime events are arriving. */}
-        {(activeCoreText || (isGenerating && activeCoreTurnId && !activePeerName)) && (
+        {showActiveCorePanel && (
           <div className="message-assistant-flow">
             <div className="message-header">{selectedSession?.active_core ?? 'Core'} (core)</div>
             {renderedActiveCoreText ? (
@@ -931,10 +2429,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   renderMessageBody={renderMessageBody}
                   onOpenFile={onOpenFile}
                 />
-                {activeCoreTurnId && renderTurnActivitySummary(activeCoreTurnId, sessionEvents, turns, realtimeTerminalLines[activeCoreTurnId], hyardJobs)}
+                {activeCoreTurnId && renderTurnActivitySummary(activeCoreTurnId, activeCoreEvents, activeCoreRelatedTurns, realtimeTerminalLines[activeCoreTurnId], hyardJobs, scopedRenderOptions)}
               </>
             ) : activeCoreTurnId ? (
-              renderTurnActivitySummary(activeCoreTurnId, sessionEvents, turns, realtimeTerminalLines[activeCoreTurnId], hyardJobs)
+              renderTurnActivitySummary(activeCoreTurnId, activeCoreEvents, activeCoreRelatedTurns, realtimeTerminalLines[activeCoreTurnId], hyardJobs, scopedRenderOptions)
             ) : (
               <div className="message-body" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)' }}>
                 <span className="thinking-dots">正在连接 provider，等待首个流式事件…</span>
@@ -945,7 +2443,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         )}
 
         {/* Active Peer Streaming delegation box */}
-        {activePeerName && (
+        {showActivePeerPanel && (
           <div
             className="message-bubble message-assistant"
             style={{ alignSelf: 'flex-start', borderLeft: '3px solid var(--color-secondary)', background: 'rgba(6, 182, 212, 0.05)' }}
@@ -960,10 +2458,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   renderMessageBody={renderMessageBody}
                   onOpenFile={onOpenFile}
                 />
-                {activePeerTurnId && renderTurnActivitySummary(activePeerTurnId, sessionEvents, turns, realtimeTerminalLines[activePeerTurnId], hyardJobs)}
+                {activePeerTurnId && renderTurnActivitySummary(activePeerTurnId, activePeerEvents, activePeerRelatedTurns, realtimeTerminalLines[activePeerTurnId], hyardJobs, scopedRenderOptions)}
               </>
             ) : activePeerTurnId ? (
-              renderTurnActivitySummary(activePeerTurnId, sessionEvents, turns, realtimeTerminalLines[activePeerTurnId], hyardJobs)
+              renderTurnActivitySummary(activePeerTurnId, activePeerEvents, activePeerRelatedTurns, realtimeTerminalLines[activePeerTurnId], hyardJobs, scopedRenderOptions)
             ) : (
               <div className="message-body" style={{ fontStyle: 'italic', display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <span className="thinking-dots">正在等待 peer 输出…</span>
@@ -1042,7 +2540,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           </>
         )}
 
-        <div ref={messagesEndRef} />
+          <div ref={messagesEndRef} />
+        </div>
       </div>
 
       <ChatComposer
@@ -1120,11 +2619,40 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
     });
   }, []);
 
-  const saveDroppedOrPastedFiles = useCallback(async (files: File[]) => {
+  const addOrPersistNativeAttachmentPaths = useCallback(async (paths: string[]) => {
+    const savedPaths: string[] = [];
+    for (const rawPath of paths) {
+      const path = typeof rawPath === 'string' ? rawPath.trim() : '';
+      if (!path) continue;
+
+      if (!looksLikeEphemeralAttachmentPath(path)) {
+        savedPaths.push(path);
+        continue;
+      }
+
+      try {
+        const savedPath = await persistAttachmentFile(path, attachmentFromPath(path).mimeType);
+        savedPaths.push(savedPath);
+      } catch (error) {
+        console.error('Failed to persist ephemeral attachment path', error);
+        setAttachmentError(`无法持久化临时附件 ${filenameFromPath(path)}：${String(error)}`);
+      }
+    }
+
+    if (savedPaths.length > 0) {
+      addAttachmentsFromPaths(savedPaths);
+    }
+  }, [addAttachmentsFromPaths]);
+
+  const saveDroppedOrPastedFiles = useCallback(async (
+    files: File[],
+    options?: { preferNativePath?: boolean },
+  ) => {
+    const preferNativePath = options?.preferNativePath ?? false;
     const savedPaths: string[] = [];
     for (const file of files) {
-      const nativePath = (file as File & { path?: string }).path;
-      if (typeof nativePath === 'string' && nativePath.trim()) {
+      const nativePath = nativePathForFile(file);
+      if (preferNativePath && nativePath && !looksLikeEphemeralAttachmentPath(nativePath)) {
         savedPaths.push(nativePath);
         continue;
       }
@@ -1132,14 +2660,23 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
       try {
         const dataUrl = await readFileAsDataUrl(file);
         const savedPath = await saveClipboardAttachment(
-          file.name || undefined,
-          file.type || undefined,
+          attachmentNameHintForFile(file, nativePath),
+          mimeTypeHintForFile(file, nativePath),
           dataUrl,
         );
         savedPaths.push(savedPath);
       } catch (error) {
+        if (nativePath) {
+          try {
+            const savedPath = await persistAttachmentFile(nativePath, mimeTypeHintForFile(file, nativePath));
+            savedPaths.push(savedPath);
+            continue;
+          } catch (persistError) {
+            console.error('Failed to persist native attachment fallback', persistError);
+          }
+        }
         console.error('Failed to save pasted/dropped attachment', error);
-        setAttachmentError(`无法读取或保存附件 ${file.name || 'clipboard item'}：${String(error)}`);
+        setAttachmentError(`无法读取或保存附件 ${file.name || nativePath || 'clipboard item'}：${String(error)}`);
       }
     }
     if (savedPaths.length > 0) {
@@ -1189,7 +2726,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
           setIsDragOver(false);
           dragDepthRef.current = 0;
           if (inside) {
-            addAttachmentsFromPaths(payload.paths);
+            void addOrPersistNativeAttachmentPaths(payload.paths);
           }
         }
       })
@@ -1207,13 +2744,13 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
       disposed = true;
       unlisten?.();
     };
-  }, [addAttachmentsFromPaths, isPointInsideComposer]);
+  }, [addOrPersistNativeAttachmentPaths, isPointInsideComposer]);
 
   const handlePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const files = Array.from(event.clipboardData?.files ?? []);
     if (files.length === 0) return;
     event.preventDefault();
-    void saveDroppedOrPastedFiles(files);
+    void saveDroppedOrPastedFiles(files, { preferNativePath: false });
   }, [saveDroppedOrPastedFiles]);
 
   const handleDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
@@ -1246,7 +2783,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
     setIsDragOver(false);
     const files = Array.from(event.dataTransfer.files ?? []);
     if (files.length > 0) {
-      void saveDroppedOrPastedFiles(files);
+      void saveDroppedOrPastedFiles(files, { preferNativePath: true });
     }
   }, [saveDroppedOrPastedFiles]);
 

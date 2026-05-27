@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use switchyard_provider_api::{
-    ArtifactBundle, ContextBundle, ExecutionPolicy, LiveInstanceRegistry, PersistentProvider,
-    ProbeResult, Provider, ProviderError, ProviderEvent, TurnInput, TurnResult,
+    ArtifactBundle, ContextBundle, ExecutionPolicy, InstanceState, LiveInstanceRegistry,
+    PersistentProvider, ProbeResult, Provider, ProviderError, ProviderEvent, TurnInput, TurnResult,
 };
 
 /// Adapts a [`Provider`] so that `start_turn` first looks for an idle live
@@ -60,6 +61,7 @@ impl Provider for PersistentProviderProxy {
             && let Some((instance_id, inst_lock)) =
                 reg.checkout_any_idle(&self.provider_name, self.session_id)
         {
+            reg.update_state(instance_id, InstanceState::Busy { turn_id });
             let mut inst = inst_lock.lock().await;
             if let Err(e) = inst.update_context(context).await {
                 reg.release(instance_id);
@@ -88,12 +90,23 @@ impl Provider for PersistentProviderProxy {
 
             let mut response_text = String::new();
             let mut failed = false;
+            let mut timed_out = false;
+            let mut cancelled_by_user = false;
             let provider_name = self.provider_name.clone();
+            let timeout_secs = policy.timeout_secs;
+            let turn_timeout = tokio::time::sleep(Duration::from_secs(timeout_secs.max(1)));
+            tokio::pin!(turn_timeout);
 
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         failed = true;
+                        cancelled_by_user = true;
+                        break;
+                    }
+                    _ = &mut turn_timeout, if timeout_secs > 0 => {
+                        failed = true;
+                        timed_out = true;
                         break;
                     }
                     pe_opt = event_rx.recv() => {
@@ -114,7 +127,23 @@ impl Provider for PersistentProviderProxy {
                 }
             }
 
-            reg.release(instance_id);
+            if timed_out || cancelled_by_user {
+                reg.terminate(instance_id);
+            } else {
+                reg.release(instance_id);
+            }
+
+            if timed_out {
+                return Err(ProviderError::ExecutionFailed(format!(
+                    "persistent provider turn timed out after {timeout_secs} seconds"
+                )));
+            }
+
+            if cancelled_by_user {
+                return Err(ProviderError::ExecutionFailed(
+                    "persistent provider turn cancelled by user".into(),
+                ));
+            }
 
             let mut metadata = HashMap::new();
             metadata.insert(
@@ -210,14 +239,92 @@ fn payload_item_type(payload: &serde_json::Value) -> Option<String> {
     })
 }
 
+fn role_from_value(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(|value| value.as_str())
+        .map(normalize_activity_kind)
+        .filter(|role| !role.is_empty())
+}
+
+fn item_role(item: &serde_json::Value) -> Option<String> {
+    role_from_value(item.get("role"))
+        .or_else(|| role_from_value(item.get("message").and_then(|message| message.get("role"))))
+}
+
+fn payload_role(payload: &serde_json::Value) -> Option<String> {
+    role_from_value(payload.get("role"))
+        .or_else(|| payload.get("item").and_then(item_role))
+        .or_else(|| {
+            role_from_value(
+                payload
+                    .get("message")
+                    .and_then(|message| message.get("role")),
+            )
+        })
+        .or_else(|| role_from_value(payload.get("params").and_then(|params| params.get("role"))))
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|params| params.get("item"))
+                .and_then(item_role)
+        })
+        .or_else(|| {
+            role_from_value(
+                payload
+                    .get("params")
+                    .and_then(|params| params.get("message"))
+                    .and_then(|message| message.get("role")),
+            )
+        })
+}
+
+fn is_assistant_role(role: &str) -> bool {
+    matches!(role, "assistant" | "agent" | "model")
+}
+
+fn payload_has_explicit_assistant_role(payload: &serde_json::Value) -> bool {
+    payload_role(payload)
+        .as_deref()
+        .map(is_assistant_role)
+        .unwrap_or(false)
+}
+
+fn payload_has_explicit_non_assistant_role(payload: &serde_json::Value) -> bool {
+    payload_role(payload)
+        .as_deref()
+        .map(|role| !is_assistant_role(role))
+        .unwrap_or(false)
+}
+
+fn item_is_assistant_message(item: &serde_json::Value) -> bool {
+    if let Some(role) = item_role(item) {
+        return is_assistant_role(&role);
+    }
+
+    let item_type = item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(normalize_activity_kind);
+    matches!(item_type.as_deref(), Some("agent_message" | "assistant"))
+}
+
 fn is_non_assistant_activity_item(item_type: &str) -> bool {
     matches!(
         item_type,
         "tool_use"
+            | "user"
+            | "user_message"
+            | "user_input"
+            | "input_message"
             | "tool_call"
             | "function_call"
             | "custom_tool_call"
             | "mcp_tool_call"
+            | "dynamic_tool_call"
+            | "collab_agent_tool_call"
+            | "web_search"
+            | "image_view"
+            | "image_generation"
             | "local_shell_call"
             | "tool_result"
             | "tool_response"
@@ -229,6 +336,15 @@ fn is_non_assistant_activity_item(item_type: &str) -> bool {
             | "file_change"
             | "diff_ready"
             | "todo_list"
+            | "plan"
+            | "hook"
+            | "runtime_status"
+            | "auto_approval_review"
+            | "terminal_interaction"
+            | "mcp_tool_call_progress"
+            | "raw_response_item"
+            | "delegate_request"
+            | "delegate_result"
             | "approval_request"
             | "approval_decision"
             | "server_request"
@@ -239,11 +355,13 @@ fn is_non_assistant_activity_item(item_type: &str) -> bool {
             | "shell_output_delta"
             | "stdout_delta"
             | "stderr_delta"
+            | "process_output_delta"
             | "file_change_delta"
             | "diff_delta"
             | "patch_delta"
             | "execution_telemetry"
             | "reasoning"
+            | "error"
     )
 }
 
@@ -307,13 +425,19 @@ fn protocol_has_text_hint(payload: &serde_json::Value) -> bool {
 }
 
 fn allows_plain_text_field(
+    payload: &serde_json::Value,
     item_type: Option<&str>,
     text_protocol_hint: bool,
     has_protocol_kind: bool,
 ) -> bool {
+    if payload_has_explicit_non_assistant_role(payload) {
+        return false;
+    }
+
     text_protocol_hint
         || !has_protocol_kind
-        || matches!(item_type, Some("agent_message" | "assistant" | "message"))
+        || matches!(item_type, Some("agent_message" | "assistant"))
+        || (matches!(item_type, Some("message")) && payload_has_explicit_assistant_role(payload))
 }
 
 fn is_textish_delta_kind(kind: &str) -> bool {
@@ -377,10 +501,14 @@ fn accumulate_response_text_from_event_with_hint(
     {
         return;
     }
+    if payload_has_explicit_non_assistant_role(payload) {
+        return;
+    }
 
     let protocol_kind = runtime_protocol_kind(payload);
     let text_protocol_hint = inherited_text_hint || protocol_has_text_hint(payload);
     let plain_text_allowed = allows_plain_text_field(
+        payload,
         item_type.as_deref(),
         text_protocol_hint,
         !protocol_kind.is_empty(),
@@ -439,6 +567,7 @@ fn accumulate_response_text_from_event_with_hint(
     // final body instead of leaving persistent turns empty.
     if let Some(text) = payload
         .get("item")
+        .filter(|item| item_is_assistant_message(item))
         .and_then(|item| item.get("text"))
         .and_then(|value| value.as_str())
     {
@@ -447,6 +576,7 @@ fn accumulate_response_text_from_event_with_hint(
     }
     if let Some(text) = payload
         .get("item")
+        .filter(|item| item_is_assistant_message(item))
         .and_then(|item| item.get("content"))
         .and_then(content_text)
     {
@@ -455,6 +585,7 @@ fn accumulate_response_text_from_event_with_hint(
     }
     if let Some(text) = payload
         .get("item")
+        .filter(|item| item_is_assistant_message(item))
         .and_then(|item| item.get("message"))
         .and_then(|message| message.get("content"))
         .and_then(content_text)
@@ -530,6 +661,65 @@ mod tests {
         );
 
         assert_eq!(text, "final from params");
+    }
+
+    #[test]
+    fn user_message_items_do_not_replace_assistant_response() {
+        let mut text = String::from("assistant body");
+
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "user_message",
+                    "text": "what caused this?"
+                }
+            }),
+        );
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "text": "what caused this?"
+                    }
+                }
+            }),
+        );
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "message",
+                "role": "user",
+                "content": "what caused this?"
+            }),
+        );
+
+        assert_eq!(text, "assistant body");
+    }
+
+    #[test]
+    fn generic_assistant_message_items_replace_streamed_delta_body() {
+        let mut text = String::from("partial");
+
+        accumulate_response_text_from_event(
+            &mut text,
+            &json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "text": "assistant final"
+                }
+            }),
+        );
+
+        assert_eq!(text, "assistant final");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use uuid::Uuid;
@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_session_sequence
     ON events(session_id, sequence_id);
+CREATE INDEX IF NOT EXISTS idx_events_session_timestamp_sequence
+    ON events(session_id, timestamp, sequence_id);
 CREATE INDEX IF NOT EXISTS idx_events_turn_sequence
     ON events(turn_id, sequence_id);
 
@@ -530,6 +532,64 @@ impl SessionEventRepository for SqliteStore {
         for row in rows {
             let json = row?;
             events.push(serde_json::from_str::<Event>(&json)?);
+        }
+        Ok(events)
+    }
+
+    fn list_session_events_since(
+        &self,
+        session_id: Uuid,
+        after_timestamp: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Event>, StoreError> {
+        if after_timestamp.is_none() && limit.is_none() {
+            return self.list_session_events(session_id);
+        }
+
+        let session_id = session_id.to_string();
+        let after_timestamp = after_timestamp.map(|timestamp| timestamp.to_rfc3339());
+        let sql = match (after_timestamp.is_some(), limit.is_some()) {
+            (true, true) => {
+                "SELECT data FROM events WHERE session_id = ?1 AND timestamp >= ?2 ORDER BY sequence_id ASC LIMIT ?3"
+            }
+            (true, false) => {
+                "SELECT data FROM events WHERE session_id = ?1 AND timestamp >= ?2 ORDER BY sequence_id ASC"
+            }
+            (false, true) => {
+                "SELECT data FROM events WHERE session_id = ?1 ORDER BY sequence_id ASC LIMIT ?2"
+            }
+            (false, false) => unreachable!(),
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut events = Vec::new();
+        match (after_timestamp, limit) {
+            (Some(after_timestamp), Some(limit)) => {
+                let rows = stmt
+                    .query_map(params![session_id, after_timestamp, limit as i64], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                for row in rows {
+                    events.push(serde_json::from_str::<Event>(&row?)?);
+                }
+            }
+            (Some(after_timestamp), None) => {
+                let rows = stmt.query_map(params![session_id, after_timestamp], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                for row in rows {
+                    events.push(serde_json::from_str::<Event>(&row?)?);
+                }
+            }
+            (None, Some(limit)) => {
+                let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                for row in rows {
+                    events.push(serde_json::from_str::<Event>(&row?)?);
+                }
+            }
+            (None, None) => {}
         }
         Ok(events)
     }

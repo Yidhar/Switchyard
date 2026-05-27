@@ -632,6 +632,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
         {
             tx.send(
                 crate::runtime_events::RuntimeEvent::CallbackReceiptsInjected {
+                    session_id: session.session_id,
                     provider: session.active_core.clone(),
                     count: callback_receipts.len(),
                 },
@@ -718,6 +719,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
             if let Some(tx) = runtime_tx {
                 for task in &request.requests {
                     tx.send(crate::runtime_events::RuntimeEvent::DelegateRequested {
+                        session_id: session.session_id,
                         core_turn_id,
                         peer: task.id.clone(),
                         role: task.role.to_string(),
@@ -757,6 +759,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
             // Build observer to forward peer events as RuntimeEvents
             let observer: Option<Box<switchyard_orchestrator::PeerEventObserver>> =
                 runtime_tx.map(|tx| {
+                    let session_id = session.session_id;
                     // The peer observer is a synchronous callback invoked while
                     // orchestrator drains provider events. Use an unbounded
                     // in-process hop here, then await the real runtime sender in
@@ -780,6 +783,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                         {
                             Some(
                                 crate::runtime_events::RuntimeEvent::PeerExecutionTelemetry {
+                                    session_id,
                                     turn_id: pe.turn_id,
                                     provider: peer.clone(),
                                     execution,
@@ -789,6 +793,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                             switchyard_provider_api::extract_hyard_job_observation(&pe.payload)
                         {
                             Some(crate::runtime_events::RuntimeEvent::HyardJobObserved {
+                                session_id,
                                 turn_id: pe.turn_id,
                                 source_provider: pe.provider.clone(),
                                 observed_at: pe.timestamp.to_rfc3339(),
@@ -798,6 +803,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                             switchyard_provider_api::extract_terminal_output(&pe.payload)
                         {
                             Some(crate::runtime_events::RuntimeEvent::PeerTerminalOutput {
+                                session_id,
                                 turn_id: pe.turn_id,
                                 provider: peer.clone(),
                                 text: terminal.line,
@@ -807,6 +813,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                             match pe.event_type {
                                 switchyard_provider_api::EventType::TurnStarted => {
                                     Some(crate::runtime_events::RuntimeEvent::PeerTurnStarted {
+                                        session_id,
                                         turn_id: pe.turn_id,
                                         provider: peer.clone(),
                                     })
@@ -822,6 +829,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                                     } else {
                                         let item_text = pe.display_text_or_summary();
                                         Some(crate::runtime_events::RuntimeEvent::PeerItemUpdated {
+                                            session_id,
                                             turn_id: pe.turn_id,
                                             provider: peer.clone(),
                                             event_type: pe.event_type.to_string(),
@@ -832,6 +840,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                                 }
                                 switchyard_provider_api::EventType::TurnCompleted => {
                                     Some(crate::runtime_events::RuntimeEvent::PeerOutputCompleted {
+                                        session_id,
                                         turn_id: pe.turn_id,
                                         provider: peer.clone(),
                                     })
@@ -954,6 +963,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                         for result in &response.results {
                             let status = result.status.to_string();
                             tx.send(crate::runtime_events::RuntimeEvent::DelegateCompleted {
+                                session_id: session.session_id,
                                 core_turn_id,
                                 peer: result.id.clone(),
                                 status,
@@ -970,6 +980,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                     if let Some(tx) = runtime_tx {
                         for task in &request.requests {
                             tx.send(crate::runtime_events::RuntimeEvent::DelegateCompleted {
+                                session_id: session.session_id,
                                 core_turn_id,
                                 peer: task.id.clone(),
                                 status: "failed".to_string(),

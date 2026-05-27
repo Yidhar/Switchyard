@@ -140,7 +140,7 @@ pub fn status(primary_root: &Path) -> Result<GitStatus, String> {
             "status",
             "--porcelain=v1",
             "--branch",
-            "--untracked-files=all",
+            "--untracked-files=normal",
             "-z",
         ],
     )?;

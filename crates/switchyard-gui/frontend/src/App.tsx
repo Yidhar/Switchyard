@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { Suspense, lazy, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
+import { unstable_batchedUpdates } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type {
   SwitchyardConfig,
   Session,
@@ -17,21 +19,17 @@ import type {
 } from './types';
 import { Sidebar } from './components/Sidebar';
 import { IconRail, type RailMode } from './components/IconRail';
-import { WorkspaceHeader } from './components/WorkspaceHeader';
+import { AppTopBar } from './components/AppTopBar';
+import { WelcomeWorkspace } from './components/WelcomeWorkspace';
 import { ChatArea } from './components/ChatArea';
-import { ControlCenter } from './components/ControlCenter';
-import { SettingsModal } from './components/SettingsModal';
-import { Canvas, type CanvasMode, type CanvasTab } from './components/Canvas';
+import type { CanvasMode, CanvasTab } from './components/Canvas';
 import { fetchSnapshot, saveFile } from './components/canvasApi';
-import { FilesTree } from './components/FilesTree';
-import { SourceControl } from './components/SourceControl';
-import { TopologyOverlay } from './components/TopologyOverlay';
-import { TerminalPanel } from './components/TerminalPanel';
 import { StatusBar } from './components/StatusBar';
 import { parseSlash, type SlashContext } from './components/slashCommands';
 // ArtifactDrawer is no longer rendered — its bottom-bar UX didn't fit
 // the new layout. The import + state are dropped along with the bar.
 import { renderMessageBody, isSystemStatusText, renderTurnEvents, renderTurnActivitySummary } from './components/ui/RenderHelpers';
+import type { RuntimeTurnPhase, RenderTurnEventsOptions } from './components/ui/RenderHelpers';
 import { resolveToolApproval } from './services/api';
 import {
   attachmentFromPath,
@@ -41,10 +39,25 @@ import {
   mergeInputAttachments,
   stripAttachmentReferences,
 } from './utils/attachments';
+import {
+  fallbackResponseForUserMessage,
+  mergeFallbackResponseIntoTurns,
+  mergeFinalResponseIntoTurns,
+  mergeFreshTurnsPreservingKnownResponses,
+  nonBlankText,
+} from './utils/turnMerge';
+
+const Canvas = lazy(() => import('./components/Canvas'));
+const ControlCenter = lazy(() => import('./components/ControlCenter'));
+const FilesTree = lazy(() => import('./components/FilesTree'));
+const SettingsModal = lazy(() => import('./components/SettingsModal'));
+const SourceControl = lazy(() => import('./components/SourceControl'));
+const TerminalPanel = lazy(() => import('./components/TerminalPanel'));
+const TopologyOverlay = lazy(() => import('./components/TopologyOverlay'));
 
 const RUNTIME_ITEM_EVENT_FALLBACK = 'item_updated';
-const DEBUG_RUNTIME_EVENTS = false;
 const MAX_REALTIME_TERMINAL_LINES = 1000;
+const MAX_REALTIME_TERMINAL_CHARS = 200_000;
 const DEFAULT_LEFT_COLUMN_WIDTH = 280;
 const MIN_LEFT_COLUMN_WIDTH = 220;
 const MAX_LEFT_COLUMN_WIDTH = 460;
@@ -53,6 +66,248 @@ const MIN_CANVAS_COLUMN_WIDTH = 360;
 const DEFAULT_CANVAS_COLUMN_WIDTH = 680;
 const DEFAULT_SANDBOX_MODE: SandboxMode = 'workspace-write';
 const TURN_ATTACHMENTS_STORAGE_KEY = 'switchyard.turnAttachments.v1';
+const TEMP_USER_TURN_ID_PREFIX = 'temp-user-';
+
+interface PendingTurnAttachmentBinding {
+  bindingId: string;
+  sessionId: string;
+  text: string;
+  attachments: InputAttachment[];
+  beforeTurnIds: string[];
+  tempTurnId?: string;
+  createdAt: number;
+  resolvedTurnId?: string;
+}
+
+interface SessionUiSnapshot {
+  turns: Turn[];
+  sessionEvents: any[];
+  sessionWorkers: InstanceMetadata[];
+  activeCoreText: string;
+  activePeerText: string;
+  activePeerName: string | null;
+  activeNodes: string[];
+  activeTurnIds: string[];
+  activeCoreTurnId: string | null;
+  activePeerTurnId: string | null;
+  selectedAgentTurnId: string | null;
+  hyardJobs: Record<string, any>;
+  realtimeTerminalLines: Record<string, string[]>;
+  realtimeTerminalBuffers: Record<string, string>;
+  runtimeTurnPhases: Record<string, RuntimeTurnPhase>;
+  runtimeTurnStartedAt: Record<string, number>;
+  runtimeTurnPhaseChangedAt: Record<string, number>;
+  runtimeDispatchStartedAt: number | null;
+  runtimePreparingPhase: string | null;
+  isGenerating: boolean;
+  messageQueue: SendPayload[];
+  loaded: boolean;
+  loadedAt: number;
+}
+
+function createEmptySessionUiSnapshot(): SessionUiSnapshot {
+  return {
+    turns: [],
+    sessionEvents: [],
+    sessionWorkers: [],
+    activeCoreText: '',
+    activePeerText: '',
+    activePeerName: null,
+    activeNodes: [],
+    activeTurnIds: [],
+    activeCoreTurnId: null,
+    activePeerTurnId: null,
+    selectedAgentTurnId: null,
+    hyardJobs: {},
+    realtimeTerminalLines: {},
+    realtimeTerminalBuffers: {},
+    runtimeTurnPhases: {},
+    runtimeTurnStartedAt: {},
+    runtimeTurnPhaseChangedAt: {},
+    runtimeDispatchStartedAt: null,
+    runtimePreparingPhase: null,
+    isGenerating: false,
+    messageQueue: [],
+    loaded: false,
+    loadedAt: 0,
+  };
+}
+
+function sessionUiSnapshotWithRuntimePhase(
+  snapshot: SessionUiSnapshot,
+  turnId: unknown,
+  phase: RuntimeTurnPhase,
+  options?: { ensureOnly?: boolean; now?: number },
+): SessionUiSnapshot {
+  if (typeof turnId !== 'string' || !turnId) return snapshot;
+  const previousPhase = snapshot.runtimeTurnPhases[turnId];
+  if (options?.ensureOnly && previousPhase) return snapshot;
+  const now = options?.now ?? Date.now();
+  const nextStartedAt =
+    phase === 'running' || phase === 'output_completed' || phase === 'finalizing'
+      ? (snapshot.runtimeTurnStartedAt[turnId] ?? now)
+      : snapshot.runtimeTurnStartedAt[turnId];
+  return {
+    ...snapshot,
+    runtimeTurnPhases: {
+      ...snapshot.runtimeTurnPhases,
+      [turnId]: previousPhase ?? phase,
+      ...(options?.ensureOnly ? {} : { [turnId]: phase }),
+    },
+    runtimeTurnPhaseChangedAt: {
+      ...snapshot.runtimeTurnPhaseChangedAt,
+      [turnId]: options?.ensureOnly
+        ? (snapshot.runtimeTurnPhaseChangedAt[turnId] ?? now)
+        : now,
+    },
+    runtimeTurnStartedAt: nextStartedAt
+      ? { ...snapshot.runtimeTurnStartedAt, [turnId]: nextStartedAt }
+      : snapshot.runtimeTurnStartedAt,
+  };
+}
+
+function sessionUiSnapshotSeedStartedAt(
+  snapshot: SessionUiSnapshot,
+  turnId: unknown,
+  startedAt: number | null,
+): SessionUiSnapshot {
+  if (typeof turnId !== 'string' || !turnId || !startedAt || snapshot.runtimeTurnStartedAt[turnId]) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    runtimeTurnStartedAt: {
+      ...snapshot.runtimeTurnStartedAt,
+      [turnId]: startedAt,
+    },
+  };
+}
+
+function sessionUiSnapshotEnsureTerminal(
+  snapshot: SessionUiSnapshot,
+  turnId: unknown,
+): SessionUiSnapshot {
+  if (typeof turnId !== 'string' || !turnId) return snapshot;
+  if (
+    Object.prototype.hasOwnProperty.call(snapshot.realtimeTerminalBuffers, turnId) &&
+    Object.prototype.hasOwnProperty.call(snapshot.realtimeTerminalLines, turnId)
+  ) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    realtimeTerminalBuffers: Object.prototype.hasOwnProperty.call(snapshot.realtimeTerminalBuffers, turnId)
+      ? snapshot.realtimeTerminalBuffers
+      : { ...snapshot.realtimeTerminalBuffers, [turnId]: '' },
+    realtimeTerminalLines: Object.prototype.hasOwnProperty.call(snapshot.realtimeTerminalLines, turnId)
+      ? snapshot.realtimeTerminalLines
+      : { ...snapshot.realtimeTerminalLines, [turnId]: [] },
+  };
+}
+
+function sessionUiSnapshotResetTerminal(
+  snapshot: SessionUiSnapshot,
+  turnId: unknown,
+): SessionUiSnapshot {
+  if (typeof turnId !== 'string' || !turnId) return snapshot;
+  return {
+    ...snapshot,
+    realtimeTerminalBuffers: {
+      ...snapshot.realtimeTerminalBuffers,
+      [turnId]: '',
+    },
+    realtimeTerminalLines: {
+      ...snapshot.realtimeTerminalLines,
+      [turnId]: [],
+    },
+  };
+}
+
+function sessionUiSnapshotAppendTerminalText(
+  snapshot: SessionUiSnapshot,
+  turnId: unknown,
+  text: unknown,
+): SessionUiSnapshot {
+  if (typeof turnId !== 'string' || !turnId || typeof text !== 'string' || text.length === 0) {
+    return snapshot;
+  }
+  const nextText = trimRealtimeTextBuffer(
+    `${snapshot.realtimeTerminalBuffers[turnId] || ''}${normalizeRealtimeText(text)}`,
+  );
+  return {
+    ...snapshot,
+    realtimeTerminalBuffers: {
+      ...snapshot.realtimeTerminalBuffers,
+      [turnId]: nextText,
+    },
+    realtimeTerminalLines: {
+      ...snapshot.realtimeTerminalLines,
+      [turnId]: realtimeTextToLines(nextText),
+    },
+  };
+}
+
+function LazyPanelFallback({ label, minHeight = 96 }: { label: string; minHeight?: number }) {
+  return (
+    <div
+      style={{
+        minHeight,
+        height: '100%',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 16,
+        color: 'var(--text-muted)',
+        fontSize: 12,
+      }}
+    >
+      {label}
+    </div>
+  );
+}
+
+function truthyDebugFlag(value: unknown): boolean {
+  return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+function debugRuntimeEventsEnabled(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return truthyDebugFlag(window.localStorage.getItem('switchyard.debugRuntimeEvents'));
+  } catch {
+    return false;
+  }
+}
+
+function runtimeEventDebugSummary(type: string, data: any) {
+  const payload = data?.payload;
+  return {
+    type,
+    turn_id: data?.turn_id,
+    provider: data?.provider,
+    event_type: data?.event_type,
+    text_len: typeof data?.text === 'string' ? data.text.length : 0,
+    payload_item_type: payload ? runtimeItemType(payload) : '',
+    payload_method: firstRuntimeIdentity(payload?.method, payload?.params?.method) || '',
+  };
+}
+
+function leafName(path: string): string {
+  if (!path) return '';
+  const normalised = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  const idx = normalised.lastIndexOf('/');
+  return idx >= 0 ? normalised.slice(idx + 1) : normalised;
+}
+
+function normalizePathKey(path: string): string {
+  const normalised = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  // Windows drive-letter and UNC paths should be treated case-insensitively
+  // when de-duping workspace roots; POSIX paths keep their case.
+  if (/^[A-Za-z]:\//.test(normalised) || normalised.startsWith('//')) {
+    return normalised.toLowerCase();
+  }
+  return normalised;
+}
 
 function normalizeSendPayload(input: string | SendPayload): SendPayload {
   if (typeof input === 'string') {
@@ -96,6 +351,86 @@ function attachmentsFromPayload(payload: SendPayload): InputAttachment[] {
     payload.imagePaths.map((path) => attachmentFromPath(path)),
     (payload.filePaths ?? []).map((path) => attachmentFromPath(path)),
     extractAttachmentsFromAttachmentReferences(payload.text),
+  );
+}
+
+function normalizedAttachmentMatchText(text: string): string {
+  return stripAttachmentReferences(text).trim();
+}
+
+function createTempUserTurnId(sessionId: string): string {
+  const random = Math.random().toString(36).slice(2, 10);
+  return `${TEMP_USER_TURN_ID_PREFIX}${sessionId}-${Date.now()}-${random}`;
+}
+
+function turnIdsBeforeSend(turns: Turn[], sessionId: string): string[] {
+  return turns
+    .filter((turn) => (
+      turn.session_id === sessionId &&
+      !turn.turn_id.startsWith(TEMP_USER_TURN_ID_PREFIX)
+    ))
+    .map((turn) => turn.turn_id);
+}
+
+function findMatchingAttachmentTurn(
+  turnList: Turn[],
+  binding: PendingTurnAttachmentBinding,
+): Turn | null {
+  if (binding.resolvedTurnId) {
+    const resolved = turnList.find((turn) => (
+      turn.turn_id === binding.resolvedTurnId &&
+      turn.session_id === binding.sessionId
+    ));
+    if (resolved) return resolved;
+  }
+
+  const targetText = normalizedAttachmentMatchText(binding.text);
+  const beforeIds = new Set(binding.beforeTurnIds);
+  const candidates = turnList
+    .filter((turn) => (
+      turn.session_id === binding.sessionId &&
+      turn.origin === 'user' &&
+      turn.turn_id !== binding.tempTurnId
+    ))
+    .reverse();
+
+  return (
+    candidates.find((turn) => (
+      !beforeIds.has(turn.turn_id) &&
+      normalizedAttachmentMatchText(turn.user_message) === targetText
+    )) ??
+    candidates.find((turn) => !beforeIds.has(turn.turn_id)) ??
+    candidates.find((turn) => normalizedAttachmentMatchText(turn.user_message) === targetText) ??
+    null
+  );
+}
+
+function findFreshlySentTurn(
+  turnList: Turn[],
+  sessionId: string,
+  message: string,
+  beforeTurnIds: string[],
+  tempTurnId?: string,
+): Turn | null {
+  const targetText = normalizedAttachmentMatchText(message);
+  const beforeIds = new Set(beforeTurnIds);
+  const candidates = turnList
+    .filter((turn) => (
+      turn.session_id === sessionId &&
+      turn.origin === 'user' &&
+      turn.turn_id !== tempTurnId &&
+      !turn.turn_id.startsWith(TEMP_USER_TURN_ID_PREFIX)
+    ))
+    .reverse();
+
+  return (
+    candidates.find((turn) => (
+      !beforeIds.has(turn.turn_id) &&
+      normalizedAttachmentMatchText(turn.user_message) === targetText
+    )) ??
+    candidates.find((turn) => !beforeIds.has(turn.turn_id)) ??
+    candidates.find((turn) => normalizedAttachmentMatchText(turn.user_message) === targetText) ??
+    null
   );
 }
 
@@ -180,6 +515,92 @@ function normalizeRuntimeEventType(value: any): string {
     .toLowerCase();
 }
 
+const KNOWN_WORKER_STATES = new Set<InstanceMetadata['state']>([
+  'spawning',
+  'idle',
+  'busy',
+  'retrying',
+  'dying',
+  'dead',
+]);
+
+const ACTIVE_HYARD_JOB_STATUSES = new Set(['queued', 'running', 'cancel_requested', 'wait_timeout']);
+
+function normalizedString(value: any): string | null {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+function normalizeWorkerKind(value: any): InstanceMetadata['kind'] {
+  return normalizeRuntimeEventType(value) === 'core' ? 'core' : 'worker';
+}
+
+function normalizeWorkerState(value: any): InstanceMetadata['state'] {
+  const state = normalizeRuntimeEventType(value);
+  if (KNOWN_WORKER_STATES.has(state as InstanceMetadata['state'])) {
+    return state as InstanceMetadata['state'];
+  }
+  return 'idle';
+}
+
+function normalizeInstanceMetadata(raw: any): InstanceMetadata | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const instanceId = normalizedString(raw.instance_id ?? raw.instanceId ?? raw.id);
+  const provider = normalizedString(raw.provider);
+  const sessionId = normalizedString(raw.session_id ?? raw.sessionId);
+  if (!instanceId || !provider || !sessionId) return null;
+
+  return {
+    instance_id: instanceId,
+    provider,
+    session_id: sessionId,
+    label: normalizedString(raw.label),
+    kind: normalizeWorkerKind(raw.kind),
+    spawned_at: normalizedString(raw.spawned_at ?? raw.spawnedAt) ?? new Date().toISOString(),
+    state: normalizeWorkerState(raw.state),
+    in_flight_turn_id: normalizedString(raw.in_flight_turn_id ?? raw.inFlightTurnId),
+  };
+}
+
+function normalizeInstanceMetadataList(rawList: any): InstanceMetadata[] {
+  if (!Array.isArray(rawList)) return [];
+  return rawList
+    .map((item) => normalizeInstanceMetadata(item))
+    .filter((item): item is InstanceMetadata => item !== null);
+}
+
+function upsertInstanceMetadata(list: InstanceMetadata[], next: InstanceMetadata): InstanceMetadata[] {
+  const index = list.findIndex((item) => item.instance_id === next.instance_id);
+  if (index === -1) return [...list, next];
+  const clone = list.slice();
+  clone[index] = { ...clone[index], ...next };
+  return clone;
+}
+
+function activeHyardJobStatus(job: any): string {
+  const liveStatus = normalizeRuntimeEventType(job?.job_status ?? job?.live_status);
+  if (liveStatus) return liveStatus;
+  return normalizeRuntimeEventType(job?.status);
+}
+
+function isActiveHyardJob(job: any): boolean {
+  return ACTIVE_HYARD_JOB_STATUSES.has(activeHyardJobStatus(job));
+}
+
+function countActiveHyardJobs(jobs: Record<string, any>): number {
+  const seen = new Set<string>();
+  let count = 0;
+  Object.values(jobs).forEach((job, index) => {
+    if (!isActiveHyardJob(job)) return;
+    const key = normalizedString(job?.job_id ?? job?.id) ?? `anonymous-${index}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    count += 1;
+  });
+  return count;
+}
+
 function runtimeItemType(payload: any): string {
   const item = runtimePayloadItem(payload);
   const raw = firstRuntimeIdentity(
@@ -203,6 +624,11 @@ const NON_ASSISTANT_RUNTIME_ITEM_TYPES = new Set([
   'function_call',
   'custom_tool_call',
   'mcp_tool_call',
+  'dynamic_tool_call',
+  'collab_agent_tool_call',
+  'web_search',
+  'image_view',
+  'image_generation',
   'local_shell_call',
   'tool_result',
   'tool_response',
@@ -214,6 +640,13 @@ const NON_ASSISTANT_RUNTIME_ITEM_TYPES = new Set([
   'file_change',
   'diff_ready',
   'todo_list',
+  'plan',
+  'hook',
+  'runtime_status',
+  'auto_approval_review',
+  'terminal_interaction',
+  'mcp_tool_call_progress',
+  'raw_response_item',
   'delegate_request',
   'delegate_result',
   'approval_request',
@@ -226,6 +659,7 @@ const NON_ASSISTANT_RUNTIME_ITEM_TYPES = new Set([
   'shell_output_delta',
   'stdout_delta',
   'stderr_delta',
+  'process_output_delta',
   'file_change_delta',
   'diff_delta',
   'patch_delta',
@@ -281,10 +715,7 @@ function runtimeContentText(value: any): string | null {
 }
 
 function normalizeRuntimeKind(value: any): string {
-  return String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[\/_\-\s]+/g, '.');
+  return normalizeRuntimeEventType(value).replace(/_/g, '.');
 }
 
 function runtimeDeltaText(value: any, inheritedTextHint = false): string | null {
@@ -341,9 +772,8 @@ function runtimePayloadText(payload: any): string | null {
 }
 
 function runtimeProtocolKind(payload: any): string {
-  return String(payload?.method || payload?.params?.method || payload?.type || payload?.params?.type || '')
-    .toLowerCase()
-    .replace(/\//g, '.');
+  return normalizeRuntimeEventType(payload?.method || payload?.params?.method || payload?.type || payload?.params?.type || '')
+    .replace(/_/g, '.');
 }
 
 function runtimeDeltaKind(payload: any): string {
@@ -409,6 +839,9 @@ function payloadLooksLikeToolOrActivity(payload: any): boolean {
     protocol.includes('server.request') ||
     protocol.includes('terminal') ||
     protocol.includes('execution') ||
+    protocol.includes('plan') ||
+    protocol.includes('hook') ||
+    protocol.includes('reasoning') ||
     protocol.includes('diff') ||
     protocol.includes('file.change')
   ) {
@@ -422,10 +855,15 @@ function payloadLooksLikeToolOrActivity(payload: any): boolean {
     'stdout',
     'stderr',
     'aggregated_output',
+    'aggregatedOutput',
     'exit_code',
+    'exitCode',
     'diff',
     'patch',
     'file',
+    'filePath',
+    'relativePath',
+    'sourcePath',
     'path',
     'request',
     'tool',
@@ -442,9 +880,10 @@ function payloadLooksLikeToolOrActivity(payload: any): boolean {
   });
 }
 
-function appendRealtimeLines(current: string[] | undefined, incoming: string[]): string[] {
-  const next = [...(current || [])];
-  for (const line of incoming) {
+function compactRealtimeLines(incoming: string[]): string[] {
+  const next: string[] = [];
+  for (const rawLine of incoming) {
+    const line = String(rawLine ?? '').replace(/\r/g, '');
     // Runtime status text and terminal output can occasionally mirror the same
     // provider line. De-dupe consecutive duplicates so the live activity block
     // stays readable while still preserving the full stream order.
@@ -453,6 +892,21 @@ function appendRealtimeLines(current: string[] | undefined, incoming: string[]):
   }
   if (next.length <= MAX_REALTIME_TERMINAL_LINES) return next;
   return next.slice(next.length - MAX_REALTIME_TERMINAL_LINES);
+}
+
+function normalizeRealtimeText(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function trimRealtimeTextBuffer(text: string): string {
+  if (text.length <= MAX_REALTIME_TERMINAL_CHARS) return text;
+  const tail = text.slice(text.length - MAX_REALTIME_TERMINAL_CHARS);
+  const firstNewline = tail.indexOf('\n');
+  return firstNewline >= 0 ? tail.slice(firstNewline + 1) : tail;
+}
+
+function realtimeTextToLines(text: string): string[] {
+  return compactRealtimeLines(normalizeRealtimeText(text).split('\n'));
 }
 
 function hasMeaningfulReasoningContent(payload: any): boolean {
@@ -570,7 +1024,10 @@ function reasoningRuntimeSignature(payload: any): string {
   }
 }
 
-function runtimeEventKey(event: any): string {
+const runtimeEventKeyObjectCache = new WeakMap<object, string>();
+const sessionEventTimestampObjectCache = new WeakMap<object, number | null>();
+
+function computeRuntimeEventKey(event: any): string {
   const itemType = runtimeItemType(event?.payload);
   // Reasoning streams can emit a fresh protocol item id for every heartbeat.
   // Coalesce them per turn/provider before considering item ids; otherwise one
@@ -592,6 +1049,17 @@ function runtimeEventKey(event: any): string {
     event?.provider || '',
     event?.timestamp || '',
   ].join(':');
+}
+
+function runtimeEventKey(event: any): string {
+  if (event && typeof event === 'object') {
+    const cached = runtimeEventKeyObjectCache.get(event);
+    if (cached !== undefined) return cached;
+    const key = computeRuntimeEventKey(event);
+    runtimeEventKeyObjectCache.set(event, key);
+    return key;
+  }
+  return computeRuntimeEventKey(event);
 }
 
 function runtimeLifecycleRank(event: any): number {
@@ -660,13 +1128,84 @@ function isRuntimeEventNoop(current: any, next: any): boolean {
   );
 }
 
+function compactVisibleSessionEvents(events: any[]): any[] {
+  let next: any[] | null = null;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (isEmptyReasoningRuntimeEvent(event)) {
+      if (next === null) next = events.slice(0, index);
+      continue;
+    }
+    if (next !== null) next.push(event);
+  }
+  return next ?? events;
+}
+
 function mergeSessionEventLists(existing: any[], incoming: any[]): any[] {
-  const visibleExisting = existing.filter((event) => !isEmptyReasoningRuntimeEvent(event));
+  const visibleIncoming = compactVisibleSessionEvents(incoming);
+
+  if (visibleIncoming.length === 0) {
+    return existing;
+  }
+
+  // Hot path for live streaming: the backend now sends incremental session
+  // events, so most merges are either "replace the active tail item" or
+  // "append a few fresh items". Avoid rebuilding a Map over the entire long
+  // history on every runtime tick.
+  if (visibleIncoming.length <= 64) {
+    let next = existing;
+    let changed = false;
+    let canUseFastPath = true;
+    const recentSearchWindow = 512;
+
+    for (const event of visibleIncoming) {
+      const key = runtimeEventKey(event);
+      let existingIndex = -1;
+      const searchStart = next.length - 1;
+      const searchEnd = Math.max(0, next.length - recentSearchWindow);
+      for (let index = searchStart; index >= searchEnd; index -= 1) {
+        if (runtimeEventKey(next[index]) === key) {
+          existingIndex = index;
+          break;
+        }
+      }
+
+      if (existingIndex >= 0) {
+        const preferred = preferRuntimeEvent(event, next[existingIndex]);
+        const replacement = isRuntimeEventNoop(next[existingIndex], preferred)
+          ? next[existingIndex]
+          : preferred;
+        if (replacement !== next[existingIndex]) {
+          if (!changed) next = next.slice();
+          next[existingIndex] = replacement;
+          changed = true;
+        }
+        continue;
+      }
+
+      const eventMs = sessionEventTimestampMs(event);
+      const lastMs = next.length > 0 ? sessionEventTimestampMs(next[next.length - 1]) : null;
+      if (eventMs !== null && lastMs !== null && eventMs < lastMs) {
+        canUseFastPath = false;
+        break;
+      }
+
+      if (!changed) next = next.slice();
+      next.push(event);
+      changed = true;
+    }
+
+    if (canUseFastPath) {
+      return changed ? next : existing;
+    }
+  }
+
+  const visibleExisting = compactVisibleSessionEvents(existing);
   const merged = [...visibleExisting];
   const indexByKey = new Map<string, number>();
   merged.forEach((event, index) => indexByKey.set(runtimeEventKey(event), index));
 
-  incoming.filter((event) => !isEmptyReasoningRuntimeEvent(event)).forEach((event) => {
+  visibleIncoming.forEach((event) => {
     const key = runtimeEventKey(event);
     const existingIndex = indexByKey.get(key);
     if (existingIndex === undefined) {
@@ -691,25 +1230,55 @@ function mergeSessionEventLists(existing: any[], incoming: any[]): any[] {
   return merged;
 }
 
-function upsertRuntimeItemEvent(existing: any[], data: any): any[] {
-  const payload = data?.payload;
-  if (!payload) return existing;
-  if (isRuntimeAssistantTextPayload(payload)) return existing;
-  if (isEmptyReasoningRuntimeEvent(data)) return existing;
+function sessionEventTimestampMs(event: any): number | null {
+  if (event && typeof event === 'object' && sessionEventTimestampObjectCache.has(event)) {
+    return sessionEventTimestampObjectCache.get(event) ?? null;
+  }
+  const raw = event?.timestamp ?? event?.created_at ?? event?.updated_at;
+  if (typeof raw !== 'string' || !raw.trim()) {
+    if (event && typeof event === 'object') sessionEventTimestampObjectCache.set(event, null);
+    return null;
+  }
+  const ms = Date.parse(raw);
+  const parsed = Number.isFinite(ms) ? ms : null;
+  if (event && typeof event === 'object') sessionEventTimestampObjectCache.set(event, parsed);
+  return parsed;
+}
 
-  const eventType = normalizeRuntimeEventType(data.event_type || RUNTIME_ITEM_EVENT_FALLBACK) || RUNTIME_ITEM_EVENT_FALLBACK;
-  const itemId = runtimeItemIdentity(payload);
+function maxSessionEventTimestamp(events: any[], fallback?: string): string | undefined {
+  let bestMs = fallback ? Date.parse(fallback) : Number.NEGATIVE_INFINITY;
+  let bestTimestamp = fallback;
+  for (const event of events) {
+    const raw = event?.timestamp;
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    const ms = sessionEventTimestampMs(event);
+    if (ms === null) continue;
+    if (ms >= bestMs) {
+      bestMs = ms;
+      bestTimestamp = raw;
+    }
+  }
+  return bestTimestamp;
+}
+
+function upsertRuntimeItemEvent(existing: any[], data: any): any[] {
   const timestamp = new Date().toISOString();
-  const nextEvent = {
-    event_id: data.event_id || `live:${data.turn_id}:${eventType}:${itemId || timestamp}`,
-    turn_id: data.turn_id,
-    event_type: eventType,
-    provider: data.provider,
-    timestamp,
-    payload,
-  };
+  const nextEvent = buildRuntimeItemEvent(data, timestamp);
+  if (!nextEvent) return existing;
+  return upsertRuntimeEventObject(existing, nextEvent);
+}
+
+function upsertRuntimeEventObject(existing: any[], nextEvent: any): any[] {
   const key = runtimeEventKey(nextEvent);
-  const existingIdx = existing.findIndex((event) => runtimeEventKey(event) === key);
+  // Streaming updates usually mutate the most recently appended runtime item.
+  // Search from the tail to keep the hot path near O(1) on long histories.
+  let existingIdx = -1;
+  for (let index = existing.length - 1; index >= 0; index -= 1) {
+    if (runtimeEventKey(existing[index]) === key) {
+      existingIdx = index;
+      break;
+    }
+  }
   if (existingIdx === -1) {
     return [...existing, nextEvent];
   }
@@ -717,6 +1286,57 @@ function upsertRuntimeItemEvent(existing: any[], data: any): any[] {
   const preferred = preferRuntimeEvent(next[existingIdx], nextEvent);
   if (isRuntimeEventNoop(next[existingIdx], preferred)) return existing;
   next[existingIdx] = preferred;
+  return next;
+}
+
+function buildRuntimeItemEvent(data: any, timestamp: string): any | null {
+  const payload = data?.payload;
+  if (!payload) return null;
+  if (isRuntimeAssistantTextPayload(payload)) return null;
+  if (isEmptyReasoningRuntimeEvent(data)) return null;
+
+  const eventType = normalizeRuntimeEventType(data.event_type || RUNTIME_ITEM_EVENT_FALLBACK) || RUNTIME_ITEM_EVENT_FALLBACK;
+  const itemId = runtimeItemIdentity(payload);
+  return {
+    event_id: data.event_id || `live:${data.turn_id}:${eventType}:${itemId || timestamp}`,
+    turn_id: data.turn_id,
+    event_type: eventType,
+    provider: data.provider,
+    timestamp,
+    payload,
+  };
+}
+
+function upsertRuntimeItemEvents(existing: any[], dataList: any[]): any[] {
+  if (dataList.length === 0) return existing;
+  if (dataList.length === 1) return upsertRuntimeItemEvent(existing, dataList[0]);
+
+  const timestamp = new Date().toISOString();
+  const incoming: any[] = [];
+  const incomingIndexByKey = new Map<string, number>();
+  for (const data of dataList) {
+    const event = buildRuntimeItemEvent(data, timestamp);
+    if (!event) continue;
+    const key = runtimeEventKey(event);
+    const existingIndex = incomingIndexByKey.get(key);
+    if (existingIndex === undefined) {
+      incomingIndexByKey.set(key, incoming.length);
+      incoming.push(event);
+    } else {
+      incoming[existingIndex] = preferRuntimeEvent(incoming[existingIndex], event);
+    }
+  }
+  if (incoming.length === 0) return existing;
+
+  // A runtime batch can contain dozens of item/tool/reasoning updates for the
+  // same active turn. Coalesce duplicate updates first and commit them through
+  // one React state updater; each surviving event still uses the exact same
+  // tail-first upsert path as the single-event stream to avoid creating
+  // duplicate tool cards for older-but-still-active items.
+  let next = existing;
+  for (const event of incoming) {
+    next = upsertRuntimeEventObject(next, event);
+  }
   return next;
 }
 
@@ -787,9 +1407,27 @@ function applyProviderTextUpdate(prev: string, text: string, payload: any): stri
 
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const sessionsRef = useRef<Session[]>([]);
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
+  // Ref to always capture the latest selectedSession inside async loaders and
+  // the singleton runtime listener. Keep this hook before worker sync effects
+  // so those effects never compare against a stale previous session.
+  const selectedSessionRef = useRef<Session | null>(null);
+  useEffect(() => {
+    selectedSessionRef.current = selectedSession;
+  }, [selectedSession]);
   const [turns, setTurns] = useState<Turn[]>([]);
+  const turnsRef = useRef<Turn[]>([]);
+  const finalTurnResponsesRef = useRef<Record<string, string>>({});
+  useEffect(() => {
+    turnsRef.current = turns;
+  }, [turns]);
   const [turnAttachments, setTurnAttachments] = useState<Record<string, InputAttachment[]>>(readStoredTurnAttachments);
+  const pendingAttachmentBindingsRef = useRef<PendingTurnAttachmentBinding[]>([]);
+  const activeAttachmentBindingIdRef = useRef<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [messageQueue, setMessageQueue] = useState<SendPayload[]>([]);
   // React state is not synchronous enough to decide whether a rapid follow-up
@@ -813,6 +1451,119 @@ function App() {
       console.warn('Failed to persist turn attachment previews', error);
     }
   }, [turnAttachments]);
+
+  const commitTurns = (next: Turn[] | ((previous: Turn[]) => Turn[])) => {
+    const resolved = typeof next === 'function'
+      ? (next as (previousTurns: Turn[]) => Turn[])(turnsRef.current)
+      : next;
+    turnsRef.current = resolved;
+    setTurns(resolved);
+  };
+
+  const rememberFinalTurnResponse = (turnId: unknown, response: unknown) => {
+    if (typeof turnId !== 'string' || !turnId) return null;
+    const knownTurn = turnsRef.current.find((turn) => turn.turn_id === turnId);
+    const finalResponse = knownTurn
+      ? fallbackResponseForUserMessage(response, knownTurn.user_message)
+      : nonBlankText(response);
+    if (finalResponse === null) return null;
+    finalTurnResponsesRef.current = {
+      ...finalTurnResponsesRef.current,
+      [turnId]: finalResponse,
+    };
+    return finalResponse;
+  };
+
+  const applyRememberedFinalTurnResponses = (turnList: Turn[]) => {
+    const remembered = finalTurnResponsesRef.current;
+    const entries = Object.entries(remembered);
+    if (entries.length === 0) return turnList;
+
+    let nextTurns = turnList;
+    const remaining = { ...remembered };
+    for (const [turnId, response] of entries) {
+      const existingTurn = nextTurns.find((turn) => turn.turn_id === turnId);
+      if (!existingTurn) continue;
+      if (nonBlankText(existingTurn.provider_response) !== null) {
+        delete remaining[turnId];
+        continue;
+      }
+      const finalResponse = fallbackResponseForUserMessage(response, existingTurn.user_message);
+      if (finalResponse === null) {
+        delete remaining[turnId];
+        continue;
+      }
+      nextTurns = mergeFinalResponseIntoTurns(nextTurns, turnId, finalResponse);
+    }
+    finalTurnResponsesRef.current = remaining;
+    return nextTurns;
+  };
+
+  const applyAttachmentBindingToTurn = (
+    binding: PendingTurnAttachmentBinding,
+    turnId: string,
+    options?: { keepTempAttachment?: boolean },
+  ) => {
+    setTurnAttachments((prev) => {
+      const next = { ...prev };
+      const tempAttachments = binding.tempTurnId ? next[binding.tempTurnId] : undefined;
+      const merged = mergeInputAttachments(next[turnId], tempAttachments, binding.attachments);
+      if (merged.length > 0) {
+        next[turnId] = merged;
+      }
+      if (!options?.keepTempAttachment && binding.tempTurnId && binding.tempTurnId !== turnId) {
+        delete next[binding.tempTurnId];
+      }
+      return next;
+    });
+  };
+
+  const bindActiveAttachmentTurnFromRuntime = (turnId: string) => {
+    const bindingId = activeAttachmentBindingIdRef.current;
+    if (!bindingId) return false;
+    const binding = pendingAttachmentBindingsRef.current.find((item) => item.bindingId === bindingId);
+    if (!binding) {
+      activeAttachmentBindingIdRef.current = null;
+      return false;
+    }
+    binding.resolvedTurnId = turnId;
+    applyAttachmentBindingToTurn(binding, turnId, { keepTempAttachment: true });
+    return true;
+  };
+
+  const reconcileTurnAttachmentBindings = (sessionId: string, turnList: Turn[]) => {
+    const pending = pendingAttachmentBindingsRef.current;
+    if (pending.length === 0) return;
+    const resolved: Array<{ binding: PendingTurnAttachmentBinding; turnId: string }> = [];
+    for (const binding of pending) {
+      if (binding.sessionId !== sessionId || binding.attachments.length === 0) continue;
+      const matchedTurn = findMatchingAttachmentTurn(turnList, binding);
+      if (matchedTurn) {
+        resolved.push({ binding, turnId: matchedTurn.turn_id });
+      }
+    }
+    if (resolved.length === 0) return;
+
+    const resolvedBindingIds = new Set(resolved.map(({ binding }) => binding.bindingId));
+    pendingAttachmentBindingsRef.current = pending.filter((binding) => !resolvedBindingIds.has(binding.bindingId));
+    if (activeAttachmentBindingIdRef.current && resolvedBindingIds.has(activeAttachmentBindingIdRef.current)) {
+      activeAttachmentBindingIdRef.current = null;
+    }
+    setTurnAttachments((prev) => {
+      const next = { ...prev };
+      for (const { binding, turnId } of resolved) {
+        const tempAttachments = binding.tempTurnId ? next[binding.tempTurnId] : undefined;
+        const merged = mergeInputAttachments(next[turnId], tempAttachments, binding.attachments);
+        if (merged.length > 0) {
+          next[turnId] = merged;
+        }
+        if (binding.tempTurnId && binding.tempTurnId !== turnId) {
+          delete next[binding.tempTurnId];
+        }
+      }
+      return next;
+    });
+  };
   
   // Streaming state during active run
   const [activeCoreText, setActiveCoreText] = useState('');
@@ -822,11 +1573,28 @@ function App() {
   const [activeTurnIds, setActiveTurnIds] = useState<string[]>([]);
   const [telemetryLogs, setTelemetryLogs] = useState<TelemetryLog[]>([]);
   const [sessionEvents, setSessionEvents] = useState<any[]>([]);
+  const sessionEventsCursorRef = useRef<Record<string, string>>({});
   const [realtimeTerminalLines, setRealtimeTerminalLines] = useState<Record<string, string[]>>({});
+  // Keep the unbounded-ish text accumulator out of React state. Terminal
+  // chunks can arrive dozens of times per second; storing the buffer in state
+  // made every chunk recompute line splits and re-render the whole app. The
+  // visible `realtimeTerminalLines` state is flushed on a short timer instead.
+  const realtimeTerminalBuffersRef = useRef<Record<string, string>>({});
+  const realtimeTerminalPendingRef = useRef<Map<string, string>>(new Map());
+  const realtimeTerminalFlushTimerRef = useRef<number | null>(null);
   const [activeCoreTurnId, setActiveCoreTurnId] = useState<string | null>(null);
   const [activePeerTurnId, setActivePeerTurnId] = useState<string | null>(null);
   const [selectedAgentTurnId, setSelectedAgentTurnId] = useState<string | null>(null);
   const [hyardJobs, setHyardJobs] = useState<Record<string, any>>({});
+  const [runtimeTurnPhases, setRuntimeTurnPhases] = useState<Record<string, RuntimeTurnPhase>>({});
+  const [runtimeTurnStartedAt, setRuntimeTurnStartedAt] = useState<Record<string, number>>({});
+  const [runtimeTurnPhaseChangedAt, setRuntimeTurnPhaseChangedAt] = useState<Record<string, number>>({});
+  const [runtimeDispatchStartedAt, setRuntimeDispatchStartedAt] = useState<number | null>(null);
+  const [runtimePreparingPhase, setRuntimePreparingPhase] = useState<string | null>(null);
+  const runtimeDispatchStartedAtRef = useRef<number | null>(null);
+  const sessionUiSnapshotsRef = useRef<Record<string, SessionUiSnapshot>>({});
+  const activeRuntimeSessionIdRef = useRef<string | null>(null);
+  const runtimeTurnSessionIdRef = useRef<Record<string, string>>({});
   const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [providerStatusLoading, setProviderStatusLoading] = useState(false);
   const [providerStatusError, setProviderStatusError] = useState<string | null>(null);
@@ -846,9 +1614,10 @@ function App() {
   // Persistence & Artifact Drawer State
   const [sessionWorkers, setSessionWorkers] = useState<InstanceMetadata[]>([]);
 
-  // Workspace state — drives the left-rail column and scopes the session
-  // list. The backend bootstraps a "Default" workspace on first launch so
-  // `currentWorkspace` is reliably non-null after `loadWorkspaces` resolves.
+  // Workspace state — drives the workbench shell and scopes the session list.
+  // Like VS Code, Switchyard can start with no folder/workspace opened; the
+  // chat/workspace-scoped panels stay on the welcome screen until the user
+  // explicitly opens a folder.
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [currentWorkspace, setCurrentWorkspace] = useState<Workspace | null>(null);
 
@@ -896,6 +1665,16 @@ function App() {
   // Closed by default — users opt in via the rail's Activity button or
   // the Workers item in the bottom status bar.
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Load the diagnostics bundle on first use, then keep it mounted after
+  // closing so tab/search state is preserved without putting the heavy
+  // graph + telemetry panels on the initial chat render path.
+  const [drawerEverOpened, setDrawerEverOpened] = useState(false);
+
+  useEffect(() => {
+    if (drawerOpen) {
+      setDrawerEverOpened(true);
+    }
+  }, [drawerOpen]);
 
   // Bottom-anchored terminal panel. Toggled independently of railMode
   // so users keep the left column (workspace / files) visible while a
@@ -1178,18 +1957,21 @@ function App() {
     }
   };
 
-  const loadSessionWorkers = async (sessionId: string | null) => {
+  const loadSessionWorkers = useCallback(async (sessionId: string | null) => {
     if (!sessionId) {
       setSessionWorkers([]);
       return;
     }
     try {
-      const list = await invoke<InstanceMetadata[]>('list_session_workers', { sessionId });
-      setSessionWorkers(list);
+      const list = await invoke<any[]>('list_session_workers', { sessionId });
+      if (selectedSessionRef.current?.session_id && selectedSessionRef.current.session_id !== sessionId) {
+        return;
+      }
+      setSessionWorkers(normalizeInstanceMetadataList(list));
     } catch (e) {
       console.error('Failed to load session workers:', e);
     }
-  };
+  }, []);
 
   const handleResetCore = async () => {
     if (!selectedSession) return;
@@ -1203,24 +1985,51 @@ function App() {
   };
 
   // Initial loading — workspaces first so list_sessions lands inside the
-  // correct workspace scope. loadAppConfig runs in parallel (it doesn't
-  // need the workspace; the backend resolves config from the current ws).
+  // correct workspace scope. With no workspace selected, do not call
+  // workspace-scoped session commands; show the welcome/no-workspace shell.
   useEffect(() => {
     (async () => {
-      await loadWorkspaces();
-      await loadSessions();
+      const current = await loadWorkspaces();
+      if (current) {
+        await loadSessions(current);
+      } else {
+        resetWorkspaceScopedUi();
+      }
     })();
     loadAppConfig();
   }, []);
 
-  const loadWorkspaces = async () => {
+  // Replace the browser/native right-click menu across workbench chrome with
+  // Switchyard/VSC-style menus. Keep native menus inside text inputs and any
+  // explicit escape hatch so copying/editing text still feels normal.
+  useEffect(() => {
+    const handleContextMenu = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.closest(
+          'input, textarea, select, [contenteditable="true"], [data-allow-native-context-menu="true"]',
+        )
+      ) {
+        return;
+      }
+      event.preventDefault();
+    };
+    window.addEventListener('contextmenu', handleContextMenu);
+    return () => window.removeEventListener('contextmenu', handleContextMenu);
+  }, []);
+
+  const loadWorkspaces = async (): Promise<Workspace | null> => {
     try {
       const list = await invoke<Workspace[]>('list_workspaces');
       setWorkspaces(list);
       const current = await invoke<Workspace | null>('get_current_workspace');
       setCurrentWorkspace(current);
+      return current;
     } catch (e) {
       console.error('Failed to load workspaces:', e);
+      setWorkspaces([]);
+      setCurrentWorkspace(null);
+      return null;
     }
   };
 
@@ -1230,13 +2039,9 @@ function App() {
       setCurrentWorkspace(next);
       // Wipe per-workspace UI state — sessions, turns, events all belong
       // to the previous workspace and would be confusing if left visible.
-      setSelectedSession(null);
-      setTurns([]);
-      setSessionEvents([]);
-      setSessionWorkers([]);
-      setActiveCoreText('');
-      setActivePeerText('');
-      await loadSessions();
+      resetWorkspaceScopedUi();
+      void loadAppConfig();
+      await loadSessions(next);
       addLog(new Date().toLocaleTimeString(), 'sys', `Switched workspace to: ${next.name}`);
     } catch (e) {
       console.error('Failed to switch workspace:', e);
@@ -1249,11 +2054,9 @@ function App() {
       const created = await invoke<Workspace>('create_workspace', { primaryRoot, name });
       setWorkspaces((prev) => [created, ...prev]);
       setCurrentWorkspace(created);
-      setSelectedSession(null);
-      setTurns([]);
-      setSessionEvents([]);
-      setSessionWorkers([]);
-      await loadSessions();
+      resetWorkspaceScopedUi();
+      void loadAppConfig();
+      await loadSessions(created);
       addLog(new Date().toLocaleTimeString(), 'sys', `Created workspace: ${created.name}`);
     } catch (e) {
       console.error('Failed to create workspace:', e);
@@ -1302,15 +2105,115 @@ function App() {
     }
   };
 
-  // One-shot initial sync when the session changes. Live updates after that
-  // come through Worker* runtime events handled below — polling retired.
+  const pickFolder = async (title: string): Promise<string | null> => {
+    try {
+      const picked = await openDialog({
+        directory: true,
+        multiple: false,
+        title,
+      });
+      return typeof picked === 'string' ? picked : null;
+    } catch (e) {
+      console.error('Failed to open folder picker:', e);
+      alert('Folder picker failed: ' + e);
+      return null;
+    }
+  };
+
+  const handleOpenFolderAsWorkspace = async () => {
+    const path = await pickFolder('Open Folder as Workspace');
+    if (!path) return;
+    await handleCreateWorkspace(path, leafName(path) || null);
+  };
+
+  const handleCloseWorkspace = async () => {
+    if (!currentWorkspace) return;
+    try {
+      await invoke('clear_current_workspace');
+      setCurrentWorkspace(null);
+      resetWorkspaceScopedUi();
+      setGitRefreshNonce((nonce) => nonce + 1);
+      void loadAppConfig();
+      addLog(new Date().toLocaleTimeString(), 'sys', 'Closed workspace');
+    } catch (e) {
+      console.error('Failed to close workspace:', e);
+      alert('Failed to close workspace: ' + e);
+    }
+  };
+
+  const handleAddFolderToCurrentWorkspace = async () => {
+    if (!currentWorkspace) {
+      await handleOpenFolderAsWorkspace();
+      return;
+    }
+    const path = await pickFolder('Add Folder to Workspace');
+    if (!path) return;
+    const pickedKey = normalizePathKey(path);
+    const primaryKey = normalizePathKey(currentWorkspace.primary_root);
+    const extraKeys = new Set(currentWorkspace.extra_roots.map(normalizePathKey));
+    if (pickedKey === primaryKey || extraKeys.has(pickedKey)) return;
+    await handleUpdateExtraRoots(currentWorkspace.workspace_id, [
+      ...currentWorkspace.extra_roots,
+      path,
+    ]);
+  };
+
+  const handleRemoveExtraRoot = async (root: string) => {
+    if (!currentWorkspace) return;
+    const rootKey = normalizePathKey(root);
+    await handleUpdateExtraRoots(
+      currentWorkspace.workspace_id,
+      currentWorkspace.extra_roots.filter((item) => normalizePathKey(item) !== rootKey),
+    );
+  };
+
+  const persistentTeamWorkerCount = useMemo(
+    () => sessionWorkers.filter((w) => w.kind === 'worker').length,
+    [sessionWorkers],
+  );
+  const activeRuntimeWorkerCount = useMemo(() => {
+    const activeWorkerTurnIds = new Set<string>();
+    turns.forEach((turn) => {
+      if (turn.role !== 'core' && (turn.status === 'pending' || turn.status === 'running')) {
+        activeWorkerTurnIds.add(turn.turn_id);
+      }
+    });
+    activeTurnIds.forEach((turnId) => activeWorkerTurnIds.add(turnId));
+    if (activePeerTurnId) activeWorkerTurnIds.add(activePeerTurnId);
+    return activeWorkerTurnIds.size;
+  }, [turns, activeTurnIds, activePeerTurnId]);
+  const activeHyardWorkerCount = useMemo(
+    () => countActiveHyardJobs(hyardJobs),
+    [hyardJobs],
+  );
+  const displayedWorkerCount = useMemo(
+    () => Math.max(persistentTeamWorkerCount, activeRuntimeWorkerCount) + activeHyardWorkerCount,
+    [persistentTeamWorkerCount, activeRuntimeWorkerCount, activeHyardWorkerCount],
+  );
+  const workerRosterSyncActive = useMemo(() => (
+    isGenerating ||
+    Boolean(activeCoreTurnId) ||
+    Boolean(activePeerTurnId) ||
+    activeTurnIds.length > 0 ||
+    activeHyardWorkerCount > 0
+  ), [isGenerating, activeCoreTurnId, activePeerTurnId, activeTurnIds.length, activeHyardWorkerCount]);
+
+  // Worker roster is event-first, but keep a light resync while a turn or
+  // background delegate is active. That prevents a missed/mis-shaped Worker*
+  // event from permanently freezing the status-bar count at zero.
   useEffect(() => {
     if (!selectedSession) {
       setSessionWorkers([]);
       return;
     }
-    loadSessionWorkers(selectedSession.session_id);
-  }, [selectedSession?.session_id]);
+    const sessionId = selectedSession.session_id;
+    void loadSessionWorkers(sessionId);
+    if (!workerRosterSyncActive) return;
+    const timer = window.setInterval(() => {
+      void loadSessionWorkers(sessionId);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [selectedSession?.session_id, workerRosterSyncActive, loadSessionWorkers]);
 
   // Update selectedAgentTurnId from core-agent or temp-user-id to activeCoreTurnId when activeCoreTurnId is resolved
   useEffect(() => {
@@ -1319,31 +2222,340 @@ function App() {
     }
   }, [activeCoreTurnId, selectedAgentTurnId]);
 
-  // Ref to always capture the latest selectedSession inside the singleton listener
-  const selectedSessionRef = useRef<Session | null>(null);
+  const beginRuntimeDispatch = (phase?: string, startedAt = Date.now()) => {
+    const existing = runtimeDispatchStartedAtRef.current;
+    const nextStartedAt = existing ?? startedAt;
+    runtimeDispatchStartedAtRef.current = nextStartedAt;
+    setRuntimeDispatchStartedAt((prev) => {
+      const next = prev ?? nextStartedAt;
+      runtimeDispatchStartedAtRef.current = next;
+      return next;
+    });
+    if (phase !== undefined) {
+      setRuntimePreparingPhase(phase);
+    }
+  };
+
+  const clearRuntimeDispatch = () => {
+    runtimeDispatchStartedAtRef.current = null;
+    setRuntimeDispatchStartedAt(null);
+    setRuntimePreparingPhase(null);
+  };
+
+  const seedRuntimeTurnStartedAtFromDispatch = (turnId: unknown) => {
+    if (typeof turnId !== 'string' || !turnId) return;
+    const startedAt = runtimeDispatchStartedAtRef.current;
+    if (!startedAt) return;
+    setRuntimeTurnStartedAt((prev) => (prev[turnId] ? prev : { ...prev, [turnId]: startedAt }));
+  };
+
+  const markRuntimeTurnPhase = (turnId: unknown, phase: RuntimeTurnPhase) => {
+    if (typeof turnId !== 'string' || !turnId) return;
+    const now = Date.now();
+    setRuntimeTurnPhases((prev) => (prev[turnId] === phase ? prev : { ...prev, [turnId]: phase }));
+    setRuntimeTurnPhaseChangedAt((prev) => ({ ...prev, [turnId]: now }));
+    if (phase === 'running' || phase === 'output_completed' || phase === 'finalizing') {
+      setRuntimeTurnStartedAt((prev) => (prev[turnId] ? prev : { ...prev, [turnId]: now }));
+    }
+  };
+
+  const ensureRuntimeTurnPhase = (turnId: unknown, phase: RuntimeTurnPhase) => {
+    if (typeof turnId !== 'string' || !turnId) return;
+    const now = Date.now();
+    setRuntimeTurnPhases((prev) => (prev[turnId] ? prev : { ...prev, [turnId]: phase }));
+    setRuntimeTurnPhaseChangedAt((prev) => (prev[turnId] ? prev : { ...prev, [turnId]: now }));
+    if (phase === 'running' || phase === 'output_completed' || phase === 'finalizing') {
+      setRuntimeTurnStartedAt((prev) => (prev[turnId] ? prev : { ...prev, [turnId]: now }));
+    }
+  };
+
+  const resetRealtimeTerminalForTurn = (turnId: unknown) => {
+    if (typeof turnId !== 'string' || !turnId) return;
+    realtimeTerminalPendingRef.current.delete(turnId);
+    realtimeTerminalBuffersRef.current = { ...realtimeTerminalBuffersRef.current, [turnId]: '' };
+    setRealtimeTerminalLines((prev) => ({ ...prev, [turnId]: [] }));
+  };
+
+  const ensureRealtimeTerminalForTurn = (turnId: unknown) => {
+    if (typeof turnId !== 'string' || !turnId) return;
+    if (!Object.prototype.hasOwnProperty.call(realtimeTerminalBuffersRef.current, turnId)) {
+      realtimeTerminalBuffersRef.current = { ...realtimeTerminalBuffersRef.current, [turnId]: '' };
+    }
+    setRealtimeTerminalLines((prev) => (prev[turnId] ? prev : { ...prev, [turnId]: [] }));
+  };
+
+  const flushRealtimeTerminalText = useCallback(() => {
+    realtimeTerminalFlushTimerRef.current = null;
+    const pending = realtimeTerminalPendingRef.current;
+    if (pending.size === 0) return;
+
+    const updates: Record<string, string[]> = {};
+    pending.forEach((chunk, turnId) => {
+      const nextText = trimRealtimeTextBuffer((realtimeTerminalBuffersRef.current[turnId] || '') + chunk);
+      realtimeTerminalBuffersRef.current[turnId] = nextText;
+      updates[turnId] = realtimeTextToLines(nextText);
+    });
+    pending.clear();
+
+    setRealtimeTerminalLines((prev) => {
+      const entries = Object.entries(updates);
+      if (entries.length === 0) return prev;
+      const next = { ...prev };
+      entries.forEach(([turnId, lines]) => {
+        next[turnId] = lines;
+      });
+      return next;
+    });
+  }, []);
+
+  const scheduleRealtimeTerminalFlush = useCallback(() => {
+    if (realtimeTerminalFlushTimerRef.current !== null) return;
+    realtimeTerminalFlushTimerRef.current = window.setTimeout(flushRealtimeTerminalText, 33);
+  }, [flushRealtimeTerminalText]);
+
+  const appendRealtimeTerminalText = (turnId: unknown, text: unknown) => {
+    if (typeof turnId !== 'string' || !turnId || typeof text !== 'string' || text.length === 0) return;
+    const normalizedText = normalizeRealtimeText(text);
+    const pending = realtimeTerminalPendingRef.current;
+    pending.set(turnId, (pending.get(turnId) || '') + normalizedText);
+    scheduleRealtimeTerminalFlush();
+  };
+
+  const clearRealtimeTerminalText = useCallback(() => {
+    if (realtimeTerminalFlushTimerRef.current !== null) {
+      window.clearTimeout(realtimeTerminalFlushTimerRef.current);
+      realtimeTerminalFlushTimerRef.current = null;
+    }
+    realtimeTerminalPendingRef.current.clear();
+    realtimeTerminalBuffersRef.current = {};
+    setRealtimeTerminalLines({});
+  }, []);
+
+  useEffect(() => () => {
+    if (realtimeTerminalFlushTimerRef.current !== null) {
+      window.clearTimeout(realtimeTerminalFlushTimerRef.current);
+      realtimeTerminalFlushTimerRef.current = null;
+    }
+  }, []);
+
+  const materializeRealtimeTerminalSnapshot = () => {
+    const buffers = { ...realtimeTerminalBuffersRef.current };
+    realtimeTerminalPendingRef.current.forEach((chunk, turnId) => {
+      buffers[turnId] = trimRealtimeTextBuffer((buffers[turnId] || '') + chunk);
+    });
+    const lines: Record<string, string[]> = { ...realtimeTerminalLines };
+    Object.entries(buffers).forEach(([turnId, text]) => {
+      lines[turnId] = realtimeTextToLines(text);
+    });
+    return { buffers, lines };
+  };
+
+  const patchSessionUiSnapshot = (
+    sessionId: string | null | undefined,
+    patch:
+      | Partial<SessionUiSnapshot>
+      | ((previous: SessionUiSnapshot) => SessionUiSnapshot),
+  ) => {
+    if (!sessionId) return createEmptySessionUiSnapshot();
+    const previous = sessionUiSnapshotsRef.current[sessionId] ?? createEmptySessionUiSnapshot();
+    const next = typeof patch === 'function'
+      ? patch(previous)
+      : {
+          ...previous,
+          ...patch,
+          loadedAt: patch.loadedAt ?? Date.now(),
+        };
+    sessionUiSnapshotsRef.current = {
+      ...sessionUiSnapshotsRef.current,
+      [sessionId]: next,
+    };
+    return next;
+  };
+
+  const buildVisibleSessionUiSnapshot = (
+    sessionId: string,
+    options?: { loaded?: boolean },
+  ): SessionUiSnapshot => {
+    const terminal = materializeRealtimeTerminalSnapshot();
+    const previous = sessionUiSnapshotsRef.current[sessionId];
+    return {
+      ...(previous ?? createEmptySessionUiSnapshot()),
+      turns: turnsRef.current,
+      sessionEvents,
+      sessionWorkers,
+      activeCoreText,
+      activePeerText,
+      activePeerName,
+      activeNodes,
+      activeTurnIds,
+      activeCoreTurnId,
+      activePeerTurnId,
+      selectedAgentTurnId,
+      hyardJobs,
+      realtimeTerminalLines: terminal.lines,
+      realtimeTerminalBuffers: terminal.buffers,
+      runtimeTurnPhases,
+      runtimeTurnStartedAt,
+      runtimeTurnPhaseChangedAt,
+      runtimeDispatchStartedAt: runtimeDispatchStartedAtRef.current,
+      runtimePreparingPhase,
+      isGenerating,
+      messageQueue: messageQueueRef.current,
+      loaded: options?.loaded ?? previous?.loaded ?? true,
+      loadedAt: Date.now(),
+    };
+  };
+
+  const captureCurrentSessionUiSnapshot = (
+    sessionId = selectedSessionRef.current?.session_id,
+    options?: { loaded?: boolean },
+  ) => {
+    if (!sessionId) return;
+    const snapshot = buildVisibleSessionUiSnapshot(sessionId, options);
+    sessionUiSnapshotsRef.current = {
+      ...sessionUiSnapshotsRef.current,
+      [sessionId]: snapshot,
+    };
+  };
+
+  const replaceRealtimeTerminalSnapshot = (snapshot: SessionUiSnapshot) => {
+    if (realtimeTerminalFlushTimerRef.current !== null) {
+      window.clearTimeout(realtimeTerminalFlushTimerRef.current);
+      realtimeTerminalFlushTimerRef.current = null;
+    }
+    realtimeTerminalPendingRef.current.clear();
+    realtimeTerminalBuffersRef.current = { ...snapshot.realtimeTerminalBuffers };
+    setRealtimeTerminalLines(snapshot.realtimeTerminalLines);
+  };
+
+  const applySessionUiSnapshot = (snapshot?: SessionUiSnapshot) => {
+    const next = snapshot ?? createEmptySessionUiSnapshot();
+    commitTurns(next.turns);
+    setSessionEvents(next.sessionEvents);
+    setSessionWorkers(next.sessionWorkers);
+    setActiveCoreText(next.activeCoreText);
+    setActivePeerText(next.activePeerText);
+    setActivePeerName(next.activePeerName);
+    setActiveNodes(next.activeNodes);
+    setActiveTurnIds(next.activeTurnIds);
+    setActiveCoreTurnId(next.activeCoreTurnId);
+    setActivePeerTurnId(next.activePeerTurnId);
+    setSelectedAgentTurnId(next.selectedAgentTurnId);
+    setHyardJobs(next.hyardJobs);
+    setRuntimeTurnPhases(next.runtimeTurnPhases);
+    setRuntimeTurnStartedAt(next.runtimeTurnStartedAt);
+    setRuntimeTurnPhaseChangedAt(next.runtimeTurnPhaseChangedAt);
+    runtimeDispatchStartedAtRef.current = next.runtimeDispatchStartedAt;
+    setRuntimeDispatchStartedAt(next.runtimeDispatchStartedAt);
+    setRuntimePreparingPhase(next.runtimePreparingPhase);
+    messageQueueRef.current = next.messageQueue;
+    setMessageQueue(next.messageQueue);
+    setIsGenerating(next.isGenerating);
+    replaceRealtimeTerminalSnapshot(next);
+  };
+
   useEffect(() => {
-    selectedSessionRef.current = selectedSession;
-  }, [selectedSession]);
+    const sessionId = selectedSessionRef.current?.session_id;
+    if (!sessionId) return;
+    const terminal = materializeRealtimeTerminalSnapshot();
+    patchSessionUiSnapshot(sessionId, {
+      turns,
+      sessionEvents,
+      sessionWorkers,
+      activeCoreText,
+      activePeerText,
+      activePeerName,
+      activeNodes,
+      activeTurnIds,
+      activeCoreTurnId,
+      activePeerTurnId,
+      selectedAgentTurnId,
+      hyardJobs,
+      realtimeTerminalLines: terminal.lines,
+      realtimeTerminalBuffers: terminal.buffers,
+      runtimeTurnPhases,
+      runtimeTurnStartedAt,
+      runtimeTurnPhaseChangedAt,
+      runtimeDispatchStartedAt: runtimeDispatchStartedAtRef.current,
+      runtimePreparingPhase,
+      isGenerating,
+      messageQueue,
+      loaded: true,
+    });
+  }, [
+    turns,
+    sessionEvents,
+    sessionWorkers,
+    activeCoreText,
+    activePeerText,
+    activePeerName,
+    activeNodes,
+    activeTurnIds,
+    activeCoreTurnId,
+    activePeerTurnId,
+    selectedAgentTurnId,
+    hyardJobs,
+    realtimeTerminalLines,
+    runtimeTurnPhases,
+    runtimeTurnStartedAt,
+    runtimeTurnPhaseChangedAt,
+    runtimeDispatchStartedAt,
+    runtimePreparingPhase,
+    isGenerating,
+    messageQueue,
+  ]);
+
+  const updateSessionEventsCursor = (sessionId: string, events: any[]) => {
+    const nextCursor = maxSessionEventTimestamp(events, sessionEventsCursorRef.current[sessionId]);
+    if (nextCursor) {
+      sessionEventsCursorRef.current = {
+        ...sessionEventsCursorRef.current,
+        [sessionId]: nextCursor,
+      };
+    }
+  };
+
+  const fetchSessionEventsForMerge = async (sessionId: string, mode: 'full' | 'incremental' = 'incremental') => {
+    const afterTimestamp = mode === 'incremental' ? sessionEventsCursorRef.current[sessionId] : undefined;
+    const eventList = await invoke<any[]>('get_session_events', {
+      sessionId,
+      ...(afterTimestamp ? { afterTimestamp } : {}),
+    });
+    updateSessionEventsCursor(sessionId, eventList);
+    return eventList;
+  };
 
   // Listen for Tauri events
   useEffect(() => {
     let active = true;
-    let unlistenFn: (() => void) | null = null;
+    const unlistenFns: Array<() => void> = [];
+    let refreshTurnsTimer: number | null = null;
+    let refreshTurnsInFlight = false;
+    let refreshTurnsQueued = false;
+    let workerRefreshTimer: number | null = null;
+    const pendingWorkerRefreshSessionIds = new Set<string>();
 
     const setupListener = async () => {
-      if (DEBUG_RUNTIME_EVENTS) console.log('Setting up Tauri event listener for runtime_event...');
+      const runtimeDebug = debugRuntimeEventsEnabled();
+      if (runtimeDebug) console.debug('[runtime_event] listener attached');
       const refreshTurns = async () => {
         if (!active) return;
         const session = selectedSessionRef.current;
         const sessionId = session?.session_id;
-        if (DEBUG_RUNTIME_EVENTS) console.log('refreshTurns called, current session:', sessionId);
+        if (runtimeDebug) console.debug('[runtime_event] refreshTurns', { session_id: sessionId || null });
         if (!session || !sessionId) return;
         try {
           const turnList = await invoke<Turn[]>('get_session_turns', { sessionId });
           if (!active || selectedSessionRef.current?.session_id !== sessionId) return;
-          if (DEBUG_RUNTIME_EVENTS) console.log(`Loaded ${turnList.length} turns for session ${sessionId}`);
-          setTurns(turnList);
-          const eventList = await invoke<any[]>('get_session_events', { sessionId });
+          if (runtimeDebug) console.debug('[runtime_event] turns loaded', { session_id: sessionId, count: turnList.length });
+          const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
+          reconcileTurnAttachmentBindings(sessionId, turnListWithFinalResponses);
+          // A refresh can race with the final runtime event / run_turn return.
+          // Treat DB data as authoritative for ordering/status, but never let a
+          // transient empty provider_response erase a final answer already seen
+          // by the UI.
+          commitTurns((prev) => mergeFreshTurnsPreservingKnownResponses(prev, turnListWithFinalResponses));
+          const eventList = await fetchSessionEventsForMerge(sessionId, 'incremental');
           if (!active || selectedSessionRef.current?.session_id !== sessionId) return;
           // DB writes can lag a live runtime event by a few milliseconds. Merge
           // instead of wholesale replacement so a refresh triggered by a status
@@ -1353,16 +2565,483 @@ function App() {
           console.error('Error fetching session turns/events:', e);
         }
       };
+      const runScheduledRefreshTurns = async () => {
+        if (!active) return;
+        if (refreshTurnsInFlight) {
+          refreshTurnsQueued = true;
+          return;
+        }
+        refreshTurnsInFlight = true;
+        try {
+          await refreshTurns();
+        } finally {
+          refreshTurnsInFlight = false;
+          if (refreshTurnsQueued && active) {
+            refreshTurnsQueued = false;
+            scheduleRefreshTurns(50);
+          }
+        }
+      };
+      const scheduleRefreshTurns = (delayMs = 80) => {
+        if (!active) return;
+        if (refreshTurnsInFlight) {
+          refreshTurnsQueued = true;
+          return;
+        }
+        if (refreshTurnsTimer !== null) return;
+        refreshTurnsTimer = window.setTimeout(() => {
+          refreshTurnsTimer = null;
+          void runScheduledRefreshTurns();
+        }, delayMs);
+      };
+      const refreshSessionWorkers = async (sessionIdValue: any) => {
+        if (!active) return;
+        const sessionId = normalizedString(sessionIdValue);
+        if (!sessionId || selectedSessionRef.current?.session_id !== sessionId) return;
+        try {
+          const list = await invoke<any[]>('list_session_workers', { sessionId });
+          if (!active || selectedSessionRef.current?.session_id !== sessionId) return;
+          setSessionWorkers(normalizeInstanceMetadataList(list));
+        } catch (e) {
+          console.error('Failed to refresh session workers:', e);
+        }
+      };
+      const flushWorkerRefreshes = () => {
+        workerRefreshTimer = null;
+        const sessionIds = Array.from(pendingWorkerRefreshSessionIds);
+        pendingWorkerRefreshSessionIds.clear();
+        sessionIds.forEach((sessionId) => {
+          void refreshSessionWorkers(sessionId);
+        });
+      };
+      const scheduleRefreshSessionWorkers = (sessionIdValue: any, delayMs = 150) => {
+        if (!active) return;
+        const sessionId = normalizedString(sessionIdValue);
+        if (!sessionId || selectedSessionRef.current?.session_id !== sessionId) return;
+        pendingWorkerRefreshSessionIds.add(sessionId);
+        if (workerRefreshTimer !== null) return;
+        workerRefreshTimer = window.setTimeout(flushWorkerRefreshes, delayMs);
+      };
+
+      type RuntimeEventBatchContext = {
+        sessionEventUpserts: any[];
+        logs: TelemetryLog[];
+      };
+      let runtimeEventBatchContext: RuntimeEventBatchContext | null = null;
+      const enqueueRuntimeItemEvent = (data: any) => {
+        if (runtimeEventBatchContext) {
+          runtimeEventBatchContext.sessionEventUpserts.push(data);
+          return;
+        }
+        setSessionEvents((prev) => upsertRuntimeItemEvent(prev, data));
+      };
+      const enqueueLogs = (logs: TelemetryLog[]) => {
+        if (logs.length === 0) return;
+        if (runtimeEventBatchContext) {
+          runtimeEventBatchContext.logs.push(...logs);
+          return;
+        }
+        addLogs(logs);
+      };
+      const enqueueLog = (time: string, tag: 'core' | 'peer' | 'sys' | 'info', message: string) => {
+        enqueueLogs([{ timestamp: time, tag, message }]);
+      };
+      const flushRuntimeEventBatchContext = (context: RuntimeEventBatchContext) => {
+        if (context.sessionEventUpserts.length > 0) {
+          setSessionEvents((prev) => upsertRuntimeItemEvents(prev, context.sessionEventUpserts));
+        }
+        if (context.logs.length > 0) {
+          addLogs(context.logs);
+        }
+      };
+
+      const rememberRuntimeTurnSession = (turnIdValue: unknown, sessionIdValue: unknown) => {
+        const turnId = normalizedString(turnIdValue);
+        const sessionId = normalizedString(sessionIdValue);
+        if (!turnId || !sessionId) return;
+        runtimeTurnSessionIdRef.current = {
+          ...runtimeTurnSessionIdRef.current,
+          [turnId]: sessionId,
+        };
+      };
+
+      const forgetRuntimeTurnSession = (turnIdValue: unknown) => {
+        const turnId = normalizedString(turnIdValue);
+        if (!turnId || !runtimeTurnSessionIdRef.current[turnId]) return;
+        const next = { ...runtimeTurnSessionIdRef.current };
+        delete next[turnId];
+        runtimeTurnSessionIdRef.current = next;
+      };
+
+      const runtimeEventSessionId = (type: string, data: any): string | null => {
+        const explicit = normalizedString(data?.session_id);
+        if (explicit) return explicit;
+        const turnId = normalizedString(data?.turn_id ?? data?.core_turn_id ?? data?.in_flight_turn_id);
+        if (turnId && runtimeTurnSessionIdRef.current[turnId]) {
+          return runtimeTurnSessionIdRef.current[turnId];
+        }
+        if (
+          type === 'CoreTurnStarted' ||
+          type === 'PeerTurnStarted' ||
+          type === 'FinalizationStarted' ||
+          type === 'DelegateRequested' ||
+          type === 'DelegateCompleted' ||
+          type === 'CallbackReceiptsInjected' ||
+          type === 'TurnCompleted' ||
+          type === 'TurnFailed'
+        ) {
+          return activeRuntimeSessionIdRef.current;
+        }
+        return null;
+      };
+
+      const patchBackgroundRuntimeSnapshot = (sessionId: string, type: string, data: any) => {
+        patchSessionUiSnapshot(sessionId, (previous) => {
+          let next: SessionUiSnapshot = {
+            ...previous,
+            isGenerating: type === 'TurnCompleted' || type === 'TurnFailed'
+              ? false
+              : previous.isGenerating || Boolean(activeRuntimeSessionIdRef.current === sessionId),
+            loadedAt: Date.now(),
+          };
+          const provider = normalizedString(data?.provider);
+          const turnId = normalizedString(data?.turn_id);
+
+          switch (type) {
+            case 'TurnPreparing': {
+              const startedAt = next.runtimeDispatchStartedAt ?? Date.now();
+              return {
+                ...next,
+                activeCoreText: '',
+                activePeerText: '',
+                activePeerName: null,
+                activeNodes: ['host', provider ?? 'provider'],
+                activeTurnIds: [],
+                runtimeDispatchStartedAt: startedAt,
+                runtimePreparingPhase: data.phase ?? '正在准备并启动 core provider…',
+                isGenerating: true,
+              };
+            }
+            case 'CoreTurnStarted':
+              rememberRuntimeTurnSession(turnId, sessionId);
+              next = {
+                ...next,
+                activeCoreText: '',
+                activePeerText: '',
+                activeNodes: ['host', provider ?? 'core'],
+                activeTurnIds: [],
+                activeCoreTurnId: turnId,
+                hyardJobs: {},
+                runtimeDispatchStartedAt: null,
+                runtimePreparingPhase: null,
+                isGenerating: true,
+              };
+              next = sessionUiSnapshotResetTerminal(next, turnId);
+              next = sessionUiSnapshotSeedStartedAt(next, turnId, previous.runtimeDispatchStartedAt);
+              return sessionUiSnapshotWithRuntimePhase(next, turnId, 'running');
+            case 'FinalizationStarted':
+              rememberRuntimeTurnSession(turnId, sessionId);
+              next = {
+                ...next,
+                activeCoreText: '',
+                activePeerText: '',
+                activePeerName: null,
+                activeNodes: ['host', provider ?? 'core'],
+                activeTurnIds: [],
+                activeCoreTurnId: turnId,
+                runtimeDispatchStartedAt: null,
+                runtimePreparingPhase: null,
+                isGenerating: true,
+              };
+              next = sessionUiSnapshotEnsureTerminal(next, turnId);
+              next = sessionUiSnapshotSeedStartedAt(next, turnId, previous.runtimeDispatchStartedAt);
+              return sessionUiSnapshotWithRuntimePhase(next, turnId, 'finalizing');
+            case 'CoreItemUpdated': {
+              if (turnId) {
+                rememberRuntimeTurnSession(turnId, sessionId);
+                next = {
+                  ...next,
+                  activeCoreTurnId: next.activeCoreTurnId ?? turnId,
+                  isGenerating: true,
+                };
+                next = sessionUiSnapshotWithRuntimePhase(next, turnId, 'running', { ensureOnly: true });
+                next = sessionUiSnapshotEnsureTerminal(next, turnId);
+              }
+              if (isRuntimeReasoningEvent(data)) {
+                if (!isEmptyReasoningRuntimeEvent(data) && data.payload) {
+                  next = {
+                    ...next,
+                    sessionEvents: upsertRuntimeItemEvent(next.sessionEvents, data),
+                  };
+                }
+                return next;
+              }
+              {
+                const itemText = typeof data.text === 'string' ? data.text : '';
+                if (isSystemStatusText(itemText)) {
+                  if (turnId && itemText.trim()) {
+                    next = sessionUiSnapshotAppendTerminalText(
+                      next,
+                      turnId,
+                      itemText.endsWith('\n') ? itemText : `${itemText}\n`,
+                    );
+                  }
+                } else if (hasProviderTextUpdate(itemText, data.payload)) {
+                  next = {
+                    ...next,
+                    activeCoreText: applyProviderTextUpdate(next.activeCoreText, itemText, data.payload),
+                  };
+                }
+              }
+              if (data.payload) {
+                next = {
+                  ...next,
+                  sessionEvents: upsertRuntimeItemEvent(next.sessionEvents, data),
+                };
+              }
+              return next;
+            }
+            case 'PeerTurnStarted':
+              rememberRuntimeTurnSession(turnId, sessionId);
+              next = {
+                ...next,
+                activeNodes: provider && !next.activeNodes.includes(provider)
+                  ? [...next.activeNodes, provider]
+                  : next.activeNodes,
+                activeTurnIds: turnId && !next.activeTurnIds.includes(turnId)
+                  ? [...next.activeTurnIds, turnId]
+                  : next.activeTurnIds,
+                activePeerName: provider,
+                activePeerText: '',
+                activePeerTurnId: turnId,
+                isGenerating: true,
+              };
+              next = sessionUiSnapshotResetTerminal(next, turnId);
+              return sessionUiSnapshotWithRuntimePhase(next, turnId, 'running');
+            case 'PeerItemUpdated': {
+              if (turnId) {
+                rememberRuntimeTurnSession(turnId, sessionId);
+                next = {
+                  ...next,
+                  activePeerTurnId: next.activePeerTurnId ?? turnId,
+                  activePeerName: next.activePeerName ?? provider,
+                  activeNodes: provider && !next.activeNodes.includes(provider)
+                    ? [...next.activeNodes, provider]
+                    : next.activeNodes,
+                  activeTurnIds: !next.activeTurnIds.includes(turnId)
+                    ? [...next.activeTurnIds, turnId]
+                    : next.activeTurnIds,
+                  isGenerating: true,
+                };
+                next = sessionUiSnapshotWithRuntimePhase(next, turnId, 'running', { ensureOnly: true });
+                next = sessionUiSnapshotEnsureTerminal(next, turnId);
+              }
+              if (isRuntimeReasoningEvent(data)) {
+                if (!isEmptyReasoningRuntimeEvent(data) && data.payload) {
+                  next = {
+                    ...next,
+                    sessionEvents: upsertRuntimeItemEvent(next.sessionEvents, data),
+                  };
+                }
+                return next;
+              }
+              {
+                const itemText = typeof data.text === 'string' ? data.text : '';
+                if (isSystemStatusText(itemText)) {
+                  if (turnId && itemText.trim()) {
+                    next = sessionUiSnapshotAppendTerminalText(
+                      next,
+                      turnId,
+                      itemText.endsWith('\n') ? itemText : `${itemText}\n`,
+                    );
+                  }
+                } else if (hasProviderTextUpdate(itemText, data.payload)) {
+                  next = {
+                    ...next,
+                    activePeerText: applyProviderTextUpdate(next.activePeerText, itemText, data.payload),
+                  };
+                }
+              }
+              if (data.payload) {
+                next = {
+                  ...next,
+                  sessionEvents: upsertRuntimeItemEvent(next.sessionEvents, data),
+                };
+              }
+              return next;
+            }
+            case 'CoreExecutionTelemetry':
+            case 'PeerExecutionTelemetry':
+              if (turnId) {
+                rememberRuntimeTurnSession(turnId, sessionId);
+                next = type === 'CoreExecutionTelemetry'
+                  ? { ...next, activeCoreTurnId: next.activeCoreTurnId ?? turnId, isGenerating: true }
+                  : {
+                      ...next,
+                      activePeerTurnId: next.activePeerTurnId ?? turnId,
+                      activePeerName: next.activePeerName ?? provider,
+                      activeNodes: provider && !next.activeNodes.includes(provider)
+                        ? [...next.activeNodes, provider]
+                        : next.activeNodes,
+                      activeTurnIds: !next.activeTurnIds.includes(turnId)
+                        ? [...next.activeTurnIds, turnId]
+                        : next.activeTurnIds,
+                      isGenerating: true,
+                    };
+                next = sessionUiSnapshotWithRuntimePhase(next, turnId, 'running', { ensureOnly: true });
+                next = sessionUiSnapshotEnsureTerminal(next, turnId);
+              }
+              if (data.execution) {
+                return {
+                  ...next,
+                  sessionEvents: upsertRuntimeItemEvent(next.sessionEvents, {
+                    ...data,
+                    event_type: RUNTIME_ITEM_EVENT_FALLBACK,
+                    payload: { item_type: 'execution_telemetry', execution: data.execution },
+                  }),
+                };
+              }
+              return next;
+            case 'CoreTerminalOutput':
+            case 'PeerTerminalOutput':
+              if (turnId) {
+                rememberRuntimeTurnSession(turnId, sessionId);
+                next = type === 'CoreTerminalOutput'
+                  ? { ...next, activeCoreTurnId: next.activeCoreTurnId ?? turnId, isGenerating: true }
+                  : {
+                      ...next,
+                      activePeerTurnId: next.activePeerTurnId ?? turnId,
+                      activePeerName: next.activePeerName ?? provider,
+                      activeNodes: provider && !next.activeNodes.includes(provider)
+                        ? [...next.activeNodes, provider]
+                        : next.activeNodes,
+                      activeTurnIds: !next.activeTurnIds.includes(turnId)
+                        ? [...next.activeTurnIds, turnId]
+                        : next.activeTurnIds,
+                      isGenerating: true,
+                    };
+                next = sessionUiSnapshotWithRuntimePhase(next, turnId, 'running', { ensureOnly: true });
+                next = sessionUiSnapshotAppendTerminalText(next, turnId, data.text);
+              }
+              return next;
+            case 'HyardJobObserved':
+              if (turnId) rememberRuntimeTurnSession(turnId, sessionId);
+              if (data.job?.job_id) {
+                const job = {
+                  ...data.job,
+                  observed_at: data.observed_at,
+                };
+                return {
+                  ...next,
+                  hyardJobs: {
+                    ...next.hyardJobs,
+                    [data.job.job_id]: job,
+                    ...(turnId ? { [turnId]: job } : {}),
+                  },
+                };
+              }
+              return next;
+            case 'CoreOutputCompleted':
+              return sessionUiSnapshotWithRuntimePhase(
+                sessionUiSnapshotEnsureTerminal({
+                  ...next,
+                  activeCoreTurnId: next.activeCoreTurnId ?? turnId,
+                }, turnId),
+                turnId,
+                'output_completed',
+              );
+            case 'PeerOutputCompleted':
+              return sessionUiSnapshotWithRuntimePhase({
+                ...next,
+                activeTurnIds: turnId ? next.activeTurnIds.filter((id) => id !== turnId) : next.activeTurnIds,
+              }, turnId, 'output_completed');
+            case 'DelegateCompleted':
+              return {
+                ...next,
+                activeNodes: data.peer ? next.activeNodes.filter((node) => node !== data.peer) : next.activeNodes,
+                activePeerName: null,
+              };
+            case 'TurnCompleted':
+            case 'TurnFailed':
+              forgetRuntimeTurnSession(turnId);
+              return {
+                ...next,
+                activeNodes: [],
+                activeTurnIds: [],
+                activeCoreTurnId: null,
+                activePeerTurnId: null,
+                activePeerName: null,
+                activeCoreText: '',
+                activePeerText: '',
+                runtimeTurnPhases: {},
+                runtimeTurnStartedAt: {},
+                runtimeTurnPhaseChangedAt: {},
+                runtimeDispatchStartedAt: null,
+                runtimePreparingPhase: null,
+                isGenerating: false,
+              };
+            case 'WorkerSpawned':
+            case 'worker_spawned': {
+              const worker = normalizeInstanceMetadata({ ...data, state: data.state ?? 'idle' });
+              if (!worker) return next;
+              return {
+                ...next,
+                sessionWorkers: upsertInstanceMetadata(next.sessionWorkers, worker),
+              };
+            }
+            case 'WorkerStateChanged':
+            case 'worker_state_changed': {
+              const instanceId = normalizedString(data.instance_id);
+              if (!instanceId) return next;
+              return {
+                ...next,
+                sessionWorkers: next.sessionWorkers.map((worker) => (
+                  worker.instance_id === instanceId
+                    ? {
+                        ...worker,
+                        state: normalizeWorkerState(data.state),
+                        in_flight_turn_id: normalizedString(data.in_flight_turn_id),
+                      }
+                    : worker
+                )),
+              };
+            }
+            case 'WorkerTerminated':
+            case 'worker_terminated': {
+              const instanceId = normalizedString(data.instance_id);
+              if (!instanceId) return next;
+              return {
+                ...next,
+                sessionWorkers: next.sessionWorkers.filter((worker) => worker.instance_id !== instanceId),
+              };
+            }
+            default:
+              return next;
+          }
+        });
+      };
 
       try {
-        const u = await listen<any>('runtime_event', (event) => {
+        const handleRuntimeEventPayload = (payload: any) => {
           if (!active) return;
-          if (DEBUG_RUNTIME_EVENTS) console.log('Received runtime_event event:', event);
-          const payload = event.payload;
-          const type = payload.event;
-          const data = payload.data;
+          const envelope = payload || {};
+          const rawType = envelope.event ?? envelope.type ?? envelope.event_type;
+          const type = normalizedString(rawType) ?? '';
+          const data = envelope.data ?? envelope.payload ?? {};
           const now = new Date().toLocaleTimeString();
-          if (DEBUG_RUNTIME_EVENTS) console.log(`Event type: ${type}, data:`, data);
+          if (runtimeDebug) console.debug('[runtime_event]', runtimeEventDebugSummary(type, data));
+          const eventSessionId = runtimeEventSessionId(type, data);
+          if (eventSessionId && selectedSessionRef.current?.session_id !== eventSessionId) {
+            if (
+              type === 'CoreTurnStarted' ||
+              type === 'PeerTurnStarted' ||
+              type === 'FinalizationStarted'
+            ) {
+              rememberRuntimeTurnSession(data.turn_id, eventSessionId);
+            }
+            patchBackgroundRuntimeSnapshot(eventSessionId, type, data);
+            return;
+          }
   
         switch (type) {
           case 'TurnPreparing':
@@ -1373,173 +3052,176 @@ function App() {
             ) {
               break;
             }
+            beginRuntimeDispatch(data.phase ?? '正在准备并启动 core provider…');
             setActiveCoreText('');
             setActivePeerText('');
             setActivePeerName(null);
             setActiveNodes(['host', data.provider]);
             setActiveTurnIds([]);
-            addLog(now, 'core', `Preparing ${data.provider}: ${data.phase ?? 'starting turn'}`);
+            enqueueLog(now, 'core', `Preparing ${data.provider}: ${data.phase ?? 'starting turn'}`);
             break;
 
           case 'CoreTurnStarted':
+            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
             setActiveCoreText('');
             setActivePeerText('');
             setActiveNodes(['host', data.provider]);
             setActiveTurnIds([]);
             setActiveCoreTurnId(data.turn_id);
-            setRealtimeTerminalLines((prev) => ({ ...prev, [data.turn_id]: [] }));
+            if (data.turn_id) {
+              bindActiveAttachmentTurnFromRuntime(String(data.turn_id));
+            }
+            resetRealtimeTerminalForTurn(data.turn_id);
             setHyardJobs({});
-            addLog(now, 'core', `Core turn started on [${data.provider}] (ID: ${data.turn_id})`);
-            refreshTurns();
+            seedRuntimeTurnStartedAtFromDispatch(data.turn_id);
+            markRuntimeTurnPhase(data.turn_id, 'running');
+            clearRuntimeDispatch();
+            enqueueLog(now, 'core', `Core turn started on [${data.provider}] (ID: ${data.turn_id})`);
+            scheduleRefreshTurns();
             break;
           
           case 'CoreItemUpdated':
             if (data.turn_id) {
+              rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
               setActiveCoreTurnId((prev) => prev ?? data.turn_id);
-              setRealtimeTerminalLines((prev) => (
-                prev[data.turn_id] ? prev : { ...prev, [data.turn_id]: [] }
-              ));
+              ensureRuntimeTurnPhase(data.turn_id, 'running');
+              ensureRealtimeTerminalForTurn(data.turn_id);
             }
             if (isRuntimeReasoningEvent(data)) {
               if (!isEmptyReasoningRuntimeEvent(data) && data.payload) {
-                setSessionEvents((prev) => upsertRuntimeItemEvent(prev, data));
+                enqueueRuntimeItemEvent(data);
               }
               break;
             }
             {
               const itemText = typeof data.text === 'string' ? data.text : '';
               if (isSystemStatusText(itemText)) {
-                addLog(now, 'core', itemText);
+                enqueueLog(now, 'core', itemText);
                 if (data.turn_id && itemText.trim()) {
-                  setRealtimeTerminalLines((prev) => ({
-                    ...prev,
-                    [data.turn_id]: appendRealtimeLines(prev[data.turn_id], itemText.split(/\r?\n/)),
-                  }));
+                  appendRealtimeTerminalText(data.turn_id, itemText.endsWith('\n') ? itemText : `${itemText}\n`);
                 }
               } else if (hasProviderTextUpdate(itemText, data.payload)) {
                 setActiveCoreText((prev) => applyProviderTextUpdate(prev, itemText, data.payload));
               }
             }
             if (data.payload) {
-              setSessionEvents((prev) => upsertRuntimeItemEvent(prev, data));
+              enqueueRuntimeItemEvent(data);
             }
             break;
 
           case 'PeerTurnStarted':
+            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
             setActiveNodes((prev) => prev.includes(data.provider) ? prev : [...prev, data.provider]);
             setActiveTurnIds((prev) => prev.includes(data.turn_id) ? prev : [...prev, data.turn_id]);
             setActivePeerName(data.provider);
             setActivePeerText('');
             setActivePeerTurnId(data.turn_id);
-            setRealtimeTerminalLines((prev) => ({ ...prev, [data.turn_id]: [] }));
-            addLog(now, 'peer', `Delegating subtask to Peer [${data.provider}] (ID: ${data.turn_id})`);
-            refreshTurns();
+            resetRealtimeTerminalForTurn(data.turn_id);
+            markRuntimeTurnPhase(data.turn_id, 'running');
+            enqueueLog(now, 'peer', `Delegating subtask to Peer [${data.provider}] (ID: ${data.turn_id})`);
+            scheduleRefreshTurns();
             break;
 
           case 'PeerItemUpdated':
             if (data.turn_id) {
+              rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
               setActivePeerTurnId((prev) => prev ?? data.turn_id);
+              ensureRuntimeTurnPhase(data.turn_id, 'running');
               setActivePeerName((prev) => prev ?? data.provider);
               setActiveNodes((prev) => prev.includes(data.provider) ? prev : [...prev, data.provider]);
               setActiveTurnIds((prev) => prev.includes(data.turn_id) ? prev : [...prev, data.turn_id]);
-              setRealtimeTerminalLines((prev) => (
-                prev[data.turn_id] ? prev : { ...prev, [data.turn_id]: [] }
-              ));
+              ensureRealtimeTerminalForTurn(data.turn_id);
             }
             if (isRuntimeReasoningEvent(data)) {
               if (!isEmptyReasoningRuntimeEvent(data) && data.payload) {
-                setSessionEvents((prev) => upsertRuntimeItemEvent(prev, data));
+                enqueueRuntimeItemEvent(data);
               }
               break;
             }
             {
               const itemText = typeof data.text === 'string' ? data.text : '';
               if (isSystemStatusText(itemText)) {
-                addLog(now, 'peer', itemText);
+                enqueueLog(now, 'peer', itemText);
                 if (data.turn_id && itemText.trim()) {
-                  setRealtimeTerminalLines((prev) => ({
-                    ...prev,
-                    [data.turn_id]: appendRealtimeLines(prev[data.turn_id], itemText.split(/\r?\n/)),
-                  }));
+                  appendRealtimeTerminalText(data.turn_id, itemText.endsWith('\n') ? itemText : `${itemText}\n`);
                 }
               } else if (hasProviderTextUpdate(itemText, data.payload)) {
                 setActivePeerText((prev) => applyProviderTextUpdate(prev, itemText, data.payload));
               }
             }
             if (data.payload) {
-              setSessionEvents((prev) => upsertRuntimeItemEvent(prev, data));
+              enqueueRuntimeItemEvent(data);
             }
             break;
 
           case 'DelegateRequested':
-            addLog(now, 'sys', `Core requested delegation to [${data.peer}] as [${data.role}]: "${data.task_summary}"`);
+            enqueueLog(now, 'sys', `Core requested delegation to [${data.peer}] as [${data.role}]: "${data.task_summary}"`);
             break;
 
           case 'DelegateCompleted':
             setActiveNodes((prev) => prev.filter((n) => n !== data.peer));
             setActivePeerName(null);
-            addLog(now, 'sys', `Delegation to [${data.peer}] completed with status: ${data.status}`);
-            refreshTurns();
+            enqueueLog(now, 'sys', `Delegation to [${data.peer}] completed with status: ${data.status}`);
+            scheduleRefreshTurns();
             break;
 
           case 'CoreOutputCompleted':
             if (data.turn_id) {
               setActiveCoreTurnId((prev) => prev ?? data.turn_id);
-              setRealtimeTerminalLines((prev) => (
-                prev[data.turn_id] ? prev : { ...prev, [data.turn_id]: [] }
-              ));
+              ensureRealtimeTerminalForTurn(data.turn_id);
+              markRuntimeTurnPhase(data.turn_id, 'output_completed');
             }
-            addLog(now, 'core', `Core output completed for [${data.provider}]`);
-            refreshTurns();
+            enqueueLog(now, 'core', `Core output completed for [${data.provider}]`);
+            scheduleRefreshTurns();
             break;
 
           case 'PeerOutputCompleted':
             setActiveTurnIds((prev) => prev.filter((id) => id !== data.turn_id));
-            refreshTurns();
+            markRuntimeTurnPhase(data.turn_id, 'output_completed');
+            scheduleRefreshTurns();
             break;
 
           case 'CoreExecutionTelemetry':
             if (data.turn_id) {
               setActiveCoreTurnId((prev) => prev ?? data.turn_id);
-              setRealtimeTerminalLines((prev) => (
-                prev[data.turn_id] ? prev : { ...prev, [data.turn_id]: [] }
-              ));
+              ensureRuntimeTurnPhase(data.turn_id, 'running');
+              ensureRealtimeTerminalForTurn(data.turn_id);
             }
             if (data.execution) {
-              setSessionEvents((prev) => upsertRuntimeItemEvent(prev, {
+              enqueueRuntimeItemEvent({
                 ...data,
                 event_type: RUNTIME_ITEM_EVENT_FALLBACK,
                 payload: { item_type: 'execution_telemetry', execution: data.execution },
-              }));
+              });
               const transport = data.execution.io_transport ? ` [${String(data.execution.io_transport).toUpperCase()}]` : '';
-              addLog(now, 'info', `Core command${transport}: ${executionDisplay(data.execution)}`);
+              enqueueLog(now, 'info', `Core command${transport}: ${executionDisplay(data.execution)}`);
             }
             break;
 
           case 'PeerExecutionTelemetry':
             if (data.turn_id) {
               setActivePeerTurnId((prev) => prev ?? data.turn_id);
+              ensureRuntimeTurnPhase(data.turn_id, 'running');
               setActivePeerName((prev) => prev ?? data.provider);
               setActiveNodes((prev) => prev.includes(data.provider) ? prev : [...prev, data.provider]);
               setActiveTurnIds((prev) => prev.includes(data.turn_id) ? prev : [...prev, data.turn_id]);
-              setRealtimeTerminalLines((prev) => (
-                prev[data.turn_id] ? prev : { ...prev, [data.turn_id]: [] }
-              ));
+              ensureRealtimeTerminalForTurn(data.turn_id);
             }
             if (data.execution) {
-              setSessionEvents((prev) => upsertRuntimeItemEvent(prev, {
+              enqueueRuntimeItemEvent({
                 ...data,
                 event_type: RUNTIME_ITEM_EVENT_FALLBACK,
                 payload: { item_type: 'execution_telemetry', execution: data.execution },
-              }));
+              });
               const transport = data.execution.io_transport ? ` [${String(data.execution.io_transport).toUpperCase()}]` : '';
-              addLog(now, 'info', `Peer command${transport}: ${executionDisplay(data.execution)}`);
+              enqueueLog(now, 'info', `Peer command${transport}: ${executionDisplay(data.execution)}`);
             }
             break;
 
           case 'CoreTerminalOutput':
             if (data.turn_id) {
               setActiveCoreTurnId((prev) => prev ?? data.turn_id);
+              ensureRuntimeTurnPhase(data.turn_id, 'running');
             }
             if (data.text) {
               const lines = data.text.split('\n');
@@ -1551,12 +3233,10 @@ function App() {
                 }
               }
               if (newLogs.length > 0) {
-                addLogs(newLogs);
+                enqueueLogs(newLogs);
               }
               if (data.turn_id) {
-                setRealtimeTerminalLines((prev) => {
-                  return { ...prev, [data.turn_id]: appendRealtimeLines(prev[data.turn_id], lines) };
-                });
+                appendRealtimeTerminalText(data.turn_id, data.text);
               }
             }
             break;
@@ -1564,6 +3244,7 @@ function App() {
           case 'PeerTerminalOutput':
             if (data.turn_id) {
               setActivePeerTurnId((prev) => prev ?? data.turn_id);
+              ensureRuntimeTurnPhase(data.turn_id, 'running');
               setActivePeerName((prev) => prev ?? data.provider);
               setActiveNodes((prev) => prev.includes(data.provider) ? prev : [...prev, data.provider]);
               setActiveTurnIds((prev) => prev.includes(data.turn_id) ? prev : [...prev, data.turn_id]);
@@ -1578,19 +3259,17 @@ function App() {
                 }
               }
               if (newLogs.length > 0) {
-                addLogs(newLogs);
+                enqueueLogs(newLogs);
               }
               if (data.turn_id) {
-                setRealtimeTerminalLines((prev) => {
-                  return { ...prev, [data.turn_id]: appendRealtimeLines(prev[data.turn_id], lines) };
-                });
+                appendRealtimeTerminalText(data.turn_id, data.text);
               }
             }
             break;
 
           case 'CallbackReceiptsInjected':
-            addLog(now, 'sys', `Injected ${data.count} unread callback receipts for provider [${data.provider}]`);
-            refreshTurns();
+            enqueueLog(now, 'sys', `Injected ${data.count} unread callback receipts for provider [${data.provider}]`);
+            scheduleRefreshTurns();
             break;
 
           case 'HyardJobObserved':
@@ -1605,25 +3284,34 @@ function App() {
                 ...(data.turn_id ? { [data.turn_id]: job } : {}),
               };
             });
-            addLog(now, 'sys', `[HYARD] Observed background job ${data.job.job_id} (${data.job.provider}) status: ${data.job.status}`);
-            refreshTurns();
+            enqueueLog(now, 'sys', `[HYARD] Observed background job ${data.job.job_id} (${data.job.provider}) status: ${data.job.status}`);
+            scheduleRefreshTurns();
             break;
 
           case 'FinalizationStarted':
+            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
             setActiveCoreText('');
             setActivePeerText('');
             setActivePeerName(null);
             setActiveNodes(['host', data.provider]);
             setActiveTurnIds([]);
             setActiveCoreTurnId(data.turn_id);
-            setRealtimeTerminalLines((prev) => (
-              prev[data.turn_id] ? prev : { ...prev, [data.turn_id]: [] }
-            ));
-            addLog(now, 'core', `Finalization phase started on [${data.provider}] (ID: ${data.turn_id})`);
-            refreshTurns();
+            ensureRealtimeTerminalForTurn(data.turn_id);
+            seedRuntimeTurnStartedAtFromDispatch(data.turn_id);
+            markRuntimeTurnPhase(data.turn_id, 'finalizing');
+            clearRuntimeDispatch();
+            enqueueLog(now, 'core', `Finalization phase started on [${data.provider}] (ID: ${data.turn_id})`);
+            scheduleRefreshTurns();
             break;
 
           case 'TurnCompleted':
+            {
+              const finalResponse = rememberFinalTurnResponse(data.turn_id, data.response);
+              if (finalResponse && typeof data.turn_id === 'string') {
+                commitTurns((prev) => mergeFinalResponseIntoTurns(prev, data.turn_id, finalResponse, 'completed'));
+              }
+            }
+            forgetRuntimeTurnSession(data.turn_id);
             setActiveNodes([]);
             setActiveTurnIds([]);
             setActiveCoreTurnId(null);
@@ -1631,8 +3319,12 @@ function App() {
             setActivePeerName(null);
             setActiveCoreText('');
             setActivePeerText('');
-            addLog(now, 'sys', `Routed turn completed successfully.`);
-            refreshTurns();
+            setRuntimeTurnPhases({});
+            setRuntimeTurnStartedAt({});
+            setRuntimeTurnPhaseChangedAt({});
+            clearRuntimeDispatch();
+            enqueueLog(now, 'sys', `Routed turn completed successfully.`);
+            scheduleRefreshTurns();
             // Bump the git refresh counter so the Source Control panel
             // re-fetches `git status` and surfaces whatever the AI just
             // wrote. This is the primary AI-change discovery path now
@@ -1641,6 +3333,7 @@ function App() {
             break;
 
           case 'TurnFailed':
+            forgetRuntimeTurnSession(data.turn_id);
             setActiveNodes([]);
             setActiveTurnIds([]);
             setActiveCoreTurnId(null);
@@ -1648,80 +3341,117 @@ function App() {
             setActivePeerName(null);
             setActiveCoreText('');
             setActivePeerText('');
-            addLog(now, 'sys', `Turn failed: ${data.error}`);
-            refreshTurns();
+            setRuntimeTurnPhases({});
+            setRuntimeTurnStartedAt({});
+            setRuntimeTurnPhaseChangedAt({});
+            clearRuntimeDispatch();
+            enqueueLog(now, 'sys', `Turn failed: ${data.error}`);
+            scheduleRefreshTurns();
             break;
 
-          case 'WorkerSpawned': {
+          case 'WorkerSpawned':
+          case 'worker_spawned': {
             const session = selectedSessionRef.current;
-            if (session && session.session_id === data.session_id) {
-              setSessionWorkers((prev) => {
-                if (prev.some((w) => w.instance_id === data.instance_id)) return prev;
-                return [
-                  ...prev,
-                  {
-                    instance_id: data.instance_id,
-                    provider: data.provider,
-                    session_id: data.session_id,
-                    label: data.label ?? null,
-                    kind: data.kind,
-                    spawned_at: data.spawned_at,
-                    state: 'idle',
-                    in_flight_turn_id: null,
-                  } as InstanceMetadata,
-                ];
-              });
-              addLog(now, 'sys', `Worker spawned: ${data.provider}${data.label ? ` (${data.label})` : ''}`);
+            const worker = normalizeInstanceMetadata({ ...data, state: data.state ?? 'idle' });
+            if (session && worker && session.session_id === worker.session_id) {
+              setSessionWorkers((prev) => upsertInstanceMetadata(prev, worker));
+              enqueueLog(now, 'sys', `Worker spawned: ${data.provider}${data.label ? ` (${data.label})` : ''}`);
+              scheduleRefreshSessionWorkers(worker.session_id);
             }
             break;
           }
 
-          case 'WorkerStateChanged': {
+          case 'WorkerStateChanged':
+          case 'worker_state_changed': {
             const session = selectedSessionRef.current;
-            if (session && session.session_id === data.session_id) {
+            const sessionId = normalizedString(data.session_id);
+            const instanceId = normalizedString(data.instance_id);
+            if (session && sessionId && instanceId && session.session_id === sessionId) {
               setSessionWorkers((prev) =>
                 prev.map((w) =>
-                  w.instance_id === data.instance_id
-                    ? { ...w, state: data.state, in_flight_turn_id: data.in_flight_turn_id ?? null }
+                  w.instance_id === instanceId
+                    ? {
+                        ...w,
+                        state: normalizeWorkerState(data.state),
+                        in_flight_turn_id: normalizedString(data.in_flight_turn_id),
+                      }
                     : w,
                 ),
               );
+              scheduleRefreshSessionWorkers(sessionId);
             }
             break;
           }
 
-          case 'WorkerRetrying': {
+          case 'WorkerRetrying':
+          case 'worker_retrying': {
             const session = selectedSessionRef.current;
-            if (session && session.session_id === data.session_id) {
-              addLog(
+            const sessionId = normalizedString(data.session_id);
+            if (session && sessionId && session.session_id === sessionId) {
+              enqueueLog(
                 now,
                 'sys',
                 `Worker retrying (attempt ${data.attempt}) ${data.provider}${data.label ? ` [${data.label}]` : ''}: ${data.last_error}`,
               );
               // The new attempt will emit its own WorkerSpawned + StateChanged
               // events, so no roster mutation here beyond surfacing the cause.
+              scheduleRefreshSessionWorkers(sessionId);
             }
             break;
           }
 
-          case 'WorkerTerminated': {
+          case 'WorkerTerminated':
+          case 'worker_terminated': {
             const session = selectedSessionRef.current;
-            if (session && session.session_id === data.session_id) {
-              setSessionWorkers((prev) => prev.filter((w) => w.instance_id !== data.instance_id));
-              addLog(
+            const sessionId = normalizedString(data.session_id);
+            const instanceId = normalizedString(data.instance_id);
+            if (session && sessionId && instanceId && session.session_id === sessionId) {
+              setSessionWorkers((prev) => prev.filter((w) => w.instance_id !== instanceId));
+              enqueueLog(
                 now,
                 'sys',
                 `Worker terminated (${data.reason}): ${data.provider}${data.label ? ` [${data.label}]` : ''}`,
               );
+              scheduleRefreshSessionWorkers(sessionId);
             }
             break;
           }
         }
+      };
+
+      const handleRuntimeEventBatchPayloads = (batch: any[]) => {
+        if (batch.length <= 1) {
+          if (batch.length === 1) handleRuntimeEventPayload(batch[0]);
+          return;
+        }
+        const context: RuntimeEventBatchContext = { sessionEventUpserts: [], logs: [] };
+        runtimeEventBatchContext = context;
+        try {
+          for (const payload of batch) {
+            handleRuntimeEventPayload(payload);
+          }
+        } finally {
+          runtimeEventBatchContext = null;
+        }
+        flushRuntimeEventBatchContext(context);
+      };
+
+      const uEvent = await listen<any>('runtime_event', (event) => {
+        unstable_batchedUpdates(() => {
+          handleRuntimeEventPayload(event.payload || {});
+        });
+      });
+      const uBatch = await listen<any[]>('runtime_event_batch', (event) => {
+        const batch = Array.isArray(event.payload) ? event.payload : [];
+        unstable_batchedUpdates(() => {
+          handleRuntimeEventBatchPayloads(batch);
+        });
       });
       if (!active) {
-        u();
+        uEvent();
+        uBatch();
       } else {
-        unlistenFn = u;
+        unlistenFns.push(uEvent, uBatch);
       }
       } catch (err) {
         console.error('Error setting up Tauri event listener:', err);
@@ -1732,9 +3462,16 @@ function App() {
 
     return () => {
       active = false;
-      if (unlistenFn) {
-        unlistenFn();
+      if (refreshTurnsTimer !== null) {
+        window.clearTimeout(refreshTurnsTimer);
+        refreshTurnsTimer = null;
       }
+      if (workerRefreshTimer !== null) {
+        window.clearTimeout(workerRefreshTimer);
+        workerRefreshTimer = null;
+      }
+      pendingWorkerRefreshSessionIds.clear();
+      unlistenFns.splice(0).forEach((unlisten) => unlisten());
     };
   }, []);
 
@@ -1751,6 +3488,18 @@ function App() {
   const addLog = (time: string, tag: 'core' | 'peer' | 'sys' | 'info', message: string) => {
     addLogs([{ timestamp: time, tag, message }]);
   };
+
+  const persistedTurnStartedAtMs = useMemo(() => {
+    const next: Record<string, number> = {};
+    turns.forEach((turn) => {
+      if (!turn.started_at) return;
+      const parsed = Date.parse(turn.started_at);
+      if (Number.isFinite(parsed)) {
+        next[turn.turn_id] = parsed;
+      }
+    });
+    return next;
+  }, [turns]);
 
   const handleResolveToolApproval = async (
     requestId: string,
@@ -1774,14 +3523,39 @@ function App() {
     }
   };
 
+  const runtimeTurnStartedAtMs = (turnId: string): number | undefined => {
+    const liveStartedAt = runtimeTurnStartedAt[turnId];
+    if (liveStartedAt) return liveStartedAt;
+    return persistedTurnStartedAtMs[turnId];
+  };
+
+  const runtimePhaseStartedAtMs = (turnId: string): number | undefined => {
+    return runtimeTurnPhaseChangedAt[turnId] || runtimeTurnStartedAtMs(turnId);
+  };
+
+  const handleCancel = async () => {
+    try {
+      await invoke('cancel_turn');
+      addLog(new Date().toLocaleTimeString(), 'sys', '取消指令已发送至智能体内核...');
+    } catch (e) {
+      addLog(new Date().toLocaleTimeString(), 'sys', `取消失败: ${e}`);
+    }
+  };
+
   const renderTurnEventsWithActions = (
     turnId: string,
     eventList: any[],
     turnList: Turn[],
     realtimeLines?: string[],
     jobs?: Record<string, any>,
+    options: RenderTurnEventsOptions = {},
   ) => renderTurnEvents(turnId, eventList, turnList, realtimeLines, jobs, {
+    ...options,
     onResolveApproval: handleResolveToolApproval,
+    onCancelTurn: handleCancel,
+    runtimePhase: runtimeTurnPhases[turnId],
+    runtimeStartedAtMs: runtimeTurnStartedAtMs(turnId),
+    runtimePhaseStartedAtMs: runtimePhaseStartedAtMs(turnId),
   });
 
   const renderTurnActivitySummaryWithActions = (
@@ -1790,14 +3564,44 @@ function App() {
     turnList: Turn[],
     realtimeLines?: string[],
     jobs?: Record<string, any>,
+    options: RenderTurnEventsOptions = {},
   ) => renderTurnActivitySummary(turnId, eventList, turnList, realtimeLines, jobs, {
+    ...options,
     onResolveApproval: handleResolveToolApproval,
+    onCancelTurn: handleCancel,
+    runtimePhase: runtimeTurnPhases[turnId],
+    runtimeStartedAtMs: runtimeTurnStartedAtMs(turnId),
+    runtimePhaseStartedAtMs: runtimePhaseStartedAtMs(turnId),
   });
 
-  const enqueueQueuedMessage = (payload: SendPayload) => {
-    const next = [...messageQueueRef.current, payload];
-    messageQueueRef.current = next;
-    setMessageQueue(next);
+  const getQueuedMessagesForSession = (sessionId: string | null | undefined) => {
+    if (!sessionId) return [];
+    if (selectedSessionRef.current?.session_id === sessionId) {
+      return messageQueueRef.current;
+    }
+    return sessionUiSnapshotsRef.current[sessionId]?.messageQueue ?? [];
+  };
+
+  const setQueuedMessagesForSession = (
+    sessionId: string | null | undefined,
+    next: SendPayload[],
+  ) => {
+    if (!sessionId) return;
+    patchSessionUiSnapshot(sessionId, {
+      messageQueue: next,
+    });
+    if (selectedSessionRef.current?.session_id === sessionId) {
+      messageQueueRef.current = next;
+      setMessageQueue(next);
+    }
+  };
+
+  const enqueueQueuedMessage = (
+    payload: SendPayload,
+    sessionId = selectedSessionRef.current?.session_id,
+  ) => {
+    const next = [...getQueuedMessagesForSession(sessionId), payload];
+    setQueuedMessagesForSession(sessionId, next);
     addLog(
       new Date().toLocaleTimeString(),
       'sys',
@@ -1806,26 +3610,30 @@ function App() {
     return next.length;
   };
 
-  const clearQueuedMessages = (emitLog: boolean) => {
-    if (messageQueueRef.current.length === 0) return;
-    messageQueueRef.current = [];
-    setMessageQueue([]);
+  const clearQueuedMessages = (
+    emitLog: boolean,
+    sessionId = selectedSessionRef.current?.session_id,
+  ) => {
+    if (getQueuedMessagesForSession(sessionId).length === 0) return;
+    setQueuedMessagesForSession(sessionId, []);
     if (emitLog) {
       addLog(new Date().toLocaleTimeString(), 'sys', 'Cleared queued messages');
     }
   };
 
-  const activateSessionShell = (session: Session) => {
-    const previous = selectedSessionRef.current;
-    // Keep the imperative ref in sync immediately. Runtime events and
-    // refreshTurns() can fire before React commits setSelectedSession(); if the
-    // ref is stale those live updates either no-op or hydrate the wrong chat.
-    if (previous && previous.session_id !== session.session_id) {
-      clearQueuedMessages(false);
-    }
-    selectedSessionRef.current = session;
-    setSelectedSession(session);
-    setSelectedAgentTurnId(null);
+  const resetWorkspaceScopedUi = () => {
+    selectedSessionRef.current = null;
+    sessionEventsCursorRef.current = {};
+    sessionUiSnapshotsRef.current = {};
+    activeRuntimeSessionIdRef.current = null;
+    runtimeTurnSessionIdRef.current = {};
+    pendingAttachmentBindingsRef.current = [];
+    activeAttachmentBindingIdRef.current = null;
+    setSessions([]);
+    setSelectedSession(null);
+    commitTurns([]);
+    setSessionEvents([]);
+    setSessionWorkers([]);
     setActiveCoreText('');
     setActivePeerText('');
     setActivePeerName(null);
@@ -1833,20 +3641,76 @@ function App() {
     setActiveTurnIds([]);
     setActiveCoreTurnId(null);
     setActivePeerTurnId(null);
-    setRealtimeTerminalLines({});
+    setSelectedAgentTurnId(null);
+    clearRealtimeTerminalText();
     setHyardJobs({});
+    setRuntimeTurnPhases({});
+    setRuntimeTurnStartedAt({});
+    setRuntimeTurnPhaseChangedAt({});
+    clearRuntimeDispatch();
+    setCanvasTabs([]);
+    setActiveCanvasTabId(null);
+    isPreparingDispatchRef.current = false;
+    isDispatchingRef.current = false;
+    setIsGenerating(false);
+    messageQueueRef.current = [];
+    setMessageQueue([]);
   };
 
-  const takeNextQueuedMessage = (): SendPayload | null => {
-    const pending = messageQueueRef.current;
+  const activateSessionShell = (session: Session) => {
+    const previous = selectedSessionRef.current;
+    // Keep the imperative ref in sync immediately. Runtime events and
+    // refreshTurns() can fire before React commits setSelectedSession(); if the
+    // ref is stale those live updates either no-op or hydrate the wrong chat.
+    if (previous?.session_id) {
+      captureCurrentSessionUiSnapshot(previous.session_id);
+    }
+    selectedSessionRef.current = session;
+    setSelectedSession(session);
+    applySessionUiSnapshot(sessionUiSnapshotsRef.current[session.session_id]);
+  };
+
+  const takeNextQueuedMessage = (sessionId = selectedSessionRef.current?.session_id): SendPayload | null => {
+    const pending = getQueuedMessagesForSession(sessionId);
     if (pending.length === 0) return null;
     const [nextMessage, ...rest] = pending;
-    messageQueueRef.current = rest;
-    setMessageQueue(rest);
+    setQueuedMessagesForSession(sessionId, rest);
     return nextMessage;
   };
 
-  const loadSessions = async () => {
+  const takeNextQueuedDispatch = (): { session: Session; payload: SendPayload } | null => {
+    const knownSessions = sessionsRef.current;
+    const selectedId = selectedSessionRef.current?.session_id;
+    const orderedSessionIds = [
+      selectedId,
+      ...Object.keys(sessionUiSnapshotsRef.current),
+    ].filter((value, index, array): value is string => (
+      typeof value === 'string' &&
+      value.length > 0 &&
+      array.indexOf(value) === index
+    ));
+
+    for (const sessionId of orderedSessionIds) {
+      const payload = takeNextQueuedMessage(sessionId);
+      if (!payload) continue;
+      const session = knownSessions.find((item) => item.session_id === sessionId)
+        ?? (selectedSessionRef.current?.session_id === sessionId ? selectedSessionRef.current : null);
+      if (session) {
+        return { session, payload };
+      }
+      // If the backing session was deleted between queueing and dispatch,
+      // drop only this orphaned message and continue looking for valid work.
+      addLog(new Date().toLocaleTimeString(), 'sys', `Dropped queued message for missing session ${sessionId}`);
+    }
+    return null;
+  };
+
+  const loadSessions = async (workspaceOverride?: Workspace | null) => {
+    const workspace = workspaceOverride === undefined ? currentWorkspace : workspaceOverride;
+    if (!workspace) {
+      resetWorkspaceScopedUi();
+      return;
+    }
     try {
       const res = await invoke<Session[]>('list_sessions');
       setSessions(res);
@@ -1860,15 +3724,29 @@ function App() {
 
   const selectSession = async (session: Session) => {
     activateSessionShell(session);
-    setTurns([]);
-    setSessionEvents([]);
+    sessionEventsCursorRef.current = {
+      ...sessionEventsCursorRef.current,
+      [session.session_id]: '',
+    };
     try {
       const turnList = await invoke<Turn[]>('get_session_turns', { sessionId: session.session_id });
+      const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
+      reconcileTurnAttachmentBindings(session.session_id, turnListWithFinalResponses);
+      patchSessionUiSnapshot(session.session_id, {
+        turns: turnListWithFinalResponses,
+        loaded: true,
+      });
+      if (selectedSessionRef.current?.session_id === session.session_id) {
+        commitTurns(turnListWithFinalResponses);
+      }
+      const eventList = await fetchSessionEventsForMerge(session.session_id, 'full');
+      const mergedEvents = mergeSessionEventLists([], eventList);
+      patchSessionUiSnapshot(session.session_id, {
+        sessionEvents: mergedEvents,
+        loaded: true,
+      });
       if (selectedSessionRef.current?.session_id !== session.session_id) return;
-      setTurns(turnList);
-      const eventList = await invoke<any[]>('get_session_events', { sessionId: session.session_id });
-      if (selectedSessionRef.current?.session_id !== session.session_id) return;
-      setSessionEvents(mergeSessionEventLists([], eventList));
+      setSessionEvents(mergedEvents);
     } catch (e) {
       console.error(e);
     }
@@ -1947,23 +3825,109 @@ function App() {
   const isSendPipelineBusy = () => isPreparingDispatchRef.current || isDispatchingRef.current;
 
   const runSingleMessage = async (sessionForSend: Session, payload: SendPayload) => {
+    const targetSessionId = sessionForSend.session_id;
+    const isTargetVisible = () => selectedSessionRef.current?.session_id === targetSessionId;
+    const targetTurnsForSend = () => (
+      isTargetVisible()
+        ? turnsRef.current
+        : sessionUiSnapshotsRef.current[targetSessionId]?.turns ?? []
+    );
+    const patchTargetSnapshot = (
+      patch:
+        | Partial<SessionUiSnapshot>
+        | ((previous: SessionUiSnapshot) => SessionUiSnapshot),
+    ) => patchSessionUiSnapshot(targetSessionId, patch);
+    const clearTargetRuntimeState = () => {
+      if (isTargetVisible()) {
+        setActiveNodes([]);
+        setActivePeerName(null);
+        setActiveTurnIds([]);
+        setActiveCoreTurnId(null);
+        setActivePeerTurnId(null);
+        setActiveCoreText('');
+        setActivePeerText('');
+        setRuntimeTurnPhases({});
+        setRuntimeTurnStartedAt({});
+        setRuntimeTurnPhaseChangedAt({});
+        clearRuntimeDispatch();
+        return;
+      }
+      patchTargetSnapshot((previous) => ({
+        ...previous,
+        activeNodes: [],
+        activeTurnIds: [],
+        activeCoreTurnId: null,
+        activePeerTurnId: null,
+        activePeerName: null,
+        activeCoreText: '',
+        activePeerText: '',
+        runtimeTurnPhases: {},
+        runtimeTurnStartedAt: {},
+        runtimeTurnPhaseChangedAt: {},
+        runtimeDispatchStartedAt: null,
+        runtimePreparingPhase: null,
+        isGenerating: false,
+        loadedAt: Date.now(),
+      }));
+    };
+
+    activeRuntimeSessionIdRef.current = targetSessionId;
     const message = stripAttachmentReferences(payload.text);
     const imagePaths = payload.imagePaths;
     const filePaths = payload.filePaths ?? [];
     const payloadAttachments = attachmentsFromPayload(payload);
     const sandboxMode = sandboxModeRef.current;
-    setActiveCoreText('');
-    setActivePeerText('');
-    setActivePeerName(null);
-    setActiveNodes(['host']);
-    setActiveTurnIds([]);
-    setTelemetryLogs([]);
+    const dispatchStartedAt = Date.now();
+    if (isTargetVisible()) {
+      setActiveCoreText('');
+      setActivePeerText('');
+      setActivePeerName(null);
+      setActiveNodes(['host']);
+      setActiveTurnIds([]);
+      setTelemetryLogs([]);
+      setRuntimeTurnPhases({});
+      setRuntimeTurnStartedAt({});
+      setRuntimeTurnPhaseChangedAt({});
+      beginRuntimeDispatch('正在进入后端调度队列…', dispatchStartedAt);
+    } else {
+      patchTargetSnapshot((previous) => ({
+        ...previous,
+        activeCoreText: '',
+        activePeerText: '',
+        activePeerName: null,
+        activeNodes: ['host'],
+        activeTurnIds: [],
+        activeCoreTurnId: null,
+        activePeerTurnId: null,
+        runtimeTurnPhases: {},
+        runtimeTurnStartedAt: {},
+        runtimeTurnPhaseChangedAt: {},
+        runtimeDispatchStartedAt: dispatchStartedAt,
+        runtimePreparingPhase: '正在进入后端调度队列…',
+        isGenerating: true,
+        loadedAt: Date.now(),
+      }));
+    }
 
-    // Add visual temp turn/message instantly for reactive feel
-    const tempTurnId = `temp-user-${Date.now()}`;
+    // Add visual temp turn/message instantly for reactive feel. For a hidden
+    // session this writes only to its snapshot cache, so dispatching queued work
+    // in Session B cannot repaint/pollute the currently visible Session A.
+    const tempTurnId = createTempUserTurnId(targetSessionId);
+    const beforeTurnIds = turnIdsBeforeSend(targetTurnsForSend(), targetSessionId);
+    const attachmentBinding: PendingTurnAttachmentBinding | null = payloadAttachments.length > 0
+      ? {
+          bindingId: `${tempTurnId}:attachments`,
+          sessionId: targetSessionId,
+          text: message,
+          attachments: payloadAttachments,
+          beforeTurnIds,
+          tempTurnId,
+          createdAt: Date.now(),
+        }
+      : null;
     const tempUserTurn: Turn = {
       turn_id: tempTurnId,
-      session_id: sessionForSend.session_id,
+      session_id: targetSessionId,
       origin: 'user',
       provider: 'user',
       role: 'core',
@@ -1975,17 +3939,34 @@ function App() {
       completed_at: null,
       delegated_by: null
     };
-    setTurns((prev) => [...prev, tempUserTurn]);
-    if (payloadAttachments.length > 0) {
+    if (isTargetVisible()) {
+      commitTurns((prev) => [...prev, tempUserTurn]);
+    } else {
+      patchTargetSnapshot((previous) => ({
+        ...previous,
+        turns: [...previous.turns, tempUserTurn],
+        loaded: true,
+        loadedAt: Date.now(),
+      }));
+    }
+    if (attachmentBinding) {
+      pendingAttachmentBindingsRef.current = [
+        ...pendingAttachmentBindingsRef.current,
+        attachmentBinding,
+      ].slice(-100);
+      activeAttachmentBindingIdRef.current = attachmentBinding.bindingId;
       setTurnAttachments((prev) => ({
         ...prev,
         [tempTurnId]: payloadAttachments,
       }));
+    } else {
+      activeAttachmentBindingIdRef.current = null;
     }
 
+    let runTurnResponse: string | null = null;
     try {
-      await invoke('run_turn', {
-        sessionId: sessionForSend.session_id,
+      runTurnResponse = await invoke<string>('run_turn', {
+        sessionId: targetSessionId,
         message,
         provider: sessionForSend.active_core,
         sandboxMode,
@@ -1994,32 +3975,40 @@ function App() {
       });
     } catch (e) {
       addLog(new Date().toLocaleTimeString(), 'sys', `Execution failed: ${e}`);
+      // If the backend rejects before a canonical runtime event exists, there
+      // will be no TurnFailed event to clear the "preparing" card. Success and
+      // normal provider failures are cleared by TurnCompleted/TurnFailed so we
+      // don't tear down live stream state prematurely.
+      clearTargetRuntimeState();
     } finally {
-      setActiveNodes([]);
-      setActivePeerName(null);
-      setActiveTurnIds([]);
-      setActiveCoreTurnId(null);
-      setActivePeerTurnId(null);
-      setActiveCoreText('');
-      setActivePeerText('');
       // Reload turns database state
       try {
         const updatedTurns = await invoke<Turn[]>('get_session_turns', { sessionId: sessionForSend.session_id });
-        if (payloadAttachments.length > 0) {
-          const matchedTurn = [...updatedTurns]
-            .reverse()
-            .find((turn) => turn.origin === 'user' && stripAttachmentReferences(turn.user_message).trim() === message.trim());
-          setTurnAttachments((prev) => {
-            const next = { ...prev };
-            delete next[tempTurnId];
-            if (matchedTurn) {
-              next[matchedTurn.turn_id] = payloadAttachments;
-            }
-            return next;
-          });
+        let nextTurns = applyRememberedFinalTurnResponses(updatedTurns);
+        const returnedResponse = fallbackResponseForUserMessage(runTurnResponse, message);
+        if (returnedResponse !== null) {
+          const matchedTurn = findFreshlySentTurn(
+            nextTurns,
+            sessionForSend.session_id,
+            message,
+            beforeTurnIds,
+            tempTurnId,
+          );
+          if (matchedTurn && nonBlankText(matchedTurn.provider_response) === null) {
+            rememberFinalTurnResponse(matchedTurn.turn_id, returnedResponse);
+            nextTurns = mergeFallbackResponseIntoTurns(nextTurns, matchedTurn.turn_id, returnedResponse);
+          }
         }
+        reconcileTurnAttachmentBindings(sessionForSend.session_id, nextTurns);
         if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
-          setTurns(updatedTurns);
+          commitTurns((prev) => mergeFreshTurnsPreservingKnownResponses(prev, nextTurns));
+        } else {
+          patchSessionUiSnapshot(sessionForSend.session_id, (previous) => ({
+            ...previous,
+            turns: mergeFreshTurnsPreservingKnownResponses(previous.turns, nextTurns),
+            loaded: true,
+            loadedAt: Date.now(),
+          }));
         }
       } catch (e) {
         console.error('Error reloading turns after dispatch:', e);
@@ -2031,9 +4020,16 @@ function App() {
       // races slightly behind live runtime events cannot erase just-rendered
       // streaming/tool-call cards.
       try {
-        const eventList = await invoke<any[]>('get_session_events', { sessionId: sessionForSend.session_id });
+        const eventList = await fetchSessionEventsForMerge(sessionForSend.session_id, 'incremental');
         if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
           setSessionEvents((prev) => mergeSessionEventLists(prev, eventList));
+        } else {
+          patchSessionUiSnapshot(sessionForSend.session_id, (previous) => ({
+            ...previous,
+            sessionEvents: mergeSessionEventLists(previous.sessionEvents, eventList),
+            loaded: true,
+            loadedAt: Date.now(),
+          }));
         }
       } catch (e) {
         console.error(e);
@@ -2043,11 +4039,15 @@ function App() {
 
   const dispatchMessage = async (sessionForSend: Session, initialPayload: SendPayload) => {
     if (isSendPipelineBusy()) {
-      enqueueQueuedMessage(initialPayload);
+      enqueueQueuedMessage(initialPayload, sessionForSend.session_id);
       return;
     }
     isDispatchingRef.current = true;
-    setIsGenerating(true);
+    if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
+      setIsGenerating(true);
+    } else {
+      patchSessionUiSnapshot(sessionForSend.session_id, { isGenerating: true });
+    }
     let payload: SendPayload | null = initialPayload;
     try {
       while (payload !== null) {
@@ -2057,18 +4057,36 @@ function App() {
         // in-flight flag between turns. This avoids the old recursive gap where
         // a rapid send at provider-completion time could slip through as a
         // second overlapping `run_turn` instead of joining the queue.
-        payload = takeNextQueuedMessage();
+        payload = takeNextQueuedMessage(sessionForSend.session_id);
         if (payload) {
           addLog(
             new Date().toLocaleTimeString(),
             'sys',
-            `Dispatching queued message (${messageQueueRef.current.length} remaining): ${describeSendPayload(payload)}`,
+            `Dispatching queued message (${getQueuedMessagesForSession(sessionForSend.session_id).length} remaining): ${describeSendPayload(payload)}`,
           );
         }
       }
     } finally {
       isDispatchingRef.current = false;
-      setIsGenerating(false);
+      activeRuntimeSessionIdRef.current = null;
+      if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
+        setIsGenerating(false);
+      } else {
+        patchSessionUiSnapshot(sessionForSend.session_id, {
+          isGenerating: false,
+          activeCoreTurnId: null,
+          activePeerTurnId: null,
+          activePeerName: null,
+          activeNodes: [],
+          activeTurnIds: [],
+          runtimeDispatchStartedAt: null,
+          runtimePreparingPhase: null,
+        });
+      }
+      const nextQueuedDispatch = takeNextQueuedDispatch();
+      if (nextQueuedDispatch) {
+        void dispatchMessage(nextQueuedDispatch.session, nextQueuedDispatch.payload);
+      }
     }
   };
 
@@ -2284,12 +4302,18 @@ function App() {
       return;
     }
 
-    // If a turn is already running, this send is a follow-up for that same
-    // active session. Queue it synchronously instead of trusting `isGenerating`
-    // (React state can lag behind rapid Enter presses and would otherwise allow
-    // overlapping run_turn calls).
+    // If a turn is already running, queue this message under the currently
+    // selected session. The dispatcher drains queues per session, so a message
+    // typed in Session B while Session A is busy cannot accidentally execute
+    // inside Session A's context.
     if (isSendPipelineBusy()) {
-      enqueueQueuedMessage(payload);
+      const queuedSessionId = selectedSessionRef.current?.session_id;
+      if (!queuedSessionId) {
+        restoreText?.(rawPayload.text);
+        appendSystemNote('A turn is already running. Select a session before queueing another message.');
+        return;
+      }
+      enqueueQueuedMessage(payload, queuedSessionId);
       return;
     }
 
@@ -2313,7 +4337,11 @@ function App() {
         // erase that first visible feedback, making a fresh-chat send look like
         // a silent hang.
         activateSessionShell(created);
-        setTurns([]);
+        sessionEventsCursorRef.current = {
+          ...sessionEventsCursorRef.current,
+          [created.session_id]: '',
+        };
+        commitTurns([]);
         setSessionEvents([]);
         target = created;
       } catch (e) {
@@ -2358,7 +4386,8 @@ function App() {
       try {
         const refreshed = await invoke<Turn[]>('get_session_turns', { sessionId: sessionForSend.session_id });
         if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
-          setTurns(refreshed);
+          reconcileTurnAttachmentBindings(sessionForSend.session_id, refreshed);
+          commitTurns(refreshed);
         }
       } catch (e) {
         console.error('refresh after rewind failed', e);
@@ -2382,7 +4411,7 @@ function App() {
         attachments: attachments.length > 0 ? attachments : undefined,
       };
       if (isSendPipelineBusy()) {
-        enqueueQueuedMessage(payload);
+        enqueueQueuedMessage(payload, sessionForSend.session_id);
       } else {
         void dispatchMessage(sessionForSend, payload);
       }
@@ -2414,7 +4443,8 @@ function App() {
       try {
         const refreshed = await invoke<Turn[]>('get_session_turns', { sessionId: sessionForSend.session_id });
         if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
-          setTurns(refreshed);
+          reconcileTurnAttachmentBindings(sessionForSend.session_id, refreshed);
+          commitTurns(refreshed);
         }
       } catch (e) {
         console.error('refresh after rewind failed', e);
@@ -2435,21 +4465,12 @@ function App() {
         attachments: attachments.length > 0 ? attachments : undefined,
       };
       if (isSendPipelineBusy()) {
-        enqueueQueuedMessage(payload);
+        enqueueQueuedMessage(payload, sessionForSend.session_id);
       } else {
         void dispatchMessage(sessionForSend, payload);
       }
     } catch (e) {
       addLog(new Date().toLocaleTimeString(), 'sys', `Retry failed: ${e}`);
-    }
-  };
-
-  const handleCancel = async () => {
-    try {
-      await invoke('cancel_turn');
-      addLog(new Date().toLocaleTimeString(), 'sys', '取消指令已发送至智能体内核...');
-    } catch (e) {
-      addLog(new Date().toLocaleTimeString(), 'sys', `取消失败: ${e}`);
     }
   };
 
@@ -2607,15 +4628,31 @@ function App() {
     }
     try {
       await invoke('delete_session', { sessionId });
+      const remainingCursors = { ...sessionEventsCursorRef.current };
+      delete remainingCursors[sessionId];
+      sessionEventsCursorRef.current = remainingCursors;
+      const remainingSnapshots = { ...sessionUiSnapshotsRef.current };
+      delete remainingSnapshots[sessionId];
+      sessionUiSnapshotsRef.current = remainingSnapshots;
+      runtimeTurnSessionIdRef.current = Object.fromEntries(
+        Object.entries(runtimeTurnSessionIdRef.current).filter(([, value]) => value !== sessionId),
+      );
+      if (activeRuntimeSessionIdRef.current === sessionId) {
+        activeRuntimeSessionIdRef.current = null;
+      }
       setSessions((prev) => {
         const next = prev.filter((s) => s.session_id !== sessionId);
         if (selectedSession?.session_id === sessionId) {
           if (next.length > 0) {
             selectSession(next[0]);
           } else {
+            selectedSessionRef.current = null;
             setSelectedSession(null);
-            setTurns([]);
+            commitTurns([]);
             setSessionEvents([]);
+            setSessionWorkers([]);
+            messageQueueRef.current = [];
+            setMessageQueue([]);
           }
         }
         return next;
@@ -2694,6 +4731,23 @@ function App() {
         '--switchyard-canvas-column-width': `${Math.round(canvasColumnWidthRef.current)}px`,
       } as CSSProperties}
     >
+      <AppTopBar
+        current={currentWorkspace}
+        workspaces={workspaces}
+        railMode={railMode}
+        terminalOpen={terminalOpen}
+        onRailModeChange={setRailMode}
+        onSwitchWorkspace={handleSwitchWorkspace}
+        onRenameWorkspace={handleRenameWorkspace}
+        onOpenFolder={handleOpenFolderAsWorkspace}
+        onCloseWorkspace={handleCloseWorkspace}
+        onAddFolder={handleAddFolderToCurrentWorkspace}
+        onRemoveExtraRoot={handleRemoveExtraRoot}
+        onOpenSettings={() => setShowSettings(true)}
+        onToggleTerminal={toggleTerminalPanel}
+        onOpenDiagnostics={() => setDrawerOpen((v) => !v)}
+      />
+
       {/* 0. Icon Rail — mode switcher + bottom settings control. */}
       <IconRail
         mode={railMode}
@@ -2702,9 +4756,10 @@ function App() {
         onOpenSettings={() => setShowSettings(true)}
       />
 
-      {/* 1. Second column — Workspace header + session list (Chat mode).
-          Files/Terminal modes land in later phases; today they show a
-          placeholder so the rail still feels responsive. */}
+      {/* 1. Second column — session list / explorer / source control.
+          Workspace operations moved into the custom top bar so this column
+          can behave like VS Code's activity side pane without a pinned
+          floating header. */}
       <div
         className="left-column"
         style={{
@@ -2715,14 +4770,6 @@ function App() {
           borderRight: '1px solid var(--border-muted)',
         }}
       >
-        <WorkspaceHeader
-          current={currentWorkspace}
-          workspaces={workspaces}
-          onSwitch={handleSwitchWorkspace}
-          onCreate={handleCreateWorkspace}
-          onRename={handleRenameWorkspace}
-          onUpdateExtraRoots={handleUpdateExtraRoots}
-        />
         {railMode === 'chat' && (
           <Sidebar
             sessions={sessions}
@@ -2737,36 +4784,42 @@ function App() {
           />
         )}
         {railMode === 'files' && (
-          <FilesTree
-            // workspace_id as key so swapping workspaces fully resets
-            // the tree's cached children + expanded state.
-            key={currentWorkspace?.workspace_id ?? 'no-workspace'}
-            workspaceId={currentWorkspace?.workspace_id ?? null}
-            // Shared with SourceControl — bumping `gitRefreshNonce`
-            // re-fetches `git status` so the tree's status colors
-            // and folder dots stay in sync with whatever the AI just
-            // wrote (or the user staged / discarded).
-            gitRefreshNonce={gitRefreshNonce}
-            onOpenFile={openFileInCanvas}
-          />
+          <Suspense fallback={<LazyPanelFallback label="Loading explorer…" />}>
+            <FilesTree
+              // workspace_id as key so swapping workspaces fully resets
+              // the tree's cached children + expanded state.
+              key={currentWorkspace?.workspace_id ?? 'no-workspace'}
+              workspace={currentWorkspace}
+              // Shared with SourceControl — bumping `gitRefreshNonce`
+              // re-fetches `git status` so the tree's status colors
+              // and folder dots stay in sync with whatever the AI just
+              // wrote (or the user staged / discarded).
+              gitRefreshNonce={gitRefreshNonce}
+              onOpenFile={openFileInCanvas}
+              onAddFolder={handleAddFolderToCurrentWorkspace}
+              onRemoveExtraRoot={handleRemoveExtraRoot}
+            />
+          </Suspense>
         )}
         {railMode === 'source_control' && (
-          <SourceControl
-            // workspaceId as key forces a full remount on workspace
-            // switch so committed-message + section-open state don't
-            // bleed across projects.
-            key={currentWorkspace?.workspace_id ?? 'no-workspace'}
-            workspaceId={currentWorkspace?.workspace_id ?? null}
-            refreshNonce={gitRefreshNonce}
-            onOpenDiff={openGitDiffInCanvas}
-          />
+          <Suspense fallback={<LazyPanelFallback label="Loading source control…" />}>
+            <SourceControl
+              // workspaceId as key forces a full remount on workspace
+              // switch so committed-message + section-open state don't
+              // bleed across projects.
+              key={currentWorkspace?.workspace_id ?? 'no-workspace'}
+              workspaceId={currentWorkspace?.workspace_id ?? null}
+              refreshNonce={gitRefreshNonce}
+              onOpenDiff={openGitDiffInCanvas}
+            />
+          </Suspense>
         )}
       </div>
 
       <div
         role="separator"
         aria-orientation="vertical"
-        className="layout-sash layout-sash-vertical"
+        className="layout-sash layout-sash-vertical layout-sash-sidebar"
         title="Drag to resize side bar · Double-click to reset"
         onPointerDown={startLeftColumnResize}
         onDoubleClick={() => {
@@ -2809,32 +4862,44 @@ function App() {
           }}
         >
           <div className="chat-pane" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-            <ChatArea
-              selectedSession={selectedSession}
-              isGenerating={isGenerating}
-              turns={turns}
-              turnAttachments={turnAttachments}
-              handleSend={handleSend}
-              handleCancel={handleCancel}
-              activeCoreText={activeCoreText}
-              activeCoreTurnId={activeCoreTurnId}
-              activePeerName={activePeerName}
-              activePeerTurnId={activePeerTurnId}
-              activePeerText={activePeerText}
-              sessionEvents={sessionEvents}
-              realtimeTerminalLines={realtimeTerminalLines}
-              hyardJobs={hyardJobs}
-              renderMessageBody={renderMessageBody}
-              renderTurnEvents={renderTurnEventsWithActions}
-              renderTurnActivitySummary={renderTurnActivitySummaryWithActions}
-              queuedMessages={messageQueue}
-              onClearQueue={handleClearQueue}
-              sandboxMode={config?.sandbox?.mode ?? DEFAULT_SANDBOX_MODE}
-              onSandboxModeChange={handleSandboxModeChange}
-              onEditAndResend={handleEditAndResend}
-              onRetryLastUserTurn={handleRetryLastUserTurn}
-              onOpenFile={openFileInCanvas}
-            />
+            {currentWorkspace ? (
+              <ChatArea
+                selectedSession={selectedSession}
+                isGenerating={isGenerating}
+                turns={turns}
+                turnAttachments={turnAttachments}
+                runtimeDispatchStartedAt={runtimeDispatchStartedAt}
+                runtimeDispatchPhase={runtimePreparingPhase}
+                activeCoreRuntimePhase={activeCoreTurnId ? runtimeTurnPhases[activeCoreTurnId] : undefined}
+                activePeerRuntimePhase={activePeerTurnId ? runtimeTurnPhases[activePeerTurnId] : undefined}
+                handleSend={handleSend}
+                handleCancel={handleCancel}
+                activeCoreText={activeCoreText}
+                activeCoreTurnId={activeCoreTurnId}
+                activePeerName={activePeerName}
+                activePeerTurnId={activePeerTurnId}
+                activePeerText={activePeerText}
+                sessionEvents={sessionEvents}
+                realtimeTerminalLines={realtimeTerminalLines}
+                hyardJobs={hyardJobs}
+                renderMessageBody={renderMessageBody}
+                renderTurnEvents={renderTurnEventsWithActions}
+                renderTurnActivitySummary={renderTurnActivitySummaryWithActions}
+                queuedMessages={messageQueue}
+                onClearQueue={handleClearQueue}
+                sandboxMode={config?.sandbox?.mode ?? DEFAULT_SANDBOX_MODE}
+                onSandboxModeChange={handleSandboxModeChange}
+                onEditAndResend={handleEditAndResend}
+                onRetryLastUserTurn={handleRetryLastUserTurn}
+                onOpenFile={openFileInCanvas}
+              />
+            ) : (
+              <WelcomeWorkspace
+                workspaces={workspaces}
+                onOpenFolder={handleOpenFolderAsWorkspace}
+                onSwitchWorkspace={handleSwitchWorkspace}
+              />
+            )}
           </div>
           {canvasTabs.length > 0 && (
             <>
@@ -2865,18 +4930,20 @@ function App() {
                   flexShrink: 0,
                 }}
               >
-                <Canvas
-                  tabs={canvasTabs}
-                  activeTabId={activeCanvasTabId}
-                  onSelectTab={setActiveCanvasTabId}
-                  onCloseTab={closeCanvasTab}
-                  onReloadTab={reloadCanvasTab}
-                  onToggleMode={toggleCanvasTabMode}
-                  onDraftChange={updateCanvasDraft}
-                  onSave={saveCanvasTab}
-                  onRevertAiChange={revertCanvasAiChange}
-                  onDismissAiChange={dismissCanvasAiChange}
-                />
+                <Suspense fallback={<LazyPanelFallback label="Loading editor…" minHeight={240} />}>
+                  <Canvas
+                    tabs={canvasTabs}
+                    activeTabId={activeCanvasTabId}
+                    onSelectTab={setActiveCanvasTabId}
+                    onCloseTab={closeCanvasTab}
+                    onReloadTab={reloadCanvasTab}
+                    onToggleMode={toggleCanvasTabMode}
+                    onDraftChange={updateCanvasDraft}
+                    onSave={saveCanvasTab}
+                    onRevertAiChange={revertCanvasAiChange}
+                    onDismissAiChange={dismissCanvasAiChange}
+                  />
+                </Suspense>
               </div>
             </>
           )}
@@ -2886,11 +4953,13 @@ function App() {
             Keep it mounted after the first open so hiding the panel does
             not force a PTY restart the next time it is shown. */}
         {terminalEverOpened && (
-          <TerminalPanel
-            visible={terminalOpen}
-            cwd={currentWorkspace?.primary_root ?? null}
-            onClose={() => setTerminalOpen(false)}
-          />
+          <Suspense fallback={terminalOpen ? <LazyPanelFallback label="Loading terminal…" minHeight={160} /> : null}>
+            <TerminalPanel
+              visible={terminalOpen}
+              cwd={currentWorkspace?.primary_root ?? null}
+              onClose={() => setTerminalOpen(false)}
+            />
+          </Suspense>
         )}
       </div>
 
@@ -2948,53 +5017,59 @@ function App() {
           </button>
         </div>
         <div className="diagnostics-drawer-body">
-          <ControlCenter
-            activeCore={selectedSession?.active_core || 'None'}
-            enabledPeers={selectedSession?.enabled_peers || []}
-            activeNode={activeNodes[activeNodes.length - 1] || null}
-            isGenerating={isGenerating}
-            turns={turns}
-            sessionEvents={sessionEvents}
-            realtimeTerminalLines={realtimeTerminalLines}
-            hyardJobs={hyardJobs}
-            selectedAgentTurnId={selectedAgentTurnId}
-            setSelectedAgentTurnId={setSelectedAgentTurnId}
-            telemetryLogs={telemetryLogs}
-            activeTurnIds={activeTurnIds}
-            activeNodes={activeNodes}
-            activePeerName={activePeerName}
-            activePeerTurnId={activePeerTurnId}
-            activePeerText={activePeerText}
-            activeCoreText={activeCoreText}
-            renderTurnEvents={renderTurnEventsWithActions}
-            providerStatuses={providerStatuses}
-            providerStatusLoading={providerStatusLoading}
-            providerStatusError={providerStatusError}
-            refreshProviderStatuses={refreshProviderStatuses}
-            sessionWorkers={sessionWorkers}
-            onResetCore={handleResetCore}
-            selectedSession={selectedSession}
-            onUpdateSessionSummary={handleUpdateSessionSummary}
-            onUpdateSessionChecklist={handleUpdateSessionChecklist}
-          />
+          {drawerEverOpened && (
+            <Suspense fallback={<LazyPanelFallback label="Loading diagnostics…" />}>
+              <ControlCenter
+                activeCore={selectedSession?.active_core || 'None'}
+                enabledPeers={selectedSession?.enabled_peers || []}
+                activeNode={activeNodes[activeNodes.length - 1] || null}
+                isGenerating={isGenerating}
+                turns={turns}
+                sessionEvents={sessionEvents}
+                realtimeTerminalLines={realtimeTerminalLines}
+                hyardJobs={hyardJobs}
+                selectedAgentTurnId={selectedAgentTurnId}
+                setSelectedAgentTurnId={setSelectedAgentTurnId}
+                telemetryLogs={telemetryLogs}
+                activeTurnIds={activeTurnIds}
+                activeNodes={activeNodes}
+                activePeerName={activePeerName}
+                activePeerTurnId={activePeerTurnId}
+                activePeerText={activePeerText}
+                activeCoreText={activeCoreText}
+                renderTurnEvents={renderTurnEventsWithActions}
+                providerStatuses={providerStatuses}
+                providerStatusLoading={providerStatusLoading}
+                providerStatusError={providerStatusError}
+                refreshProviderStatuses={refreshProviderStatuses}
+                sessionWorkers={sessionWorkers}
+                onResetCore={handleResetCore}
+                selectedSession={selectedSession}
+                onUpdateSessionSummary={handleUpdateSessionSummary}
+                onUpdateSessionChecklist={handleUpdateSessionChecklist}
+              />
+            </Suspense>
+          )}
         </div>
       </div>
 
       {/* Settings Modal */}
       {showSettings && config && (
-        <SettingsModal 
-          config={config}
-          settingsTab={settingsTab}
-          setSettingsTab={setSettingsTab}
-          onClose={() => setShowSettings(false)}
-          onSave={handleSaveConfig}
-          onFieldChange={handleSettingsFieldChange}
-          onProviderFieldChange={handleProviderFieldChange}
-          onAddEnvVar={addEnvVar}
-          onRemoveEnvVar={removeEnvVar}
-          onAddCustomProvider={addCustomProvider}
-          onDeleteProvider={handleDeleteProvider}
-        />
+        <Suspense fallback={null}>
+          <SettingsModal
+            config={config}
+            settingsTab={settingsTab}
+            setSettingsTab={setSettingsTab}
+            onClose={() => setShowSettings(false)}
+            onSave={handleSaveConfig}
+            onFieldChange={handleSettingsFieldChange}
+            onProviderFieldChange={handleProviderFieldChange}
+            onAddEnvVar={addEnvVar}
+            onRemoveEnvVar={removeEnvVar}
+            onAddCustomProvider={addCustomProvider}
+            onDeleteProvider={handleDeleteProvider}
+          />
+        </Suspense>
       )}
 
       {/* The legacy ArtifactDrawer bottom bar was removed — artifacts
@@ -3005,14 +5080,18 @@ function App() {
       {/* Topology overlay — fullscreen modal launched from the
           diagnostics drawer header. Rendered above the StatusBar so
           its fixed-position backdrop layers above everything else. */}
-      <TopologyOverlay
-        open={topologyOverlayOpen}
-        onClose={() => setTopologyOverlayOpen(false)}
-        activeCore={selectedSession?.active_core || 'None'}
-        enabledPeers={selectedSession?.enabled_peers || []}
-        activeNode={activeNodes[activeNodes.length - 1] || null}
-        isGenerating={isGenerating}
-      />
+      {topologyOverlayOpen && (
+        <Suspense fallback={null}>
+          <TopologyOverlay
+            open={topologyOverlayOpen}
+            onClose={() => setTopologyOverlayOpen(false)}
+            activeCore={selectedSession?.active_core || 'None'}
+            enabledPeers={selectedSession?.enabled_peers || []}
+            activeNode={activeNodes[activeNodes.length - 1] || null}
+            isGenerating={isGenerating}
+          />
+        </Suspense>
+      )}
 
       {/* Status bar — bottom row after the icon rail. Hosts the Terminal
           toggle (VS Code idiom), worker count, workspace name + running
@@ -3020,7 +5099,7 @@ function App() {
       <StatusBar
         workspace={currentWorkspace}
         coreProvider={selectedSession?.active_core ?? null}
-        workerCount={sessionWorkers.filter((w) => w.kind === 'worker').length}
+        workerCount={displayedWorkerCount}
         isGenerating={isGenerating}
         terminalOpen={terminalOpen}
         onToggleTerminal={toggleTerminalPanel}

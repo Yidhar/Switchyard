@@ -41,6 +41,36 @@ interface ControlCenterProps {
 
 type TabType = 'topology' | 'agents' | 'checklist' | 'summary' | 'telemetry';
 
+const ACTIVE_HYARD_JOB_STATUSES = new Set(['queued', 'running', 'cancel_requested', 'wait_timeout']);
+
+function normalizeStatus(value: unknown): string {
+  const text = value === undefined || value === null ? '' : String(value).trim();
+  if (!text) return '';
+  return text
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[./\s-]+/g, '_')
+    .toLowerCase();
+}
+
+function activeHyardJobStatus(job: any): string {
+  const liveStatus = normalizeStatus(job?.job_status ?? job?.live_status);
+  if (liveStatus) return liveStatus;
+  return normalizeStatus(job?.status);
+}
+
+function countActiveHyardJobs(jobs: Record<string, any>): number {
+  const seen = new Set<string>();
+  let count = 0;
+  Object.values(jobs).forEach((job, index) => {
+    if (!ACTIVE_HYARD_JOB_STATUSES.has(activeHyardJobStatus(job))) return;
+    const key = String(job?.job_id ?? job?.id ?? `anonymous-${index}`);
+    if (seen.has(key)) return;
+    seen.add(key);
+    count += 1;
+  });
+  return count;
+}
+
 export const ControlCenter: React.FC<ControlCenterProps> = ({
   activeCore,
   enabledPeers,
@@ -152,6 +182,16 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   // Split sessionWorkers into Core vs Worker views; format uptime/state for display.
   const coreInstances = sessionWorkers.filter((w) => w.kind === 'core');
   const teamWorkers = sessionWorkers.filter((w) => w.kind === 'worker');
+  const activeWorkerTurnIds = new Set<string>();
+  turns.forEach((turn) => {
+    if (turn.role !== 'core' && (turn.status === 'pending' || turn.status === 'running')) {
+      activeWorkerTurnIds.add(turn.turn_id);
+    }
+  });
+  activeTurnIds.forEach((turnId) => activeWorkerTurnIds.add(turnId));
+  if (activePeerTurnId) activeWorkerTurnIds.add(activePeerTurnId);
+  const activeHyardWorkerCount = countActiveHyardJobs(hyardJobs);
+  const displayedTeamWorkerCount = Math.max(teamWorkers.length, activeWorkerTurnIds.size) + activeHyardWorkerCount;
 
   // Tick `now` once a second so uptime displays advance without depending on
   // the 3-second worker polling cadence. Keeps formatUptime pure relative to
@@ -447,6 +487,10 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span style={{ color: 'var(--text-muted)' }}>Active Delegate Workers</span>
+                <span>{displayedTeamWorkerCount > 0 ? `${displayedTeamWorkerCount} active` : 'None'}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--text-muted)' }}>Configured Peers</span>
                 <span>{enabledPeers.length > 0 ? enabledPeers.join(', ') : 'None configured'}</span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -646,7 +690,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div style={{ fontSize: '12px', fontWeight: 'bold', color: 'var(--text-primary)' }}>
-                      Team Workers ({teamWorkers.length})
+                      Team Workers ({displayedTeamWorkerCount})
                     </div>
                     <span
                       style={{
@@ -661,7 +705,9 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                   </div>
                   {teamWorkers.length === 0 ? (
                     <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' }}>
-                      None. The Core will spawn workers when it delegates.
+                      {displayedTeamWorkerCount > 0
+                        ? `${displayedTeamWorkerCount} delegate worker${displayedTeamWorkerCount === 1 ? '' : 's'} active; reusable process details will appear here once registered.`
+                        : 'None. The Core will spawn workers when it delegates.'}
                     </div>
                   ) : (
                     teamWorkers.map((w) => (

@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::{
@@ -252,6 +253,47 @@ impl JsonlStore {
     pub fn list_session_events(&self, session_id: Uuid) -> Result<Vec<Event>, StoreError> {
         read_jsonl(&self.session_dir(session_id).join("events.jsonl"))
     }
+
+    /// Incrementally read session events using a timestamp cursor. This avoids
+    /// deserializing and shipping a long conversation's full event log after
+    /// every runtime refresh.
+    pub fn list_session_events_since(
+        &self,
+        session_id: Uuid,
+        after_timestamp: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Event>, StoreError> {
+        if after_timestamp.is_none() && limit.is_none() {
+            return self.list_session_events(session_id);
+        }
+
+        let path = self.session_dir(session_id).join("events.jsonl");
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut events = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: Event = serde_json::from_str(&line)?;
+            if after_timestamp
+                .as_ref()
+                .is_some_and(|cursor| event.timestamp < *cursor)
+            {
+                continue;
+            }
+            events.push(event);
+            if limit.is_some_and(|max| events.len() >= max) {
+                break;
+            }
+        }
+        Ok(events)
+    }
 }
 
 impl SessionCatalog for JsonlStore {
@@ -263,6 +305,15 @@ impl SessionCatalog for JsonlStore {
 impl SessionEventRepository for JsonlStore {
     fn list_session_events(&self, session_id: Uuid) -> Result<Vec<Event>, StoreError> {
         JsonlStore::list_session_events(self, session_id)
+    }
+
+    fn list_session_events_since(
+        &self,
+        session_id: Uuid,
+        after_timestamp: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Event>, StoreError> {
+        JsonlStore::list_session_events_since(self, session_id, after_timestamp, limit)
     }
 }
 
@@ -348,7 +399,10 @@ fn append_jsonl<T: serde::Serialize>(path: &Path, item: &T) -> Result<(), StoreE
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(item)?;
     writeln!(file, "{line}")?;
-    file.sync_all()?;
+    // Avoid fsyncing every append: high-frequency event logs can otherwise
+    // spend most of their time waiting for disk. `File` is unbuffered today,
+    // but this keeps the API contract intact if buffering is added later.
+    file.flush()?;
     Ok(())
 }
 

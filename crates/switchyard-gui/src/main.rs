@@ -8,10 +8,11 @@ mod git;
 mod pty;
 
 use base64::Engine;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tauri::Emitter;
 use tauri::Manager;
 
@@ -19,7 +20,7 @@ use file_watcher::{CapturedChange, FileWatcherState};
 
 use switchyard_config::{SandboxMode, SwitchyardConfig};
 use switchyard_core::{
-    ProviderRegistry, RouterPromptInjection, build_peer_catalog_probed,
+    ProviderRegistry, RouterPromptInjection, RuntimeEvent, build_peer_catalog_probed,
     execution_policy_from_config_with_overrides,
     run_routed_turn_observable_with_policy_attachments_and_prompt_injection,
 };
@@ -36,10 +37,6 @@ use switchyard_store::{
     StoreHandle, TurnRepository, WorkspaceIndex, default_index_path, workspace_data_dir,
 };
 
-fn get_cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
 /// Tauri-managed state holding the in-memory copy of `workspaces.json`.
 /// Mutations go through the state's lock; writes back to disk happen at
 /// every command boundary so a crash doesn't lose user-level state.
@@ -52,6 +49,11 @@ struct WorkspaceState {
     /// here rather than recomputed per file-op call because every
     /// SourceControl click would otherwise spawn a `git rev-parse`.
     git_repo_root: StdMutex<GitRepoCache>,
+    /// Very short-lived `git status` cache. The Source Control panel can issue
+    /// back-to-back refreshes while the UI settles or after runtime completion;
+    /// coalescing those calls avoids spawning several `git status` processes in
+    /// the same frame without hiding real changes for longer than a heartbeat.
+    git_status_cache: StdMutex<GitStatusCache>,
 }
 
 /// One cached repo-root resolution. `workspace_id` lets us detect a
@@ -71,26 +73,675 @@ impl GitRepoCache {
     }
 }
 
+const GIT_STATUS_CACHE_TTL: Duration = Duration::from_millis(500);
+
+struct GitStatusCache {
+    workspace_id: Option<uuid::Uuid>,
+    primary_root: Option<PathBuf>,
+    captured_at: Option<Instant>,
+    status: Option<Result<git::GitStatus, String>>,
+}
+
+impl GitStatusCache {
+    fn empty() -> Self {
+        Self {
+            workspace_id: None,
+            primary_root: None,
+            captured_at: None,
+            status: None,
+        }
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn runtime_payload_debug_kind(payload: Option<&serde_json::Value>) -> String {
+    let Some(payload) = payload else {
+        return "-".to_string();
+    };
+    let item_type = payload
+        .get("item_type")
+        .or_else(|| payload.get("params").and_then(|p| p.get("item_type")))
+        .or_else(|| payload.get("item").and_then(|i| i.get("type")))
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|p| p.get("item"))
+                .and_then(|i| i.get("type"))
+        })
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    let method = payload
+        .get("method")
+        .or_else(|| payload.get("params").and_then(|p| p.get("method")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    format!("item_type={item_type} method={method}")
+}
+
+fn runtime_event_bridge_brief(event: &RuntimeEvent) -> String {
+    match event {
+        RuntimeEvent::CallbackReceiptsInjected {
+            session_id,
+            provider,
+            count,
+        } => {
+            format!("CallbackReceiptsInjected session_id={session_id} provider={provider} count={count}")
+        }
+        RuntimeEvent::TurnPreparing {
+            session_id,
+            provider,
+            phase,
+        } => format!(
+            "TurnPreparing session_id={session_id} provider={provider} phase_len={}",
+            phase.len()
+        ),
+        RuntimeEvent::CoreTurnStarted {
+            session_id,
+            turn_id,
+            provider,
+        } => {
+            format!("CoreTurnStarted session_id={session_id} turn_id={turn_id} provider={provider}")
+        }
+        RuntimeEvent::CoreExecutionTelemetry {
+            session_id,
+            turn_id,
+            provider,
+            ..
+        } => {
+            format!("CoreExecutionTelemetry session_id={session_id} turn_id={turn_id} provider={provider}")
+        }
+        RuntimeEvent::CoreItemUpdated {
+            session_id,
+            turn_id,
+            provider,
+            event_type,
+            text,
+            payload,
+        } => format!(
+            "CoreItemUpdated session_id={session_id} turn_id={turn_id} provider={provider} event_type={event_type} text_len={} payload={}",
+            text.len(),
+            runtime_payload_debug_kind(payload.as_ref())
+        ),
+        RuntimeEvent::CoreTerminalOutput {
+            session_id,
+            turn_id,
+            provider,
+            text,
+            transport,
+        } => format!(
+            "CoreTerminalOutput session_id={session_id} turn_id={turn_id} provider={provider} text_len={} transport={}",
+            text.len(),
+            transport.as_deref().unwrap_or("-")
+        ),
+        RuntimeEvent::DelegateRequested {
+            session_id,
+            core_turn_id,
+            peer,
+            role,
+            task_summary,
+        } => format!(
+            "DelegateRequested session_id={session_id} core_turn_id={core_turn_id} peer={peer} role={role} task_len={}",
+            task_summary.len()
+        ),
+        RuntimeEvent::PeerTurnStarted {
+            session_id,
+            turn_id,
+            provider,
+        } => {
+            format!("PeerTurnStarted session_id={session_id} turn_id={turn_id} provider={provider}")
+        }
+        RuntimeEvent::PeerExecutionTelemetry {
+            session_id,
+            turn_id,
+            provider,
+            ..
+        } => {
+            format!("PeerExecutionTelemetry session_id={session_id} turn_id={turn_id} provider={provider}")
+        }
+        RuntimeEvent::PeerItemUpdated {
+            session_id,
+            turn_id,
+            provider,
+            event_type,
+            text,
+            payload,
+        } => format!(
+            "PeerItemUpdated session_id={session_id} turn_id={turn_id} provider={provider} event_type={event_type} text_len={} payload={}",
+            text.len(),
+            runtime_payload_debug_kind(payload.as_ref())
+        ),
+        RuntimeEvent::PeerTerminalOutput {
+            session_id,
+            turn_id,
+            provider,
+            text,
+            transport,
+        } => format!(
+            "PeerTerminalOutput session_id={session_id} turn_id={turn_id} provider={provider} text_len={} transport={}",
+            text.len(),
+            transport.as_deref().unwrap_or("-")
+        ),
+        RuntimeEvent::DelegateCompleted {
+            session_id,
+            core_turn_id,
+            peer,
+            status,
+            summary,
+        } => format!(
+            "DelegateCompleted session_id={session_id} core_turn_id={core_turn_id} peer={peer} status={status} summary_len={}",
+            summary.as_deref().map(str::len).unwrap_or(0)
+        ),
+        RuntimeEvent::HyardJobObserved {
+            session_id,
+            turn_id,
+            source_provider,
+            job,
+            ..
+        } => format!(
+            "HyardJobObserved session_id={session_id} turn_id={turn_id} source_provider={source_provider} job_id={} status={} bridge_status={}",
+            job.job_id, job.status, job.bridge_status
+        ),
+        RuntimeEvent::CoreOutputCompleted {
+            session_id,
+            turn_id,
+            provider,
+        } => {
+            format!("CoreOutputCompleted session_id={session_id} turn_id={turn_id} provider={provider}")
+        }
+        RuntimeEvent::PeerOutputCompleted {
+            session_id,
+            turn_id,
+            provider,
+        } => {
+            format!("PeerOutputCompleted session_id={session_id} turn_id={turn_id} provider={provider}")
+        }
+        RuntimeEvent::FinalizationStarted {
+            session_id,
+            turn_id,
+            provider,
+        } => {
+            format!("FinalizationStarted session_id={session_id} turn_id={turn_id} provider={provider}")
+        }
+        RuntimeEvent::TurnCompleted {
+            session_id,
+            turn_id,
+            provider,
+            response,
+        } => format!(
+            "TurnCompleted session_id={session_id} turn_id={turn_id} provider={provider} response_len={}",
+            response.as_deref().map(str::len).unwrap_or(0)
+        ),
+        RuntimeEvent::TurnFailed {
+            session_id,
+            turn_id,
+            provider,
+            error,
+        } => format!(
+            "TurnFailed session_id={session_id} turn_id={turn_id} provider={provider} error_len={}",
+            error.len()
+        ),
+        RuntimeEvent::WorkerSpawned {
+            session_id,
+            instance_id,
+            provider,
+            label,
+            kind,
+            ..
+        } => format!(
+            "WorkerSpawned session_id={session_id} instance_id={instance_id} provider={provider} label={} kind={kind}",
+            label.as_deref().unwrap_or("-")
+        ),
+        RuntimeEvent::WorkerStateChanged {
+            session_id,
+            instance_id,
+            state,
+            in_flight_turn_id,
+        } => format!(
+            "WorkerStateChanged session_id={session_id} instance_id={instance_id} state={state} in_flight_turn_id={}",
+            in_flight_turn_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        RuntimeEvent::WorkerRetrying {
+            session_id,
+            instance_id,
+            provider,
+            label,
+            attempt,
+            last_error,
+        } => format!(
+            "WorkerRetrying session_id={session_id} instance_id={} provider={provider} label={} attempt={attempt} error_len={}",
+            instance_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            label.as_deref().unwrap_or("-"),
+            last_error.len()
+        ),
+        RuntimeEvent::WorkerTerminated {
+            session_id,
+            instance_id,
+            provider,
+            label,
+            reason,
+        } => format!(
+            "WorkerTerminated session_id={session_id} instance_id={instance_id} provider={provider} label={} reason={reason}",
+            label.as_deref().unwrap_or("-")
+        ),
+    }
+}
+
+const RUNTIME_EVENT_BATCH_MAX_EVENTS: usize = 64;
+const RUNTIME_EVENT_BATCH_FLUSH_MS: u64 = 16;
+const RUNTIME_EVENT_TERMINAL_MERGE_MAX_BYTES: usize = 96 * 1024;
+
+#[derive(Default)]
+struct RuntimeEventBatcher {
+    events: Vec<RuntimeEvent>,
+    coalesced_item_indexes: HashMap<String, usize>,
+    coalesced_hyard_indexes: HashMap<String, usize>,
+    coalesced_worker_indexes: HashMap<String, usize>,
+}
+
+impl RuntimeEventBatcher {
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    fn drain(&mut self) -> Vec<RuntimeEvent> {
+        self.coalesced_item_indexes.clear();
+        self.coalesced_hyard_indexes.clear();
+        self.coalesced_worker_indexes.clear();
+        std::mem::take(&mut self.events)
+    }
+
+    fn push(&mut self, event: RuntimeEvent) {
+        let event = match self.try_merge_terminal_output(event) {
+            Some(event) => event,
+            None => return,
+        };
+
+        if let Some(key) = runtime_worker_state_coalesce_key(&event) {
+            if let Some(index) = self.coalesced_worker_indexes.get(&key).copied()
+                && let Some(slot) = self.events.get_mut(index)
+            {
+                *slot = event;
+                return;
+            }
+            self.coalesced_worker_indexes.insert(key, self.events.len());
+            self.events.push(event);
+            return;
+        }
+
+        if let Some(key) = runtime_hyard_coalesce_key(&event) {
+            if let Some(index) = self.coalesced_hyard_indexes.get(&key).copied()
+                && let Some(slot) = self.events.get_mut(index)
+            {
+                *slot = event;
+                return;
+            }
+            self.coalesced_hyard_indexes.insert(key, self.events.len());
+            self.events.push(event);
+            return;
+        }
+
+        if let Some(key) = runtime_item_update_coalesce_key(&event) {
+            if let Some(index) = self.coalesced_item_indexes.get(&key).copied()
+                && let Some(slot) = self.events.get_mut(index)
+            {
+                *slot = event;
+                return;
+            }
+            self.coalesced_item_indexes.insert(key, self.events.len());
+            self.events.push(event);
+            return;
+        }
+
+        self.events.push(event);
+    }
+
+    fn try_merge_terminal_output(&mut self, event: RuntimeEvent) -> Option<RuntimeEvent> {
+        match event {
+            RuntimeEvent::CoreTerminalOutput {
+                session_id,
+                turn_id,
+                provider,
+                text,
+                transport,
+            } => {
+                for existing in self.events.iter_mut().rev().take(8) {
+                    if let RuntimeEvent::CoreTerminalOutput {
+                        session_id: existing_session_id,
+                        turn_id: existing_turn_id,
+                        provider: existing_provider,
+                        text: existing_text,
+                        transport: existing_transport,
+                    } = existing
+                        && *existing_session_id == session_id
+                        && *existing_turn_id == turn_id
+                        && existing_provider == &provider
+                        && existing_transport == &transport
+                        && existing_text.len().saturating_add(text.len())
+                            <= RUNTIME_EVENT_TERMINAL_MERGE_MAX_BYTES
+                    {
+                        existing_text.push_str(&text);
+                        return None;
+                    }
+                }
+                self.events.push(RuntimeEvent::CoreTerminalOutput {
+                    session_id,
+                    turn_id,
+                    provider,
+                    text,
+                    transport,
+                });
+                None
+            }
+            RuntimeEvent::PeerTerminalOutput {
+                session_id,
+                turn_id,
+                provider,
+                text,
+                transport,
+            } => {
+                for existing in self.events.iter_mut().rev().take(8) {
+                    if let RuntimeEvent::PeerTerminalOutput {
+                        session_id: existing_session_id,
+                        turn_id: existing_turn_id,
+                        provider: existing_provider,
+                        text: existing_text,
+                        transport: existing_transport,
+                    } = existing
+                        && *existing_session_id == session_id
+                        && *existing_turn_id == turn_id
+                        && existing_provider == &provider
+                        && existing_transport == &transport
+                        && existing_text.len().saturating_add(text.len())
+                            <= RUNTIME_EVENT_TERMINAL_MERGE_MAX_BYTES
+                    {
+                        existing_text.push_str(&text);
+                        return None;
+                    }
+                }
+                self.events.push(RuntimeEvent::PeerTerminalOutput {
+                    session_id,
+                    turn_id,
+                    provider,
+                    text,
+                    transport,
+                });
+                None
+            }
+            other => Some(other),
+        }
+    }
+}
+
+fn emit_runtime_event_batch(
+    app: &tauri::AppHandle,
+    batcher: &mut RuntimeEventBatcher,
+    bridge_debug: bool,
+) -> bool {
+    if batcher.is_empty() {
+        return true;
+    }
+    let events = batcher.drain();
+    if bridge_debug {
+        eprintln!(
+            "[switchyard runtime bridge] emit runtime_event_batch count={}",
+            events.len()
+        );
+    }
+    if let Err(err) = app.emit("runtime_event_batch", events) {
+        if bridge_debug {
+            eprintln!("[switchyard runtime bridge] batch_emit_error={err}");
+        }
+        return false;
+    }
+    true
+}
+
+fn runtime_worker_state_coalesce_key(event: &RuntimeEvent) -> Option<String> {
+    match event {
+        RuntimeEvent::WorkerStateChanged {
+            session_id,
+            instance_id,
+            ..
+        } => Some(format!("worker:{session_id}:{instance_id}")),
+        _ => None,
+    }
+}
+
+fn runtime_hyard_coalesce_key(event: &RuntimeEvent) -> Option<String> {
+    match event {
+        RuntimeEvent::HyardJobObserved {
+            session_id,
+            turn_id,
+            job,
+            ..
+        } => {
+            Some(format!("hyard:{session_id}:{turn_id}:{}", job.job_id))
+        }
+        _ => None,
+    }
+}
+
+fn runtime_item_update_coalesce_key(event: &RuntimeEvent) -> Option<String> {
+    let (scope, session_id, turn_id, provider, event_type, text, payload) = match event {
+        RuntimeEvent::CoreItemUpdated {
+            session_id,
+            turn_id,
+            provider,
+            event_type,
+            text,
+            payload,
+        } => (
+            "core",
+            session_id,
+            turn_id,
+            provider,
+            event_type,
+            text,
+            payload.as_ref(),
+        ),
+        RuntimeEvent::PeerItemUpdated {
+            session_id,
+            turn_id,
+            provider,
+            event_type,
+            text,
+            payload,
+        } => (
+            "peer",
+            session_id,
+            turn_id,
+            provider,
+            event_type,
+            text,
+            payload.as_ref(),
+        ),
+        _ => return None,
+    };
+
+    let normalized_event_type = event_type.to_ascii_lowercase();
+    if normalized_event_type.contains("started")
+        || normalized_event_type.contains("completed")
+        || normalized_event_type.contains("failed")
+        || normalized_event_type.contains("artifact")
+    {
+        return None;
+    }
+
+    // Provider text/reasoning events may be deltas. Dropping earlier deltas in
+    // the backend would reintroduce the "silent long task" / missing stream
+    // bug, so only coalesce non-text snapshots.
+    if !text.trim().is_empty() {
+        return None;
+    }
+
+    let payload = payload?;
+    if runtime_payload_is_latency_sensitive(payload) {
+        return None;
+    }
+
+    let item_type = runtime_payload_item_type(payload).unwrap_or_default();
+    if matches!(
+        item_type.as_str(),
+        "agent_message"
+            | "assistant"
+            | "message"
+            | "reasoning"
+            | "approval_request"
+            | "approval_decision"
+            | "server_request"
+    ) {
+        return None;
+    }
+
+    let item_id = runtime_payload_item_identity(payload)?;
+    Some(format!(
+        "{scope}:{session_id}:{turn_id}:{provider}:{normalized_event_type}:{item_type}:{item_id}"
+    ))
+}
+
+fn runtime_payload_item_type(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("item_type")
+        .or_else(|| payload.get("params").and_then(|p| p.get("item_type")))
+        .or_else(|| payload.get("item").and_then(|i| i.get("type")))
+        .or_else(|| {
+            payload
+                .get("params")
+                .and_then(|p| p.get("item"))
+                .and_then(|i| i.get("type"))
+        })
+        .or_else(|| payload.get("type"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn runtime_payload_item_identity(payload: &serde_json::Value) -> Option<String> {
+    const ID_KEYS: &[&str] = &[
+        "id",
+        "item_id",
+        "itemId",
+        "call_id",
+        "callId",
+        "tool_call_id",
+        "toolCallId",
+        "request_id",
+        "requestId",
+        "process_id",
+        "processId",
+        "task_uuid",
+        "taskUuid",
+    ];
+
+    fn value_to_identity(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(text) if !text.trim().is_empty() => {
+                Some(text.trim().to_string())
+            }
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            serde_json::Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    for key in ID_KEYS {
+        if let Some(identity) = payload.get(*key).and_then(value_to_identity) {
+            return Some(identity);
+        }
+    }
+
+    for key in ["item", "params", "delta", "function", "tool"] {
+        if let Some(identity) = payload.get(key).and_then(runtime_payload_item_identity) {
+            return Some(identity);
+        }
+    }
+
+    None
+}
+
+fn runtime_payload_is_latency_sensitive(payload: &serde_json::Value) -> bool {
+    let item_type = runtime_payload_item_type(payload).unwrap_or_default();
+    if matches!(
+        item_type.as_str(),
+        "approval_request" | "approval_decision" | "server_request"
+    ) {
+        return true;
+    }
+
+    let method = payload
+        .get("method")
+        .or_else(|| payload.get("params").and_then(|p| p.get("method")))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    method.contains("approval")
+        || method.contains("permission")
+        || method.contains("sandbox")
+        || method.contains("confirm")
+}
+
+fn runtime_event_should_flush_immediately(event: &RuntimeEvent) -> bool {
+    match event {
+        RuntimeEvent::CoreItemUpdated { payload, .. }
+        | RuntimeEvent::PeerItemUpdated { payload, .. } => payload
+            .as_ref()
+            .is_some_and(runtime_payload_is_latency_sensitive),
+        RuntimeEvent::TurnFailed { .. }
+        | RuntimeEvent::TurnCompleted { .. }
+        | RuntimeEvent::CoreTurnStarted { .. }
+        | RuntimeEvent::PeerTurnStarted { .. }
+        | RuntimeEvent::FinalizationStarted { .. }
+        | RuntimeEvent::WorkerRetrying { .. }
+        | RuntimeEvent::WorkerTerminated { .. } => true,
+        _ => false,
+    }
+}
+
 impl WorkspaceState {
-    /// Load the index on app startup, creating a "Default" workspace
-    /// rooted at the process cwd if the index is empty. The same path
-    /// the old `get_cwd()`-based commands assumed.
-    fn load_or_bootstrap() -> Result<Self, String> {
+    /// Load the persisted workspace index. An empty index is valid:
+    /// the GUI starts on a VS Code-like welcome screen until the user
+    /// explicitly opens a folder/workspace.
+    fn load() -> Result<Self, String> {
         let index_path = default_index_path();
         let mut index = WorkspaceIndex::load(&index_path)
             .map_err(|e| format!("failed to load workspace index: {e}"))?;
-        if index.workspaces.is_empty() {
-            let mut default_ws = Workspace::new(get_cwd());
-            default_ws.name = "Default".to_string();
-            index.insert(default_ws);
+        // Do not restore the last/default workspace on GUI startup.
+        //
+        // `WorkspaceIndex.current` is still useful while the process is
+        // running: Open Folder / Switch Workspace marks the chosen
+        // workspace current so all commands in this window have a scope.
+        // But persisting that pointer across launches made the app reopen
+        // into a "Default" / previous workspace immediately after a restart.
+        // For the VS Code-like no-folder startup flow, keep the recent
+        // workspace list intact and only clear the startup selection.
+        if clear_startup_workspace_selection(&mut index) {
             index
                 .save(&index_path)
-                .map_err(|e| format!("failed to seed default workspace: {e}"))?;
+                .map_err(|e| format!("failed to clear startup workspace pointer: {e}"))?;
         }
         Ok(Self {
             index: StdMutex::new(index),
             index_path,
             git_repo_root: StdMutex::new(GitRepoCache::empty()),
+            git_status_cache: StdMutex::new(GitStatusCache::empty()),
         })
     }
 
@@ -115,11 +766,45 @@ impl WorkspaceState {
         if let Ok(mut cache) = self.git_repo_root.lock() {
             *cache = GitRepoCache::empty();
         }
+        self.invalidate_git_status_cache();
     }
 
-    /// Read-side helper that copies out the current workspace; returns
-    /// `Err` when no workspaces exist (impossible after `load_or_bootstrap`
-    /// but kept defensive for tests).
+    fn invalidate_git_status_cache(&self) {
+        if let Ok(mut cache) = self.git_status_cache.lock() {
+            *cache = GitStatusCache::empty();
+        }
+    }
+
+    fn git_status_cached(&self) -> Result<git::GitStatus, String> {
+        let current = self.current()?;
+        let now = Instant::now();
+        if let Ok(cache) = self.git_status_cache.lock()
+            && cache.workspace_id == Some(current.workspace_id)
+            && cache.primary_root.as_deref() == Some(current.primary_root.as_path())
+            && cache
+                .captured_at
+                .map(|captured| now.duration_since(captured) <= GIT_STATUS_CACHE_TTL)
+                .unwrap_or(false)
+            && let Some(status) = &cache.status
+        {
+            return status.clone();
+        }
+
+        let status = git::status(&current.primary_root);
+        if let Ok(mut cache) = self.git_status_cache.lock() {
+            *cache = GitStatusCache {
+                workspace_id: Some(current.workspace_id),
+                primary_root: Some(current.primary_root.clone()),
+                captured_at: Some(now),
+                status: Some(status.clone()),
+            };
+        }
+        status
+    }
+
+    /// Read-side helper that copies out the current workspace. `Err` is
+    /// normal when no workspace is selected; workspace-scoped commands
+    /// surface that state to the UI instead of inventing a fallback cwd.
     fn current(&self) -> Result<Workspace, String> {
         let guard = self.index.lock().map_err(|_| "workspace state poisoned")?;
         guard
@@ -140,6 +825,14 @@ impl WorkspaceState {
             .map_err(|e| format!("failed to persist workspace index: {e}"))?;
         Ok(out)
     }
+}
+
+fn clear_startup_workspace_selection(index: &mut WorkspaceIndex) -> bool {
+    if index.current.is_none() {
+        return false;
+    }
+    index.current = None;
+    true
 }
 
 /// Open the canonical store for a given workspace. The store path is
@@ -325,8 +1018,25 @@ fn set_current_workspace(
 }
 
 #[tauri::command]
+fn clear_current_workspace(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    file_watcher: tauri::State<'_, FileWatcherState>,
+) -> Result<(), String> {
+    workspace_state.mutate(|idx| {
+        idx.current = None;
+        Ok(())
+    })?;
+    workspace_state.invalidate_git_cache();
+    if let Err(e) = file_watcher.clear_workspace() {
+        eprintln!("[file_watcher] clear_workspace failed: {e}");
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn create_workspace(
     workspace_state: tauri::State<'_, WorkspaceState>,
+    file_watcher: tauri::State<'_, FileWatcherState>,
     primary_root: String,
     name: Option<String>,
 ) -> Result<Workspace, String> {
@@ -334,7 +1044,7 @@ fn create_workspace(
     if !root.is_dir() {
         return Err(format!("primary_root is not a directory: {}", primary_root));
     }
-    workspace_state.mutate(|idx| {
+    let created = workspace_state.mutate(|idx| {
         let mut ws = Workspace::new(root);
         if let Some(n) = name {
             ws.name = n;
@@ -344,7 +1054,12 @@ fn create_workspace(
             .get(id)
             .cloned()
             .expect("just-inserted workspace must exist"))
-    })
+    })?;
+    workspace_state.invalidate_git_cache();
+    if let Err(e) = file_watcher.watch_workspace(&created) {
+        eprintln!("[file_watcher] watch_workspace on create failed: {e}");
+    }
+    Ok(created)
 }
 
 #[tauri::command]
@@ -945,6 +1660,7 @@ async fn write_file(
     tokio::fs::write(&resolved, content.as_bytes())
         .await
         .map_err(|e| format!("write {}: {e}", resolved.display()))?;
+    workspace_state.invalidate_git_status_cache();
     let size = content.len() as u64;
     let rel = resolved
         .strip_prefix(&ws.primary_root)
@@ -1031,8 +1747,7 @@ fn git_is_repo(workspace_state: tauri::State<'_, WorkspaceState>) -> Result<bool
 
 #[tauri::command]
 fn git_status(workspace_state: tauri::State<'_, WorkspaceState>) -> Result<git::GitStatus, String> {
-    let ws = workspace_state.current()?;
-    git::status(&ws.primary_root)
+    workspace_state.git_status_cached()
 }
 
 #[tauri::command]
@@ -1051,7 +1766,11 @@ fn git_stage(
     path: String,
 ) -> Result<(), String> {
     let ws = workspace_state.current()?;
-    git::stage(&ws.primary_root, &path)
+    let result = git::stage(&ws.primary_root, &path);
+    if result.is_ok() {
+        workspace_state.invalidate_git_status_cache();
+    }
+    result
 }
 
 #[tauri::command]
@@ -1060,7 +1779,11 @@ fn git_unstage(
     path: String,
 ) -> Result<(), String> {
     let ws = workspace_state.current()?;
-    git::unstage(&ws.primary_root, &path)
+    let result = git::unstage(&ws.primary_root, &path);
+    if result.is_ok() {
+        workspace_state.invalidate_git_status_cache();
+    }
+    result
 }
 
 #[tauri::command]
@@ -1069,7 +1792,11 @@ fn git_discard(
     path: String,
 ) -> Result<(), String> {
     let ws = workspace_state.current()?;
-    git::discard(&ws.primary_root, &path)
+    let result = git::discard(&ws.primary_root, &path);
+    if result.is_ok() {
+        workspace_state.invalidate_git_status_cache();
+    }
+    result
 }
 
 #[tauri::command]
@@ -1078,13 +1805,21 @@ fn git_commit(
     message: String,
 ) -> Result<String, String> {
     let ws = workspace_state.current()?;
-    git::commit(&ws.primary_root, &message)
+    let result = git::commit(&ws.primary_root, &message);
+    if result.is_ok() {
+        workspace_state.invalidate_git_status_cache();
+    }
+    result
 }
 
 #[tauri::command]
 fn git_init(workspace_state: tauri::State<'_, WorkspaceState>) -> Result<(), String> {
     let ws = workspace_state.current()?;
-    git::init(&ws.primary_root)
+    let result = git::init(&ws.primary_root);
+    if result.is_ok() {
+        workspace_state.invalidate_git_cache();
+    }
+    result
 }
 
 /// Auto-derive a session name from the user's first message. The output
@@ -1378,12 +2113,14 @@ fn default_role_names(name: &str) -> Vec<String> {
 async fn list_provider_status(
     workspace_state: tauri::State<'_, WorkspaceState>,
 ) -> Result<Vec<ProviderStatus>, String> {
-    // Probe resolution honours the current workspace's `primary_root` so
-    // provider configs colocated with the project (`./switchyard.toml`)
-    // are picked up correctly.
-    let ws = workspace_state.current()?;
-    let cwd = ws.primary_root.clone();
-    let config = SwitchyardConfig::resolve(&cwd).unwrap_or_default();
+    // Probe resolution honours the current workspace's `primary_root` when
+    // a workspace is open, so project-local `./switchyard.toml` is picked up.
+    // With no workspace selected (normal first-run state), use built-in
+    // defaults instead of forcing a cwd-backed "Default" workspace/config.
+    let config = workspace_state
+        .current()
+        .map(|ws| SwitchyardConfig::resolve(&ws.primary_root).unwrap_or_default())
+        .unwrap_or_default();
     let registry = build_registry(&config);
     let checked_at = chrono::Utc::now().to_rfc3339();
 
@@ -1486,10 +2223,13 @@ async fn list_provider_status(
 async fn load_config(
     workspace_state: tauri::State<'_, WorkspaceState>,
 ) -> Result<SwitchyardConfig, String> {
-    let cwd = workspace_state
-        .current()
-        .map(|ws| ws.primary_root)
-        .unwrap_or_else(|_| get_cwd());
+    let Ok(ws) = workspace_state.current() else {
+        // No workspace selected is now a first-class state. Return an
+        // in-memory default config and, importantly, do not create
+        // switchyard.toml in the GUI process cwd.
+        return Ok(SwitchyardConfig::default());
+    };
+    let cwd = ws.primary_root;
     let config = SwitchyardConfig::resolve(&cwd).unwrap_or_default();
 
     let config_path = cwd.join("switchyard.toml");
@@ -1565,10 +2305,7 @@ async fn save_config(
     workspace_state: tauri::State<'_, WorkspaceState>,
     config: SwitchyardConfig,
 ) -> Result<(), String> {
-    let cwd = workspace_state
-        .current()
-        .map(|ws| ws.primary_root)
-        .unwrap_or_else(|_| get_cwd());
+    let cwd = workspace_state.current()?.primary_root;
     let config_path = cwd.join("switchyard.toml");
     config
         .write_to(&config_path)
@@ -1632,12 +2369,27 @@ async fn get_session_turns(
 async fn get_session_events(
     workspace_state: tauri::State<'_, WorkspaceState>,
     session_id: String,
+    after_timestamp: Option<String>,
+    limit: Option<usize>,
 ) -> Result<Vec<Event>, String> {
     let (_ws, store, _data_dir, _config) = open_current_store(&workspace_state)?;
     let session_uuid =
         uuid::Uuid::parse_str(&session_id).map_err(|e| format!("invalid session ID: {}", e))?;
+    let after_timestamp = after_timestamp
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+                .map_err(|e| format!("invalid afterTimestamp: {e}"))
+        })
+        .transpose()?;
+    let limit = limit
+        .filter(|value| *value > 0)
+        .map(|value| value.min(10_000));
     let events = store
-        .list_session_events(session_uuid)
+        .list_session_events_since(session_uuid, after_timestamp, limit)
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|event| !switchyard_provider_api::is_empty_reasoning_payload(&event.payload))
@@ -1731,6 +2483,28 @@ fn image_mime_type(extension: &str) -> Option<&'static str> {
     }
 }
 
+fn image_mime_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+        return Some("image/png");
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return Some("image/tiff");
+    }
+    None
+}
+
 fn generic_mime_type(extension: &str) -> Option<&'static str> {
     match extension {
         "txt" | "text" | "log" => Some("text/plain"),
@@ -1756,6 +2530,7 @@ fn generic_mime_type(extension: &str) -> Option<&'static str> {
 }
 
 const MAX_CLIPBOARD_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENT_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
 fn extension_for_mime_type(mime_type: &str) -> Option<&'static str> {
     match mime_type
@@ -1777,6 +2552,36 @@ fn extension_for_mime_type(mime_type: &str) -> Option<&'static str> {
         "application/pdf" => Some("pdf"),
         _ => None,
     }
+}
+
+fn supported_image_mime_hint(mime_type: Option<String>) -> Option<String> {
+    let mime = mime_type?
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|mime| !mime.is_empty())?
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/bmp" | "image/tiff" => {
+            Some(mime)
+        }
+        _ => None,
+    }
+}
+
+fn cleaned_attachment_mime_hint(mime_type: Option<String>) -> Option<String> {
+    mime_type
+        .and_then(|mime| {
+            mime.split(';')
+                .next()
+                .map(str::trim)
+                .filter(|mime| !mime.is_empty())
+                .map(str::to_string)
+        })
+        .filter(|mime| {
+            let lower = mime.to_ascii_lowercase();
+            lower != "application/octet-stream" && lower != "binary/octet-stream"
+        })
 }
 
 fn sanitize_attachment_filename(name_hint: Option<String>, mime_type: Option<&str>) -> String {
@@ -1818,6 +2623,20 @@ fn sanitize_attachment_filename(name_hint: Option<String>, mime_type: Option<&st
         cleaned.push_str(ext);
     }
     cleaned
+}
+
+fn resolve_attachment_preview_path(ws: &Workspace, raw: &str) -> Result<PathBuf, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("image attachment path is empty".to_string());
+    }
+    let candidate = PathBuf::from(raw);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        ws.primary_root.join(candidate)
+    };
+    Ok(lexical_normalize(&absolute))
 }
 
 fn decode_clipboard_data_url(
@@ -1868,16 +2687,21 @@ fn decode_clipboard_data_url(
     Ok((bytes, mime_type))
 }
 
-#[tauri::command]
-fn save_clipboard_attachment(
-    workspace_state: tauri::State<'_, WorkspaceState>,
+fn write_clipboard_attachment_bytes(
+    ws: &Workspace,
     name_hint: Option<String>,
-    mime_type: Option<String>,
-    data_url: String,
+    mime_type: Option<&str>,
+    bytes: &[u8],
 ) -> Result<String, String> {
-    let ws = workspace_state.current()?;
-    let (bytes, effective_mime_type) = decode_clipboard_data_url(&data_url, mime_type)?;
-    let filename = sanitize_attachment_filename(name_hint, effective_mime_type.as_deref());
+    if bytes.len() > MAX_CLIPBOARD_ATTACHMENT_BYTES {
+        return Err(format!(
+            "clipboard attachment is too large ({} bytes, max {} bytes)",
+            bytes.len(),
+            MAX_CLIPBOARD_ATTACHMENT_BYTES
+        ));
+    }
+
+    let filename = sanitize_attachment_filename(name_hint, mime_type);
     let attachment_dir = workspace_data_dir(ws.workspace_id).join("clipboard_attachments");
     std::fs::create_dir_all(&attachment_dir)
         .map_err(|e| format!("create clipboard attachment dir: {e}"))?;
@@ -1897,7 +2721,7 @@ fn save_clipboard_attachment(
         {
             Ok(mut file) => {
                 use std::io::Write;
-                file.write_all(&bytes)
+                file.write_all(bytes)
                     .map_err(|e| format!("write clipboard attachment: {e}"))?;
                 return Ok(path.to_string_lossy().to_string());
             }
@@ -1907,6 +2731,133 @@ fn save_clipboard_attachment(
     }
 
     Err("failed to allocate a unique clipboard attachment filename".to_string())
+}
+
+#[tauri::command]
+fn save_clipboard_attachment(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    name_hint: Option<String>,
+    mime_type: Option<String>,
+    data_url: String,
+) -> Result<String, String> {
+    let ws = workspace_state.current()?;
+    let (bytes, effective_mime_type) = decode_clipboard_data_url(&data_url, mime_type)?;
+    let effective_mime_type = cleaned_attachment_mime_hint(effective_mime_type)
+        .or_else(|| image_mime_type_from_bytes(bytes.as_slice()).map(str::to_string));
+    write_clipboard_attachment_bytes(
+        &ws,
+        name_hint,
+        effective_mime_type.as_deref(),
+        bytes.as_slice(),
+    )
+}
+
+#[tauri::command]
+fn persist_attachment_file(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    path: String,
+    mime_type: Option<String>,
+) -> Result<String, String> {
+    let ws = workspace_state.current()?;
+    let resolved = resolve_attachment_preview_path(&ws, &path)?;
+    let metadata = std::fs::metadata(&resolved)
+        .map_err(|e| format!("stat attachment {}: {e}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("attachment is not a file: {}", resolved.display()));
+    }
+    if metadata.len() > MAX_CLIPBOARD_ATTACHMENT_BYTES as u64 {
+        return Err(format!(
+            "attachment is too large to persist ({} bytes, max {} bytes)",
+            metadata.len(),
+            MAX_CLIPBOARD_ATTACHMENT_BYTES
+        ));
+    }
+
+    let attachment_dir = workspace_data_dir(ws.workspace_id).join("clipboard_attachments");
+    let normalized_attachment_dir = lexical_normalize(&attachment_dir);
+    if lexical_normalize(&resolved).starts_with(&normalized_attachment_dir) {
+        return Ok(resolved.to_string_lossy().to_string());
+    }
+
+    let extension = resolved
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let inferred_mime = image_mime_type(&extension)
+        .or_else(|| generic_mime_type(&extension))
+        .map(str::to_string);
+    let name_hint = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    let bytes = std::fs::read(&resolved)
+        .map_err(|e| format!("read attachment {}: {e}", resolved.display()))?;
+    let effective_mime_type = cleaned_attachment_mime_hint(mime_type)
+        .or(inferred_mime)
+        .or_else(|| image_mime_type_from_bytes(bytes.as_slice()).map(str::to_string));
+
+    write_clipboard_attachment_bytes(
+        &ws,
+        name_hint,
+        effective_mime_type.as_deref(),
+        bytes.as_slice(),
+    )
+}
+
+#[tauri::command]
+async fn read_image_attachment_data_url(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    path: String,
+    mime_type: Option<String>,
+) -> Result<String, String> {
+    let ws = workspace_state.current()?;
+    let resolved = resolve_attachment_preview_path(&ws, &path)?;
+    let metadata = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|e| format!("stat image attachment {}: {e}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "image attachment is not a file: {}",
+            resolved.display()
+        ));
+    }
+    if metadata.len() > MAX_IMAGE_ATTACHMENT_PREVIEW_BYTES {
+        return Err(format!(
+            "image attachment is too large to preview inline ({} bytes, max {} bytes)",
+            metadata.len(),
+            MAX_IMAGE_ATTACHMENT_PREVIEW_BYTES
+        ));
+    }
+
+    let extension = resolved
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(|e| format!("read image attachment {}: {e}", resolved.display()))?;
+    let mime_type = image_mime_type(&extension)
+        .map(str::to_string)
+        .or_else(|| supported_image_mime_hint(mime_type))
+        .or_else(|| image_mime_type_from_bytes(bytes.as_slice()).map(str::to_string))
+        .ok_or_else(|| {
+            if extension.is_empty() {
+                format!(
+                    "image attachment has no supported extension: {}",
+                    resolved.display()
+                )
+            } else {
+                format!(
+                    "unsupported image extension '.{}' for {}",
+                    extension,
+                    resolved.display()
+                )
+            }
+        })?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime_type};base64,{encoded}"))
 }
 
 #[tauri::command]
@@ -2086,11 +3037,43 @@ async fn run_turn(
     // renderer stalls without making text/tool/HYARD updates appear to vanish.
     let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
     let app_clone = app.clone();
+    let bridge_debug = env_flag_enabled("SWITCHYARD_DEBUG_RUNTIME_BRIDGE");
 
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let _ = app_clone.emit("runtime_event", event);
+        let mut batcher = RuntimeEventBatcher::default();
+        let mut flush_interval =
+            tokio::time::interval(Duration::from_millis(RUNTIME_EVENT_BATCH_FLUSH_MS));
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    if bridge_debug {
+                        eprintln!(
+                            "[switchyard runtime bridge] queue {}",
+                            runtime_event_bridge_brief(&event)
+                        );
+                    }
+                    let should_flush = runtime_event_should_flush_immediately(&event);
+                    batcher.push(event);
+                    if (should_flush || batcher.len() >= RUNTIME_EVENT_BATCH_MAX_EVENTS)
+                        && !emit_runtime_event_batch(&app_clone, &mut batcher, bridge_debug)
+                    {
+                        break;
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    if !emit_runtime_event_batch(&app_clone, &mut batcher, bridge_debug) {
+                        break;
+                    }
+                }
+            }
         }
+
+        let _ = emit_runtime_event_batch(&app_clone, &mut batcher, bridge_debug);
     });
 
     let cancel = CancellationToken::new();
@@ -2107,7 +3090,12 @@ async fn run_turn(
     // user model — one workspace, one turn at a time.
     file_watcher.start_turn();
 
-    let policy = execution_policy_from_config_with_overrides(&config, &cwd, sandbox_mode, &[]);
+    let mut policy = execution_policy_from_config_with_overrides(&config, &cwd, sandbox_mode, &[]);
+    if policy.timeout_secs == 0 {
+        if let Some(provider_config) = config.providers.get(&provider) {
+            policy.timeout_secs = provider_config.timeout_secs;
+        }
+    }
     let output = run_routed_turn_observable_with_policy_attachments_and_prompt_injection(
         &mut store,
         &mut session,
@@ -2142,6 +3130,10 @@ async fn run_turn(
             persist_captured_changes(&mut store, turn_id, &provider, &captured);
         }
     }
+    // The turn may have changed files via subprocess/tooling rather than
+    // `write_file`, so do not let a pre-turn Source Control snapshot survive
+    // into the completion refresh.
+    workspace_state.invalidate_git_status_cache();
 
     match output {
         Ok(out) => Ok(out.response.unwrap_or_default()),
@@ -2899,15 +3891,54 @@ async fn update_session_checklist(
     Ok(())
 }
 
+#[tauri::command]
+fn app_window_minimize(window: tauri::Window) -> Result<(), String> {
+    window.minimize().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn app_window_maximize(window: tauri::Window) -> Result<(), String> {
+    window.maximize().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn app_window_unmaximize(window: tauri::Window) -> Result<(), String> {
+    window.unmaximize().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn app_window_is_maximized(window: tauri::Window) -> Result<bool, String> {
+    window.is_maximized().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn app_window_close(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn app_window_new(app: tauri::AppHandle) -> Result<String, String> {
+    let label = format!("main-{}", uuid::Uuid::now_v7());
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
+        .title("Switchyard")
+        .inner_size(1100.0, 750.0)
+        .resizable(true)
+        .fullscreen(false)
+        .decorations(false)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    Ok(label)
+}
+
 fn main() {
-    let workspace_state =
-        WorkspaceState::load_or_bootstrap().expect("failed to initialise workspace state");
+    let workspace_state = WorkspaceState::load().expect("failed to initialise workspace state");
 
     // Stand up the workspace file watcher before the Tauri runtime
     // starts so the eager-scan thread can begin populating the
-    // baseline while the GUI window mounts. If no workspace exists
-    // yet (shouldn't happen after bootstrap), the watcher just sits
-    // idle until set_current_workspace fires.
+    // baseline while the GUI window mounts. If no workspace is selected
+    // yet, the watcher stays idle until set_current_workspace/create_workspace
+    // points it at real roots.
     let file_watcher = FileWatcherState::new();
     if let Ok(ws) = workspace_state.current() {
         if let Err(e) = file_watcher.watch_workspace(&ws) {
@@ -2933,6 +3964,8 @@ fn main() {
             get_session_turns,
             get_session_events,
             save_clipboard_attachment,
+            persist_attachment_file,
+            read_image_attachment_data_url,
             run_turn,
             cancel_turn,
             resolve_tool_approval,
@@ -2950,11 +3983,22 @@ fn main() {
             rename_session,
             update_session_summary,
             update_session_checklist,
+            // Window controls used by the custom VS Code-like title bar.
+            // The frontend still tries the official Tauri window API first,
+            // but these local commands provide a fallback if ACL/capability
+            // reload ordering makes the plugin command unavailable.
+            app_window_minimize,
+            app_window_maximize,
+            app_window_unmaximize,
+            app_window_is_maximized,
+            app_window_close,
+            app_window_new,
             // Workspace CRUD
             list_workspaces,
             get_current_workspace,
             open_external_terminal,
             set_current_workspace,
+            clear_current_workspace,
             create_workspace,
             update_workspace,
             delete_workspace,
@@ -3021,6 +4065,21 @@ mod tests {
         assert_eq!(derive_session_name(""), "");
         assert_eq!(derive_session_name("   \n\n  "), "");
         assert_eq!(derive_session_name("###"), "");
+    }
+
+    #[test]
+    fn startup_workspace_selection_is_cleared_without_deleting_recents() {
+        let mut idx = WorkspaceIndex::default();
+        let first_id = idx.insert(Workspace::new(PathBuf::from("/project/first")));
+        let second_id = idx.insert(Workspace::new(PathBuf::from("/project/second")));
+
+        assert_eq!(idx.current, Some(second_id));
+        assert!(clear_startup_workspace_selection(&mut idx));
+        assert!(idx.current.is_none());
+        assert_eq!(idx.workspaces.len(), 2);
+        assert!(idx.get(first_id).is_some());
+        assert!(idx.get(second_id).is_some());
+        assert!(!clear_startup_workspace_selection(&mut idx));
     }
 
     #[test]

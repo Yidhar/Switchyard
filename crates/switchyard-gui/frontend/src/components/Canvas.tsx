@@ -1,8 +1,14 @@
-import React, { useEffect, useMemo } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   X,
   Copy,
-  Maximize2,
+  ChevronRight,
   FileText,
   AlertCircle,
   RefreshCw,
@@ -14,8 +20,9 @@ import {
 } from 'lucide-react';
 import CodeMirror from '@uiw/react-codemirror';
 import { oneDark } from '@codemirror/theme-one-dark';
+import type { Extension } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
-import { languageExtensionFor } from './codeMirrorLanguages';
+import { loadLanguageExtensionsFor } from './codeMirrorLanguages';
 
 /// Snapshot returned by the `read_file` Tauri command. Mirrors the
 /// Rust `FileSnapshot` struct in switchyard-gui/src/main.rs.
@@ -97,6 +104,10 @@ export const Canvas: React.FC<CanvasProps> = ({
   if (tabs.length === 0) return null;
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+  const breadcrumbSegments = useMemo(
+    () => canvasBreadcrumbSegments(activeTab.path),
+    [activeTab.path],
+  );
 
   // Ctrl/Cmd+S → save the active tab when it's dirty + not already
   // saving. Bound at the Canvas level so the shortcut works as long as
@@ -224,140 +235,127 @@ export const Canvas: React.FC<CanvasProps> = ({
         })}
       </div>
 
-      {/* File header: full path + actions. Mode toggle only appears
-          when an AI change is captured — otherwise the editor is the
-          only sensible view and the toggle is just noise. Fixed 32px
-          height so [tabs + this] = 64px and aligns with .chat-header. */}
-      <div
-        className="canvas-file-header"
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          padding: '0 14px',
-          height: 32,
-          borderBottom: '1px solid var(--border-muted)',
-          fontSize: 12,
-          color: 'var(--text-secondary)',
-          flexShrink: 0,
-          boxSizing: 'border-box',
-        }}
-      >
-        <FileText size={14} color="var(--text-muted)" />
-        <span
-          style={{
-            flex: 1,
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            direction: 'rtl',
-            textAlign: 'left',
-          }}
-          title={activeTab.path}
-        >
-          {activeTab.path}
-        </span>
+      {/* Breadcrumb/action bar — fixed 32px. VS Code keeps the file name
+          in the tab and uses this row for path context + editor actions,
+          so we avoid showing a second large duplicate file title. */}
+      <div className="canvas-breadcrumb-bar">
+        <div className="canvas-breadcrumbs" title={activeTab.path}>
+          {breadcrumbSegments.length > 1 ? (
+            breadcrumbSegments.map((segment, index) => (
+              <React.Fragment key={`${segment}-${index}`}>
+                {index > 0 && (
+                  <ChevronRight
+                    size={13}
+                    className="canvas-breadcrumb-separator"
+                    aria-hidden
+                  />
+                )}
+                <span
+                  className={`canvas-breadcrumb-segment ${
+                    index === breadcrumbSegments.length - 1 ? 'is-current' : ''
+                  }`}
+                >
+                  {segment}
+                </span>
+              </React.Fragment>
+            ))
+          ) : (
+            <span className="canvas-breadcrumb-placeholder">./</span>
+          )}
+        </div>
 
-        {/* Save lives next to the path so it's always reachable. The
-            keyboard shortcut Ctrl/Cmd+S is the primary path. */}
-        <button
-          type="button"
-          onClick={() => onSave(activeTab.id)}
-          disabled={
-            !activeTab.dirty || activeTab.saving || !activeTab.snapshot
-          }
-          title="Save (Ctrl/⌘+S)"
-          style={{
-            ...iconBtnStyle,
-            color: activeTab.dirty
-              ? 'var(--color-primary)'
-              : 'var(--text-muted)',
-            opacity: activeTab.dirty && !activeTab.saving ? 1 : 0.4,
-            cursor:
-              activeTab.dirty && !activeTab.saving
-                ? 'pointer'
-                : 'not-allowed',
-          }}
-        >
-          <Save size={13} className={activeTab.saving ? 'spin' : ''} />
-        </button>
+        <div className="canvas-editor-actions">
+          {/* Save lives in the editor action cluster so it's always reachable.
+              The keyboard shortcut Ctrl/Cmd+S is still the primary path. */}
+          <button
+            type="button"
+            onClick={() => onSave(activeTab.id)}
+            disabled={
+              !activeTab.dirty || activeTab.saving || !activeTab.snapshot
+            }
+            title="Save (Ctrl/⌘+S)"
+            style={{
+              ...iconBtnStyle,
+              color: activeTab.dirty
+                ? 'var(--color-primary)'
+                : 'var(--text-muted)',
+              opacity: activeTab.dirty && !activeTab.saving ? 1 : 0.4,
+              cursor:
+                activeTab.dirty && !activeTab.saving
+                  ? 'pointer'
+                  : 'not-allowed',
+            }}
+          >
+            <Save size={13} className={activeTab.saving ? 'spin' : ''} />
+          </button>
 
-        {/* Diff toggle — appears only when an AI change is captured.
-            Edit is the other half of the toggle; without a capture
-            there's nothing to compare against. */}
-        {activeTab.ai_before_content !== null && (
-          <>
-            <ModeButton
-              active={activeTab.mode === 'edit'}
-              onClick={() => onToggleMode(activeTab.id, 'edit')}
-              title="Editor"
-            >
-              <Code2 size={13} />
-            </ModeButton>
-            <ModeButton
-              active={activeTab.mode === 'diff'}
-              onClick={() => onToggleMode(activeTab.id, 'diff')}
-              title="Unified diff of the AI's last modification to this file"
-            >
-              <GitCompare size={13} />
-            </ModeButton>
-            <button
-              type="button"
-              onClick={() => onRevertAiChange(activeTab.id)}
-              disabled={activeTab.saving}
-              title="Revert this file to its content before the AI's last edit"
-              style={{
-                ...iconBtnStyle,
-                color: 'var(--color-error, #ef4444)',
-                opacity: activeTab.saving ? 0.5 : 1,
-              }}
-            >
-              <Trash2 size={13} />
-            </button>
-            <button
-              type="button"
-              onClick={() => onDismissAiChange(activeTab.id)}
-              title="Dismiss the diff (keep AI's change; just hide the comparison)"
-              style={{
-                ...iconBtnStyle,
-                color: 'var(--text-muted)',
-              }}
-            >
-              <CheckIcon size={13} />
-            </button>
-          </>
-        )}
+          {/* Diff toggle — appears only when an AI change is captured.
+              Edit is the other half of the toggle; without a capture
+              there's nothing to compare against. */}
+          {activeTab.ai_before_content !== null && (
+            <>
+              <ModeButton
+                active={activeTab.mode === 'edit'}
+                onClick={() => onToggleMode(activeTab.id, 'edit')}
+                title="Editor"
+              >
+                <Code2 size={13} />
+              </ModeButton>
+              <ModeButton
+                active={activeTab.mode === 'diff'}
+                onClick={() => onToggleMode(activeTab.id, 'diff')}
+                title="Unified diff of the AI's last modification to this file"
+              >
+                <GitCompare size={13} />
+              </ModeButton>
+              <button
+                type="button"
+                onClick={() => onRevertAiChange(activeTab.id)}
+                disabled={activeTab.saving}
+                title="Revert this file to its content before the AI's last edit"
+                style={{
+                  ...iconBtnStyle,
+                  color: 'var(--color-error, #ef4444)',
+                  opacity: activeTab.saving ? 0.5 : 1,
+                }}
+              >
+                <Trash2 size={13} />
+              </button>
+              <button
+                type="button"
+                onClick={() => onDismissAiChange(activeTab.id)}
+                title="Dismiss the diff (keep AI's change; just hide the comparison)"
+                style={{
+                  ...iconBtnStyle,
+                  color: 'var(--text-muted)',
+                }}
+              >
+                <CheckIcon size={13} />
+              </button>
+            </>
+          )}
 
-        <button
-          type="button"
-          onClick={() => onReloadTab(activeTab.id)}
-          title="Reload from disk"
-          style={iconBtnStyle}
-        >
-          <RefreshCw size={13} className={activeTab.reloading ? 'spin' : ''} />
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            const text =
-              activeTab.draft ?? activeTab.snapshot?.content ?? '';
-            navigator.clipboard.writeText(text).catch(() => {});
-          }}
-          title="Copy contents"
-          style={iconBtnStyle}
-        >
-          <Copy size={13} />
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            // TODO: open this tab as a fullscreen overlay.
-          }}
-          title="Maximize (later)"
-          style={iconBtnStyle}
-        >
-          <Maximize2 size={13} />
-        </button>
+          <button
+            type="button"
+            onClick={() => onReloadTab(activeTab.id)}
+            title="Reload from disk"
+            style={iconBtnStyle}
+          >
+            <RefreshCw size={13} className={activeTab.reloading ? 'spin' : ''} />
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const text =
+                activeTab.draft ?? activeTab.snapshot?.content ?? '';
+              navigator.clipboard.writeText(text).catch(() => {});
+            }}
+            title="Copy contents"
+            style={iconBtnStyle}
+          >
+            <Copy size={13} />
+          </button>
+        </div>
       </div>
 
       {/* Body — CodeMirror editor or diff viewer */}
@@ -451,6 +449,25 @@ const CanvasBody: React.FC<{
   tab: CanvasTab;
   onDraftChange: (tabId: string, draft: string) => void;
 }> = ({ tab, onDraftChange }) => {
+  const language = tab.snapshot?.language;
+  const [languageExtensions, setLanguageExtensions] = useState<Extension[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!language) {
+      setLanguageExtensions([]);
+      return;
+    }
+    loadLanguageExtensionsFor(language).then((extensions) => {
+      if (!cancelled) {
+        setLanguageExtensions(extensions);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [language]);
+
   if (tab.error) {
     return (
       <div
@@ -508,7 +525,7 @@ const CanvasBody: React.FC<{
       onChange={(next) => onDraftChange(tab.id, next)}
       theme={oneDark}
       extensions={[
-        ...languageExtensionFor(tab.snapshot.language),
+        ...languageExtensions,
         EditorView.lineWrapping,
       ]}
       basicSetup={{
@@ -533,180 +550,480 @@ const CanvasBody: React.FC<{
 };
 
 /// One row in the line-by-line diff view.
-type DiffRow = { kind: 'equal' | 'remove' | 'add'; text: string };
+type DiffKind = 'equal' | 'remove' | 'add';
 
-const MAX_INLINE_DIFF_CELLS = 350_000;
+type DiffRow = {
+  kind: DiffKind;
+  text: string;
+  beforeLine: number | null;
+  afterLine: number | null;
+};
 
-/// LCS-based line diff. O(m*n); guarded so opening a large file in the Canvas
-/// does not freeze the GUI render thread. The right follow-up is a workerized
-/// or Monaco-style virtual diff, but this keeps the current inline view safe.
-function computeDiff(before: string, after: string): DiffRow[] | null {
-  const a = before.split('\n');
-  const b = after.split('\n');
-  const m = a.length;
-  const n = b.length;
-  if (m * n > MAX_INLINE_DIFF_CELLS) {
-    return null;
-  }
-  const lcs: number[][] = Array.from({ length: m + 1 }, () =>
-    new Array(n + 1).fill(0),
-  );
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      lcs[i][j] =
-        a[i - 1] === b[j - 1]
-          ? lcs[i - 1][j - 1] + 1
-          : Math.max(lcs[i - 1][j], lcs[i][j - 1]);
+interface DiffResult {
+  rows: DiffRow[];
+  beforeLines: number;
+  afterLines: number;
+  additions: number;
+  deletions: number;
+  algorithm: string;
+  durationMs: number;
+  exact: boolean;
+}
+
+interface DiffWorkerRequest {
+  requestId: number;
+  before: string;
+  after: string;
+}
+
+interface DiffWorkerDone extends DiffResult {
+  requestId: number;
+  status: 'done';
+}
+
+interface DiffWorkerFailure {
+  requestId: number;
+  status: 'error';
+  message: string;
+}
+
+type DiffWorkerResponse = DiffWorkerDone | DiffWorkerFailure;
+
+type DiffState =
+  | { status: 'loading'; result: null; error: null }
+  | { status: 'done'; result: DiffResult; error: null }
+  | { status: 'error'; result: null; error: string };
+
+const DIFF_ROW_HEIGHT = 20;
+const DIFF_OVERSCAN_ROWS = 36;
+
+function useWorkerDiff(before: string, after: string): DiffState {
+  const [state, setState] = useState<DiffState>({
+    status: 'loading',
+    result: null,
+    error: null,
+  });
+  const requestIdRef = useRef(0);
+  const workerRef = useRef<Worker | null>(null);
+
+  useEffect(() => {
+    const requestId = requestIdRef.current + 1;
+    requestIdRef.current = requestId;
+    setState({ status: 'loading', result: null, error: null });
+
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
     }
-  }
-  const rows: DiffRow[] = [];
-  let i = m;
-  let j = n;
-  while (i > 0 && j > 0) {
-    if (a[i - 1] === b[j - 1]) {
-      rows.push({ kind: 'equal', text: a[i - 1] });
-      i--;
-      j--;
-    } else if (lcs[i - 1][j] >= lcs[i][j - 1]) {
-      rows.push({ kind: 'remove', text: a[i - 1] });
-      i--;
-    } else {
-      rows.push({ kind: 'add', text: b[j - 1] });
-      j--;
+
+    let worker: Worker | null = null;
+
+    const finish = (nextState: DiffState) => {
+      if (requestIdRef.current !== requestId || workerRef.current !== worker) {
+        return;
+      }
+      setState(nextState);
+      worker?.terminate();
+      workerRef.current = null;
+    };
+
+    try {
+      worker = new Worker(
+        new URL('../workers/diffWorker.ts', import.meta.url),
+        { type: 'module' },
+      );
+      workerRef.current = worker;
+
+      worker.onmessage = (event: MessageEvent<DiffWorkerResponse>) => {
+        const data = event.data;
+        if (data.requestId !== requestId) return;
+        if (data.status === 'done') {
+          const {
+            rows,
+            beforeLines,
+            afterLines,
+            additions,
+            deletions,
+            algorithm,
+            durationMs,
+            exact,
+          } = data;
+          finish({
+            status: 'done',
+            result: {
+              rows,
+              beforeLines,
+              afterLines,
+              additions,
+              deletions,
+              algorithm,
+              durationMs,
+              exact,
+            },
+            error: null,
+          });
+        } else {
+          finish({ status: 'error', result: null, error: data.message });
+        }
+      };
+
+      worker.onerror = (event) => {
+        finish({
+          status: 'error',
+          result: null,
+          error: event.message || 'Diff worker failed.',
+        });
+      };
+
+      const request: DiffWorkerRequest = { requestId, before, after };
+      worker.postMessage(request);
+    } catch (error) {
+      worker?.terminate();
+      if (workerRef.current === worker) {
+        workerRef.current = null;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      setState({ status: 'error', result: null, error: message });
     }
+
+    return () => {
+      if (workerRef.current === worker) {
+        workerRef.current?.terminate();
+        workerRef.current = null;
+      }
+    };
+  }, [before, after]);
+
+  return state;
+}
+
+function countLines(text: string): number {
+  let count = 1;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) count += 1;
   }
-  while (i > 0) rows.push({ kind: 'remove', text: a[--i] });
-  while (j > 0) rows.push({ kind: 'add', text: b[--j] });
-  return rows.reverse();
+  return count;
+}
+
+function canvasBreadcrumbSegments(p: string): string[] {
+  const norm = p.replace(/\\/g, '/').replace(/\/+$/, '');
+  const parts = norm.split('/').filter(Boolean);
+  if (parts.length <= 5) return parts;
+  return [parts[0], '…', ...parts.slice(-3)];
 }
 
 /// Unified line diff renderer. Red lines were on disk, green are the
 /// AI's edit, plain lines are unchanged. Line numbers on both sides
 /// (git-style) so the user can correlate hunks back to the file.
 const DiffView: React.FC<{ before: string; after: string }> = ({ before, after }) => {
-  const rows = useMemo(() => computeDiff(before, after), [before, after]);
-  if (!rows) {
-    const beforeLines = before.split('\n').length;
-    const afterLines = after.split('\n').length;
+  const diffState = useWorkerDiff(before, after);
+  const lineCounts = useMemo(
+    () => ({
+      before: countLines(before),
+      after: countLines(after),
+    }),
+    [before, after],
+  );
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollRafRef = useRef<number | null>(null);
+  const [viewport, setViewport] = useState({ scrollTop: 0, height: 0 });
+
+  const readViewport = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const next = { scrollTop: el.scrollTop, height: el.clientHeight };
+    setViewport((previous) => {
+      if (
+        Math.abs(previous.scrollTop - next.scrollTop) < 0.5 &&
+        Math.abs(previous.height - next.height) < 0.5
+      ) {
+        return previous;
+      }
+      return next;
+    });
+  }, []);
+
+  const handleScroll = useCallback(() => {
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      readViewport();
+    });
+  }, [readViewport]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current);
+        scrollRafRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (diffState.status !== 'done') return;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = 0;
+    setViewport({ scrollTop: 0, height: el.clientHeight });
+  }, [diffState.status, diffState.result]);
+
+  useEffect(() => {
+    if (diffState.status !== 'done') return;
+    readViewport();
+    const el = scrollRef.current;
+    if (!el) return;
+    const resizeObserver = new ResizeObserver(readViewport);
+    resizeObserver.observe(el);
+    return () => resizeObserver.disconnect();
+  }, [diffState.status, readViewport]);
+
+  const virtualRows = useMemo(() => {
+    if (diffState.status !== 'done') {
+      return {
+        rows: [] as DiffRow[],
+        startIndex: 0,
+        endIndex: 0,
+        totalHeight: 0,
+      };
+    }
+    const rows = diffState.result.rows;
+    const viewportHeight = viewport.height || 480;
+    const startIndex = Math.max(
+      0,
+      Math.floor(viewport.scrollTop / DIFF_ROW_HEIGHT) - DIFF_OVERSCAN_ROWS,
+    );
+    const endIndex = Math.min(
+      rows.length,
+      Math.ceil((viewport.scrollTop + viewportHeight) / DIFF_ROW_HEIGHT) +
+        DIFF_OVERSCAN_ROWS,
+    );
+    return {
+      rows: rows.slice(startIndex, endIndex),
+      startIndex,
+      endIndex,
+      totalHeight: rows.length * DIFF_ROW_HEIGHT,
+    };
+  }, [diffState, viewport.height, viewport.scrollTop]);
+
+  if (diffState.status === 'loading') {
     return (
-      <div style={{ padding: 24, color: 'var(--text-muted)', lineHeight: 1.6 }}>
-        Diff is too large to render inline without blocking the GUI
-        {' '}
-        ({beforeLines.toLocaleString()} → {afterLines.toLocaleString()} lines).
-        Use the editor view or an external diff tool for this file.
+      <div
+        style={{
+          padding: 24,
+          color: 'var(--text-muted)',
+          lineHeight: 1.6,
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: 10,
+        }}
+      >
+        <RefreshCw size={16} className="spin" style={{ marginTop: 3 }} />
+        <div>
+          <strong style={{ color: 'var(--text-secondary)' }}>
+            Computing diff off the UI thread…
+          </strong>
+          <div>
+            {lineCounts.before.toLocaleString()} →{' '}
+            {lineCounts.after.toLocaleString()} lines
+          </div>
+        </div>
       </div>
     );
   }
-  if (rows.every((r) => r.kind === 'equal')) {
+
+  if (diffState.status === 'error') {
+    return (
+      <div
+        style={{
+          padding: 24,
+          color: 'var(--color-error, #ef4444)',
+          lineHeight: 1.6,
+        }}
+      >
+        <strong style={{ display: 'block', marginBottom: 4 }}>
+          Failed to render diff
+        </strong>
+        <span style={{ color: 'var(--text-secondary)' }}>
+          {diffState.error}
+        </span>
+      </div>
+    );
+  }
+
+  const { result } = diffState;
+  if (result.additions === 0 && result.deletions === 0) {
     return (
       <div style={{ padding: 24, color: 'var(--text-muted)' }}>
         No changes between baseline and current content.
       </div>
     );
   }
-  let beforeLine = 0;
-  let afterLine = 0;
+
   return (
     <div
       style={{
         flex: 1,
         minHeight: 0,
-        overflow: 'auto',
+        display: 'flex',
+        flexDirection: 'column',
         fontFamily:
           'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace',
         fontSize: 13,
-        lineHeight: 1.5,
+        color: 'var(--text-primary)',
       }}
     >
-      <pre
+      <div
         style={{
-          margin: 0,
-          padding: '12px 0',
-          whiteSpace: 'pre',
+          flexShrink: 0,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          padding: '8px 12px',
+          borderBottom: '1px solid var(--border-muted)',
+          background: 'rgba(255, 255, 255, 0.025)',
+          color: 'var(--text-muted)',
+          fontFamily: 'inherit',
+          fontSize: 12,
+          whiteSpace: 'nowrap',
         }}
       >
-        {rows.map((row, idx) => {
-          const isRemove = row.kind === 'remove';
-          const isAdd = row.kind === 'add';
-          let leftNum: string | number = ' ';
-          let rightNum: string | number = ' ';
-          if (isRemove) {
-            beforeLine += 1;
-            leftNum = beforeLine;
-          } else if (isAdd) {
-            afterLine += 1;
-            rightNum = afterLine;
-          } else {
-            beforeLine += 1;
-            afterLine += 1;
-            leftNum = beforeLine;
-            rightNum = afterLine;
-          }
-          return (
-            <div
-              key={idx}
-              style={{
-                display: 'grid',
-                gridTemplateColumns: '3.5em 3.5em 1em 1fr',
-                columnGap: 0,
-                background: isRemove
-                  ? 'rgba(239, 68, 68, 0.10)'
-                  : isAdd
-                    ? 'rgba(16, 185, 129, 0.10)'
-                    : 'transparent',
-                color: isRemove
-                  ? '#fca5a5'
-                  : isAdd
-                    ? '#86efac'
-                    : 'var(--text-primary)',
-                minHeight: '1.5em',
-              }}
-            >
-              <span
-                aria-hidden
-                style={{
-                  textAlign: 'right',
-                  paddingRight: 8,
-                  color: 'var(--text-muted)',
-                  userSelect: 'none',
-                  opacity: 0.7,
-                }}
-              >
-                {leftNum}
-              </span>
-              <span
-                aria-hidden
-                style={{
-                  textAlign: 'right',
-                  paddingRight: 8,
-                  color: 'var(--text-muted)',
-                  userSelect: 'none',
-                  opacity: 0.7,
-                }}
-              >
-                {rightNum}
-              </span>
-              <span
-                aria-hidden
-                style={{
-                  textAlign: 'center',
-                  color: 'var(--text-muted)',
-                  userSelect: 'none',
-                  opacity: 0.7,
-                }}
-              >
-                {isRemove ? '-' : isAdd ? '+' : ' '}
-              </span>
-              <span style={{ paddingLeft: 8, paddingRight: 14 }}>
-                {row.text || ' '}
-              </span>
-            </div>
-          );
-        })}
-      </pre>
+        <span>
+          {result.beforeLines.toLocaleString()} →{' '}
+          {result.afterLines.toLocaleString()} lines
+        </span>
+        <span style={{ color: '#86efac' }}>
+          +{result.additions.toLocaleString()}
+        </span>
+        <span style={{ color: '#fca5a5' }}>
+          -{result.deletions.toLocaleString()}
+        </span>
+        <span>{result.rows.length.toLocaleString()} rows</span>
+        <span>{result.algorithm}</span>
+        <span>{result.durationMs.toLocaleString()}ms</span>
+        <span style={{ marginLeft: 'auto' }}>
+          showing {virtualRows.startIndex + 1}-
+          {virtualRows.endIndex.toLocaleString()} of{' '}
+          {result.rows.length.toLocaleString()}
+        </span>
+      </div>
+      {!result.exact && (
+        <div
+          style={{
+            flexShrink: 0,
+            padding: '6px 12px',
+            borderBottom: '1px solid var(--border-muted)',
+            background: 'rgba(245, 158, 11, 0.08)',
+            color: 'var(--text-secondary)',
+            fontFamily:
+              'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+            fontSize: 12,
+          }}
+        >
+          Large rewrite shown with bounded alignment; unchanged anchors are
+          exact, dense changed blocks are grouped to keep the GUI responsive.
+        </div>
+      )}
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        style={{
+          flex: 1,
+          minHeight: 0,
+          overflow: 'auto',
+          position: 'relative',
+          background: 'rgba(0, 0, 0, 0.08)',
+        }}
+      >
+        <div
+          style={{
+            position: 'relative',
+            height: virtualRows.totalHeight,
+            minWidth: '100%',
+          }}
+        >
+          {virtualRows.rows.map((row, offset) => {
+            const index = virtualRows.startIndex + offset;
+            return (
+              <DiffLine
+                key={index}
+                row={row}
+                top={index * DIFF_ROW_HEIGHT}
+              />
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 };
+
+interface DiffLineProps {
+  row: DiffRow;
+  top: number;
+}
+
+const diffLineNumberStyle: React.CSSProperties = {
+  textAlign: 'right',
+  paddingRight: 8,
+  color: 'var(--text-muted)',
+  userSelect: 'none',
+  opacity: 0.7,
+};
+
+const DiffLine = React.memo(function DiffLine({ row, top }: DiffLineProps) {
+  const isRemove = row.kind === 'remove';
+  const isAdd = row.kind === 'add';
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top,
+        left: 0,
+        height: DIFF_ROW_HEIGHT,
+        minWidth: '100%',
+        width: 'max-content',
+        display: 'grid',
+        gridTemplateColumns: '3.5em 3.5em 1em max-content',
+        alignItems: 'center',
+        columnGap: 0,
+        lineHeight: `${DIFF_ROW_HEIGHT}px`,
+        whiteSpace: 'pre',
+        background: isRemove
+          ? 'rgba(239, 68, 68, 0.10)'
+          : isAdd
+            ? 'rgba(16, 185, 129, 0.10)'
+            : 'transparent',
+        color: isRemove
+          ? '#fca5a5'
+          : isAdd
+            ? '#86efac'
+            : 'var(--text-primary)',
+      }}
+    >
+      <span aria-hidden style={diffLineNumberStyle}>
+        {row.beforeLine ?? ' '}
+      </span>
+      <span aria-hidden style={diffLineNumberStyle}>
+        {row.afterLine ?? ' '}
+      </span>
+      <span
+        aria-hidden
+        style={{
+          textAlign: 'center',
+          color: 'var(--text-muted)',
+          userSelect: 'none',
+          opacity: 0.7,
+        }}
+      >
+        {isRemove ? '-' : isAdd ? '+' : ' '}
+      </span>
+      <span style={{ paddingLeft: 8, paddingRight: 14 }}>
+        {row.text || ' '}
+      </span>
+    </div>
+  );
+});
 
 function leafName(p: string): string {
   if (!p) return '';
