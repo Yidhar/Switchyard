@@ -9,9 +9,10 @@
 //!    kicks a background thread that walks the workspace roots and reads
 //!    every text file under a size cap into the baseline map.
 //!
-//! 2. [`FileWatcherState::start_turn`] flips `active_turn = true` and
-//!    clears any leftover pending state. Anything the watcher sees from
-//!    here on is candidate for an AI-change artifact.
+//! 2. [`FileWatcherState::start_turn_for`] opens a per-session capture
+//!    scope and clears any leftover pending state for that session. Anything
+//!    the watcher sees from here on is candidate for an AI-change artifact
+//!    for each active session scope.
 //!
 //! 3. The notify callback runs on the watcher's own thread. For each
 //!    relevant event, it records the file's **previous** baseline as the
@@ -20,7 +21,7 @@
 //!    no turn is active, the baseline is updated silently — that's the
 //!    user editing manually, not AI.
 //!
-//! 4. [`FileWatcherState::end_turn`] returns a list of
+//! 4. [`FileWatcherState::end_turn_for`] returns a list of
 //!    `(path, before, after)` tuples that `run_turn` then promotes into
 //!    `FileChange` artifacts in the canonical store.
 //!
@@ -79,20 +80,10 @@ struct FileWatcherInner {
     /// Last-known content per watched file. Populated eagerly at
     /// workspace switch, then maintained by the watcher callback.
     baseline: StdMutex<HashMap<PathBuf, String>>,
-    /// During an active turn: first-observed pre-modification content
-    /// per path. The very first watcher event for a given file during
-    /// the turn snapshots the baseline value here — subsequent events
-    /// for the same file are accumulated by updating the baseline (the
-    /// "after") but not by overwriting this `before`.
-    pending_before: StdMutex<HashMap<PathBuf, String>>,
-    /// True between `start_turn` and `end_turn`. The notify callback
-    /// reads this to decide whether to record an AI change or silently
-    /// update the baseline.
-    active_turn: StdMutex<bool>,
-    /// Wall-clock time `start_turn` was called. Used by the end-of-turn
-    /// fallback scan to skip files whose mtime predates the turn —
-    /// they can't have been touched by the AI.
-    turn_started_at: StdMutex<Option<SystemTime>>,
+    /// Per-session active capture scopes. Each concurrently-running session
+    /// has an independent first-observed `before` map and start timestamp, so
+    /// finishing one turn cannot drain another session's watcher state.
+    active_captures: StdMutex<HashMap<uuid::Uuid, CaptureScope>>,
     /// Workspace roots being watched. Cached at `watch_workspace` time
     /// so the fallback scan in `end_turn` knows where to look without
     /// re-plumbing the workspace handle through every call.
@@ -101,13 +92,17 @@ struct FileWatcherInner {
     watcher: StdMutex<Option<RecommendedWatcher>>,
 }
 
+#[derive(Debug, Clone)]
+struct CaptureScope {
+    pending_before: HashMap<PathBuf, String>,
+    started_at: SystemTime,
+}
+
 impl FileWatcherInner {
     fn new() -> Self {
         Self {
             baseline: StdMutex::new(HashMap::new()),
-            pending_before: StdMutex::new(HashMap::new()),
-            active_turn: StdMutex::new(false),
-            turn_started_at: StdMutex::new(None),
+            active_captures: StdMutex::new(HashMap::new()),
             roots: StdMutex::new(Vec::new()),
             watcher: StdMutex::new(None),
         }
@@ -144,19 +139,9 @@ impl FileWatcherState {
                 .map_err(|_| "baseline mutex poisoned")?;
             b.clear();
         }
-        {
-            let mut p = self
-                .inner
-                .pending_before
-                .lock()
-                .map_err(|_| "pending mutex poisoned")?;
-            p.clear();
+        if let Ok(mut captures) = self.inner.active_captures.lock() {
+            captures.clear();
         }
-        // active_turn intentionally NOT reset here — workspace switch
-        // during a turn would leave artifacts stranded, but reusing
-        // the slot is harmless (any prior turn already ended). In
-        // practice the GUI calls watch_workspace only on user switch
-        // which races with at-most a no-op turn.
 
         let roots: Vec<PathBuf> = std::iter::once(workspace.primary_root.clone())
             .chain(workspace.extra_roots.iter().cloned())
@@ -229,19 +214,8 @@ impl FileWatcherState {
                 .map_err(|_| "baseline mutex poisoned")?;
             b.clear();
         }
-        {
-            let mut p = self
-                .inner
-                .pending_before
-                .lock()
-                .map_err(|_| "pending mutex poisoned")?;
-            p.clear();
-        }
-        if let Ok(mut active) = self.inner.active_turn.lock() {
-            *active = false;
-        }
-        if let Ok(mut started_at) = self.inner.turn_started_at.lock() {
-            *started_at = None;
+        if let Ok(mut captures) = self.inner.active_captures.lock() {
+            captures.clear();
         }
         if let Ok(mut roots) = self.inner.roots.lock() {
             roots.clear();
@@ -249,49 +223,54 @@ impl FileWatcherState {
         Ok(())
     }
 
-    /// Begin recording AI-driven changes. Clears any pending state from
-    /// a prior turn (defensive — `end_turn` should already have drained).
-    /// Stamps the start time so the fallback scan in `end_turn` can
-    /// filter to "files touched after this moment".
-    pub fn start_turn(&self) {
-        if let Ok(mut active) = self.inner.active_turn.lock() {
-            *active = true;
-        }
-        if let Ok(mut pending) = self.inner.pending_before.lock() {
-            pending.clear();
-        }
-        // Snapshot 250ms BEFORE "now" so we're forgiving of clock skew
-        // between the workspace filesystem and our wall clock — e.g.
-        // network drives or VM-mounted directories.
-        let started = SystemTime::now()
-            .checked_sub(std::time::Duration::from_millis(250))
-            .unwrap_or_else(SystemTime::now);
-        if let Ok(mut slot) = self.inner.turn_started_at.lock() {
-            *slot = Some(started);
+    /// Begin recording AI-driven changes for a specific session. Replaces any
+    /// pending state from a prior turn for the same session (defensive —
+    /// `end_turn_for` should already have drained it). Stamps the start time
+    /// so the fallback scan in `end_turn_for` can filter to "files touched
+    /// after this moment".
+    pub fn start_turn_for(&self, session_id: uuid::Uuid) {
+        let started = capture_started_at();
+        if let Ok(mut captures) = self.inner.active_captures.lock() {
+            captures.insert(
+                session_id,
+                CaptureScope {
+                    pending_before: HashMap::new(),
+                    started_at: started,
+                },
+            );
         }
     }
 
-    /// Stop recording. Returns the set of files modified during the
-    /// just-ended turn, paired with their before+after content.
+    /// Compatibility helper for tests and any legacy single-turn callers.
+    #[cfg(test)]
+    pub fn start_turn(&self) {
+        self.start_turn_for(uuid::Uuid::nil());
+    }
+
+    /// Stop recording for a specific session. Returns the set of files
+    /// modified during the just-ended turn, paired with their before+after
+    /// content.
     ///
     /// **Two-phase capture**: first drain the notify-collected changes
     /// (fast path, populated as events came in), then sweep the
-    /// workspace for any file whose mtime is newer than `turn_started_at`
+    /// workspace for any file whose mtime is newer than the capture start time
     /// — this catches edits that notify dropped or coalesced (Windows
     /// rename-replace patterns, recommended_watcher debouncer collapsing
     /// rapid sequences, etc.). The fallback is bounded by `mtime` so
     /// untouched files are skipped without a content read.
-    pub fn end_turn(&self) -> Vec<CapturedChange> {
-        if let Ok(mut active) = self.inner.active_turn.lock() {
-            *active = false;
-        }
-        let started_at = self.inner.turn_started_at.lock().ok().and_then(|g| *g);
+    pub fn end_turn_for(&self, session_id: uuid::Uuid) -> Vec<CapturedChange> {
+        let capture = self
+            .inner
+            .active_captures
+            .lock()
+            .ok()
+            .and_then(|mut captures| captures.remove(&session_id));
+        let Some(capture) = capture else {
+            return Vec::new();
+        };
 
         // Phase 1: notify-collected changes.
-        let pending = match self.inner.pending_before.lock() {
-            Ok(mut p) => std::mem::take(&mut *p),
-            Err(_) => HashMap::new(),
-        };
+        let pending = capture.pending_before;
         let mut accumulated: HashMap<PathBuf, (String, String)> =
             HashMap::with_capacity(pending.len());
         {
@@ -312,16 +291,15 @@ impl FileWatcherState {
         // Any drift not already in `accumulated` joins the result set
         // and the baseline is updated so we don't re-emit the same
         // change next turn.
-        if let Some(since) = started_at {
-            let roots = self
-                .inner
-                .roots
-                .lock()
-                .map(|g| g.clone())
-                .unwrap_or_default();
-            for root in &roots {
-                self.inner.sweep_for_drift(root, since, &mut accumulated);
-            }
+        let roots = self
+            .inner
+            .roots
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        for root in &roots {
+            self.inner
+                .sweep_for_drift(root, capture.started_at, &mut accumulated);
         }
 
         accumulated
@@ -340,6 +318,12 @@ impl FileWatcherState {
                 })
             })
             .collect()
+    }
+
+    /// Compatibility helper for tests and any legacy single-turn callers.
+    #[cfg(test)]
+    pub fn end_turn(&self) -> Vec<CapturedChange> {
+        self.end_turn_for(uuid::Uuid::nil())
     }
 }
 
@@ -381,10 +365,10 @@ impl FileWatcherInner {
         }
     }
 
-    /// Re-read disk and update baseline. If `active_turn` is set and
-    /// this is the first event for the path this turn, snapshot the
-    /// pre-event baseline into `pending_before` so `end_turn` can use
-    /// it as the diff's "before".
+    /// Re-read disk and update baseline. If one or more capture scopes are
+    /// active and this is the first event for the path in that scope, snapshot
+    /// the pre-event baseline into the scope's `pending_before` so
+    /// `end_turn_for` can use it as the diff's "before".
     fn process_path(&self, path: &Path, kind: &EventKind) {
         let is_remove = matches!(kind, EventKind::Remove(_));
 
@@ -399,18 +383,25 @@ impl FileWatcherInner {
             }
         };
 
-        let active = self.active_turn.lock().map(|g| *g).unwrap_or(false);
+        let has_active_captures = self
+            .active_captures
+            .lock()
+            .map(|captures| !captures.is_empty())
+            .unwrap_or(false);
 
-        if active {
-            if let Ok(mut pending) = self.pending_before.lock() {
-                if !pending.contains_key(path) {
-                    let baseline = self.baseline.lock();
-                    let before = baseline
-                        .as_ref()
-                        .ok()
-                        .and_then(|b| b.get(path).cloned())
-                        .unwrap_or_default();
-                    pending.insert(path.to_path_buf(), before);
+        if has_active_captures {
+            let before = self
+                .baseline
+                .lock()
+                .ok()
+                .and_then(|b| b.get(path).cloned())
+                .unwrap_or_default();
+            if let Ok(mut captures) = self.active_captures.lock() {
+                for scope in captures.values_mut() {
+                    scope
+                        .pending_before
+                        .entry(path.to_path_buf())
+                        .or_insert_with(|| before.clone());
                 }
             }
         }
@@ -505,6 +496,15 @@ impl FileWatcherInner {
             }
         }
     }
+}
+
+fn capture_started_at() -> SystemTime {
+    // Snapshot 250ms BEFORE "now" so we're forgiving of clock skew between the
+    // workspace filesystem and our wall clock — e.g. network drives or
+    // VM-mounted directories.
+    SystemTime::now()
+        .checked_sub(std::time::Duration::from_millis(250))
+        .unwrap_or_else(SystemTime::now)
 }
 
 /// Walk a directory tree depth-first and pre-populate the baseline
@@ -776,8 +776,8 @@ mod tests {
 
         let baseline = inner.baseline.lock().unwrap();
         assert_eq!(baseline.get(&path).map(|s| s.as_str()), Some("v2"));
-        let pending = inner.pending_before.lock().unwrap();
-        assert!(pending.is_empty(), "no pending captures outside a turn");
+        let captures = inner.active_captures.lock().unwrap();
+        assert!(captures.is_empty(), "no pending captures outside a turn");
     }
 
     #[test]
@@ -792,16 +792,24 @@ mod tests {
             .lock()
             .unwrap()
             .insert(path.clone(), "v1".to_string());
-        *inner.active_turn.lock().unwrap() = true;
+        let session_id = uuid::Uuid::nil();
+        inner.active_captures.lock().unwrap().insert(
+            session_id,
+            CaptureScope {
+                pending_before: HashMap::new(),
+                started_at: capture_started_at(),
+            },
+        );
 
         // First write event records the "before" from baseline.
         inner.process_path(&path, &EventKind::Modify(notify::event::ModifyKind::Any));
         assert_eq!(
             inner
-                .pending_before
+                .active_captures
                 .lock()
                 .unwrap()
-                .get(&path)
+                .get(&session_id)
+                .and_then(|scope| scope.pending_before.get(&path))
                 .map(|s| s.as_str()),
             Some("v1")
         );
@@ -811,10 +819,11 @@ mod tests {
         inner.process_path(&path, &EventKind::Modify(notify::event::ModifyKind::Any));
         assert_eq!(
             inner
-                .pending_before
+                .active_captures
                 .lock()
                 .unwrap()
-                .get(&path)
+                .get(&session_id)
+                .and_then(|scope| scope.pending_before.get(&path))
                 .map(|s| s.as_str()),
             Some("v1"),
             "before is snapshotted on the FIRST event, not the most recent"

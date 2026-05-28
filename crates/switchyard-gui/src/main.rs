@@ -135,7 +135,9 @@ fn runtime_event_bridge_brief(event: &RuntimeEvent) -> String {
             provider,
             count,
         } => {
-            format!("CallbackReceiptsInjected session_id={session_id} provider={provider} count={count}")
+            format!(
+                "CallbackReceiptsInjected session_id={session_id} provider={provider} count={count}"
+            )
         }
         RuntimeEvent::TurnPreparing {
             session_id,
@@ -158,7 +160,9 @@ fn runtime_event_bridge_brief(event: &RuntimeEvent) -> String {
             provider,
             ..
         } => {
-            format!("CoreExecutionTelemetry session_id={session_id} turn_id={turn_id} provider={provider}")
+            format!(
+                "CoreExecutionTelemetry session_id={session_id} turn_id={turn_id} provider={provider}"
+            )
         }
         RuntimeEvent::CoreItemUpdated {
             session_id,
@@ -206,7 +210,9 @@ fn runtime_event_bridge_brief(event: &RuntimeEvent) -> String {
             provider,
             ..
         } => {
-            format!("PeerExecutionTelemetry session_id={session_id} turn_id={turn_id} provider={provider}")
+            format!(
+                "PeerExecutionTelemetry session_id={session_id} turn_id={turn_id} provider={provider}"
+            )
         }
         RuntimeEvent::PeerItemUpdated {
             session_id,
@@ -256,21 +262,27 @@ fn runtime_event_bridge_brief(event: &RuntimeEvent) -> String {
             turn_id,
             provider,
         } => {
-            format!("CoreOutputCompleted session_id={session_id} turn_id={turn_id} provider={provider}")
+            format!(
+                "CoreOutputCompleted session_id={session_id} turn_id={turn_id} provider={provider}"
+            )
         }
         RuntimeEvent::PeerOutputCompleted {
             session_id,
             turn_id,
             provider,
         } => {
-            format!("PeerOutputCompleted session_id={session_id} turn_id={turn_id} provider={provider}")
+            format!(
+                "PeerOutputCompleted session_id={session_id} turn_id={turn_id} provider={provider}"
+            )
         }
         RuntimeEvent::FinalizationStarted {
             session_id,
             turn_id,
             provider,
         } => {
-            format!("FinalizationStarted session_id={session_id} turn_id={turn_id} provider={provider}")
+            format!(
+                "FinalizationStarted session_id={session_id} turn_id={turn_id} provider={provider}"
+            )
         }
         RuntimeEvent::TurnCompleted {
             session_id,
@@ -532,9 +544,7 @@ fn runtime_hyard_coalesce_key(event: &RuntimeEvent) -> Option<String> {
             turn_id,
             job,
             ..
-        } => {
-            Some(format!("hyard:{session_id}:{turn_id}:{}", job.job_id))
-        }
+        } => Some(format!("hyard:{session_id}:{turn_id}:{}", job.job_id)),
         _ => None,
     }
 }
@@ -923,7 +933,7 @@ fn spawn_external_terminal(cwd: &Path) -> Result<(), String> {
     // Prefer Windows Terminal when available; it gives the closest native
     // VS Code-like fallback if the embedded terminal is not enough for a TUI.
     match ProcessCommand::new("wt.exe").arg("-d").arg(cwd).spawn() {
-        Ok(_) => return Ok(()),
+        Ok(_) => Ok(()),
         Err(wt_err) => {
             // Fall back to the inbox Windows PowerShell. `-NoExit` keeps the
             // window open and `Set-Location -LiteralPath` handles spaces and
@@ -2861,6 +2871,7 @@ async fn read_image_attachment_data_url(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     app: tauri::AppHandle,
     pool: tauri::State<'_, Arc<switchyard_core::InstancePool>>,
@@ -3079,16 +3090,21 @@ async fn run_turn(
     let cancel = CancellationToken::new();
     {
         let state = app.state::<ActiveTurnState>();
-        let mut guard = state.cancel.lock().unwrap();
-        *guard = Some(cancel.clone());
+        let mut guard = state.cancel_by_session.lock().unwrap();
+        if guard.contains_key(&session.session_id) {
+            return Err(format!(
+                "turn already running for session {}",
+                session.session_id
+            ));
+        }
+        guard.insert(session.session_id, cancel.clone());
     }
 
-    // Flip the file watcher into "capture" mode. Any file modify events
-    // arriving from this point until the matching `end_turn` below get
-    // recorded as candidate AI changes. Switching workspaces or starting
-    // a new turn would lose any in-flight capture, but that matches the
-    // user model — one workspace, one turn at a time.
-    file_watcher.start_turn();
+    // Flip the file watcher into per-session "capture" mode. Different
+    // sessions can now run concurrently; each capture scope has its own
+    // start time and before-snapshot map so one finished turn does not drain
+    // another session's pending file edits.
+    file_watcher.start_turn_for(session.session_id);
 
     let mut policy = execution_policy_from_config_with_overrides(&config, &cwd, sandbox_mode, &[]);
     if policy.timeout_secs == 0 {
@@ -3114,17 +3130,11 @@ async fn run_turn(
     )
     .await;
 
-    {
-        let state = app.state::<ActiveTurnState>();
-        let mut guard = state.cancel.lock().unwrap();
-        *guard = None;
-    }
-
     // Drain captured changes and promote each into a FileChange
     // artifact anchored to the just-finished turn. We bind the
     // artifact to the active turn ID so the frontend's
     // `list_ai_file_changes` projection finds them.
-    let captured = file_watcher.end_turn();
+    let captured = file_watcher.end_turn_for(session.session_id);
     if !captured.is_empty() {
         if let Some(turn_id) = latest_turn_id(&store, session.session_id) {
             persist_captured_changes(&mut store, turn_id, &provider, &captured);
@@ -3134,6 +3144,12 @@ async fn run_turn(
     // `write_file`, so do not let a pre-turn Source Control snapshot survive
     // into the completion refresh.
     workspace_state.invalidate_git_status_cache();
+
+    {
+        let state = app.state::<ActiveTurnState>();
+        let mut guard = state.cancel_by_session.lock().unwrap();
+        guard.remove(&session.session_id);
+    }
 
     match output {
         Ok(out) => Ok(out.response.unwrap_or_default()),
@@ -3195,18 +3211,35 @@ fn persist_captured_changes(
 }
 
 struct ActiveTurnState {
-    cancel: std::sync::Mutex<Option<CancellationToken>>,
+    cancel_by_session: std::sync::Mutex<HashMap<uuid::Uuid, CancellationToken>>,
 }
 
 #[tauri::command]
-fn cancel_turn(state: tauri::State<'_, ActiveTurnState>) -> Result<(), String> {
-    let mut guard = state.cancel.lock().unwrap();
-    if let Some(cancel) = guard.take() {
-        cancel.cancel();
-        Ok(())
-    } else {
-        Err("No active turn running".to_string())
+fn cancel_turn(
+    session_id: Option<String>,
+    state: tauri::State<'_, ActiveTurnState>,
+) -> Result<(), String> {
+    let guard = state.cancel_by_session.lock().unwrap();
+    if let Some(session_id) = session_id {
+        let session_uuid =
+            uuid::Uuid::parse_str(&session_id).map_err(|e| format!("invalid session ID: {e}"))?;
+        if let Some(cancel) = guard.get(&session_uuid) {
+            cancel.cancel();
+            return Ok(());
+        }
+        return Err(format!("No active turn running for session {session_uuid}"));
     }
+
+    if guard.is_empty() {
+        return Err("No active turn running".to_string());
+    }
+
+    let cancels: Vec<CancellationToken> = guard.values().cloned().collect();
+    drop(guard);
+    for cancel in cancels {
+        cancel.cancel();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3376,9 +3409,9 @@ async fn list_artifacts(
 
     while let Some(entry) = dir.next_entry().await.map_err(|e| e.to_string())? {
         let metadata = entry.metadata().await.map_err(|e| e.to_string())?;
-        let modified = metadata.modified().ok().and_then(|t| {
+        let modified = metadata.modified().ok().map(|t| {
             let datetime: chrono::DateTime<chrono::Local> = t.into();
-            Some(datetime.to_rfc3339())
+            datetime.to_rfc3339()
         });
 
         items.push(ArtifactItem {
@@ -3949,7 +3982,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(ActiveTurnState {
-            cancel: std::sync::Mutex::new(None),
+            cancel_by_session: std::sync::Mutex::new(HashMap::new()),
         })
         .manage(Arc::new(switchyard_core::InstancePool::new()))
         .manage(workspace_state)

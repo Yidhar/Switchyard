@@ -67,6 +67,7 @@ const DEFAULT_CANVAS_COLUMN_WIDTH = 680;
 const DEFAULT_SANDBOX_MODE: SandboxMode = 'workspace-write';
 const TURN_ATTACHMENTS_STORAGE_KEY = 'switchyard.turnAttachments.v1';
 const TEMP_USER_TURN_ID_PREFIX = 'temp-user-';
+const NEW_SESSION_PIPELINE_ID = '__switchyard_new_session__';
 
 interface PendingTurnAttachmentBinding {
   bindingId: string;
@@ -1407,10 +1408,6 @@ function applyProviderTextUpdate(prev: string, text: string, payload: any): stri
 
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
-  const sessionsRef = useRef<Session[]>([]);
-  useEffect(() => {
-    sessionsRef.current = sessions;
-  }, [sessions]);
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
   // Ref to always capture the latest selectedSession inside async loaders and
   // the singleton runtime listener. Keep this hook before worker sync effects
@@ -1434,8 +1431,8 @@ function App() {
   // send should dispatch or queue. Keep refs as the authoritative in-flight and
   // FIFO queue state so double-Enter / button-click bursts cannot start two
   // `run_turn` invocations concurrently.
-  const isDispatchingRef = useRef(false);
-  const isPreparingDispatchRef = useRef(false);
+  const dispatchingSessionIdsRef = useRef<Set<string>>(new Set());
+  const preparingSessionIdsRef = useRef<Set<string>>(new Set());
   // Mirror of messageQueue for reading inside dispatchMessage's finally without
   // making the queue a dep of the in-flight invocation. The ref always reflects
   // the latest queue state.
@@ -1518,16 +1515,29 @@ function App() {
     });
   };
 
-  const bindActiveAttachmentTurnFromRuntime = (turnId: string) => {
+  const bindActiveAttachmentTurnFromRuntime = (turnId: string, sessionId?: string | null) => {
     const bindingId = activeAttachmentBindingIdRef.current;
-    if (!bindingId) return false;
-    const binding = pendingAttachmentBindingsRef.current.find((item) => item.bindingId === bindingId);
+    const pending = pendingAttachmentBindingsRef.current;
+    let binding = bindingId
+      ? pending.find((item) => (
+          item.bindingId === bindingId &&
+          (!sessionId || item.sessionId === sessionId)
+        ))
+      : undefined;
+    if (!binding && sessionId) {
+      binding = pending.find((item) => item.sessionId === sessionId && !item.resolvedTurnId);
+    }
     if (!binding) {
-      activeAttachmentBindingIdRef.current = null;
+      if (bindingId && !pending.some((item) => item.bindingId === bindingId)) {
+        activeAttachmentBindingIdRef.current = null;
+      }
       return false;
     }
     binding.resolvedTurnId = turnId;
     applyAttachmentBindingToTurn(binding, turnId, { keepTempAttachment: true });
+    if (activeAttachmentBindingIdRef.current === binding.bindingId) {
+      activeAttachmentBindingIdRef.current = null;
+    }
     return true;
   };
 
@@ -1593,7 +1603,6 @@ function App() {
   const [runtimePreparingPhase, setRuntimePreparingPhase] = useState<string | null>(null);
   const runtimeDispatchStartedAtRef = useRef<number | null>(null);
   const sessionUiSnapshotsRef = useRef<Record<string, SessionUiSnapshot>>({});
-  const activeRuntimeSessionIdRef = useRef<string | null>(null);
   const runtimeTurnSessionIdRef = useRef<Record<string, string>>({});
   const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [providerStatusLoading, setProviderStatusLoading] = useState(false);
@@ -2673,27 +2682,34 @@ function App() {
         runtimeTurnSessionIdRef.current = next;
       };
 
-      const runtimeEventSessionId = (type: string, data: any): string | null => {
+      const runtimeEventSessionId = (_type: string, data: any): string | null => {
         const explicit = normalizedString(data?.session_id);
         if (explicit) return explicit;
         const turnId = normalizedString(data?.turn_id ?? data?.core_turn_id ?? data?.in_flight_turn_id);
         if (turnId && runtimeTurnSessionIdRef.current[turnId]) {
           return runtimeTurnSessionIdRef.current[turnId];
         }
-        if (
-          type === 'CoreTurnStarted' ||
-          type === 'PeerTurnStarted' ||
-          type === 'FinalizationStarted' ||
-          type === 'DelegateRequested' ||
-          type === 'DelegateCompleted' ||
-          type === 'CallbackReceiptsInjected' ||
-          type === 'TurnCompleted' ||
-          type === 'TurnFailed'
-        ) {
-          return activeRuntimeSessionIdRef.current;
-        }
         return null;
       };
+
+      const runtimeEventMarksRunning = (type: string) => (
+        type === 'TurnPreparing' ||
+        type === 'CoreTurnStarted' ||
+        type === 'CoreExecutionTelemetry' ||
+        type === 'CoreItemUpdated' ||
+        type === 'CoreTerminalOutput' ||
+        type === 'DelegateRequested' ||
+        type === 'DelegateCompleted' ||
+        type === 'HyardJobObserved' ||
+        type === 'CoreOutputCompleted' ||
+        type === 'PeerTurnStarted' ||
+        type === 'PeerExecutionTelemetry' ||
+        type === 'PeerItemUpdated' ||
+        type === 'PeerTerminalOutput' ||
+        type === 'PeerOutputCompleted' ||
+        type === 'FinalizationStarted' ||
+        type === 'CallbackReceiptsInjected'
+      );
 
       const patchBackgroundRuntimeSnapshot = (sessionId: string, type: string, data: any) => {
         patchSessionUiSnapshot(sessionId, (previous) => {
@@ -2701,7 +2717,7 @@ function App() {
             ...previous,
             isGenerating: type === 'TurnCompleted' || type === 'TurnFailed'
               ? false
-              : previous.isGenerating || Boolean(activeRuntimeSessionIdRef.current === sessionId),
+              : runtimeEventMarksRunning(type) || previous.isGenerating,
             loadedAt: Date.now(),
           };
           const provider = normalizedString(data?.provider);
@@ -3062,14 +3078,14 @@ function App() {
             break;
 
           case 'CoreTurnStarted':
-            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
+            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? selectedSessionRef.current?.session_id);
             setActiveCoreText('');
             setActivePeerText('');
             setActiveNodes(['host', data.provider]);
             setActiveTurnIds([]);
             setActiveCoreTurnId(data.turn_id);
             if (data.turn_id) {
-              bindActiveAttachmentTurnFromRuntime(String(data.turn_id));
+              bindActiveAttachmentTurnFromRuntime(String(data.turn_id), eventSessionId ?? selectedSessionRef.current?.session_id);
             }
             resetRealtimeTerminalForTurn(data.turn_id);
             setHyardJobs({});
@@ -3082,7 +3098,7 @@ function App() {
           
           case 'CoreItemUpdated':
             if (data.turn_id) {
-              rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
+              rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? selectedSessionRef.current?.session_id);
               setActiveCoreTurnId((prev) => prev ?? data.turn_id);
               ensureRuntimeTurnPhase(data.turn_id, 'running');
               ensureRealtimeTerminalForTurn(data.turn_id);
@@ -3110,7 +3126,7 @@ function App() {
             break;
 
           case 'PeerTurnStarted':
-            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
+            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? selectedSessionRef.current?.session_id);
             setActiveNodes((prev) => prev.includes(data.provider) ? prev : [...prev, data.provider]);
             setActiveTurnIds((prev) => prev.includes(data.turn_id) ? prev : [...prev, data.turn_id]);
             setActivePeerName(data.provider);
@@ -3124,7 +3140,7 @@ function App() {
 
           case 'PeerItemUpdated':
             if (data.turn_id) {
-              rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
+              rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? selectedSessionRef.current?.session_id);
               setActivePeerTurnId((prev) => prev ?? data.turn_id);
               ensureRuntimeTurnPhase(data.turn_id, 'running');
               setActivePeerName((prev) => prev ?? data.provider);
@@ -3289,7 +3305,7 @@ function App() {
             break;
 
           case 'FinalizationStarted':
-            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? activeRuntimeSessionIdRef.current ?? selectedSessionRef.current?.session_id);
+            rememberRuntimeTurnSession(data.turn_id, eventSessionId ?? selectedSessionRef.current?.session_id);
             setActiveCoreText('');
             setActivePeerText('');
             setActivePeerName(null);
@@ -3535,7 +3551,9 @@ function App() {
 
   const handleCancel = async () => {
     try {
-      await invoke('cancel_turn');
+      await invoke('cancel_turn', {
+        sessionId: selectedSessionRef.current?.session_id ?? null,
+      });
       addLog(new Date().toLocaleTimeString(), 'sys', '取消指令已发送至智能体内核...');
     } catch (e) {
       addLog(new Date().toLocaleTimeString(), 'sys', `取消失败: ${e}`);
@@ -3625,7 +3643,6 @@ function App() {
     selectedSessionRef.current = null;
     sessionEventsCursorRef.current = {};
     sessionUiSnapshotsRef.current = {};
-    activeRuntimeSessionIdRef.current = null;
     runtimeTurnSessionIdRef.current = {};
     pendingAttachmentBindingsRef.current = [];
     activeAttachmentBindingIdRef.current = null;
@@ -3650,8 +3667,8 @@ function App() {
     clearRuntimeDispatch();
     setCanvasTabs([]);
     setActiveCanvasTabId(null);
-    isPreparingDispatchRef.current = false;
-    isDispatchingRef.current = false;
+    preparingSessionIdsRef.current.clear();
+    dispatchingSessionIdsRef.current.clear();
     setIsGenerating(false);
     messageQueueRef.current = [];
     setMessageQueue([]);
@@ -3676,33 +3693,6 @@ function App() {
     const [nextMessage, ...rest] = pending;
     setQueuedMessagesForSession(sessionId, rest);
     return nextMessage;
-  };
-
-  const takeNextQueuedDispatch = (): { session: Session; payload: SendPayload } | null => {
-    const knownSessions = sessionsRef.current;
-    const selectedId = selectedSessionRef.current?.session_id;
-    const orderedSessionIds = [
-      selectedId,
-      ...Object.keys(sessionUiSnapshotsRef.current),
-    ].filter((value, index, array): value is string => (
-      typeof value === 'string' &&
-      value.length > 0 &&
-      array.indexOf(value) === index
-    ));
-
-    for (const sessionId of orderedSessionIds) {
-      const payload = takeNextQueuedMessage(sessionId);
-      if (!payload) continue;
-      const session = knownSessions.find((item) => item.session_id === sessionId)
-        ?? (selectedSessionRef.current?.session_id === sessionId ? selectedSessionRef.current : null);
-      if (session) {
-        return { session, payload };
-      }
-      // If the backing session was deleted between queueing and dispatch,
-      // drop only this orphaned message and continue looking for valid work.
-      addLog(new Date().toLocaleTimeString(), 'sys', `Dropped queued message for missing session ${sessionId}`);
-    }
-    return null;
   };
 
   const loadSessions = async (workspaceOverride?: Workspace | null) => {
@@ -3822,7 +3812,13 @@ function App() {
     }
   };
 
-  const isSendPipelineBusy = () => isPreparingDispatchRef.current || isDispatchingRef.current;
+  const isSessionSendPipelineBusy = (sessionId: string | null | undefined) => {
+    if (!sessionId) return false;
+    return (
+      preparingSessionIdsRef.current.has(sessionId) ||
+      dispatchingSessionIdsRef.current.has(sessionId)
+    );
+  };
 
   const runSingleMessage = async (sessionForSend: Session, payload: SendPayload) => {
     const targetSessionId = sessionForSend.session_id;
@@ -3871,7 +3867,6 @@ function App() {
       }));
     };
 
-    activeRuntimeSessionIdRef.current = targetSessionId;
     const message = stripAttachmentReferences(payload.text);
     const imagePaths = payload.imagePaths;
     const filePaths = payload.filePaths ?? [];
@@ -4038,15 +4033,16 @@ function App() {
   };
 
   const dispatchMessage = async (sessionForSend: Session, initialPayload: SendPayload) => {
-    if (isSendPipelineBusy()) {
+    const targetSessionId = sessionForSend.session_id;
+    if (isSessionSendPipelineBusy(targetSessionId)) {
       enqueueQueuedMessage(initialPayload, sessionForSend.session_id);
       return;
     }
-    isDispatchingRef.current = true;
-    if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
+    dispatchingSessionIdsRef.current.add(targetSessionId);
+    if (selectedSessionRef.current?.session_id === targetSessionId) {
       setIsGenerating(true);
     } else {
-      patchSessionUiSnapshot(sessionForSend.session_id, { isGenerating: true });
+      patchSessionUiSnapshot(targetSessionId, { isGenerating: true });
     }
     let payload: SendPayload | null = initialPayload;
     try {
@@ -4057,22 +4053,21 @@ function App() {
         // in-flight flag between turns. This avoids the old recursive gap where
         // a rapid send at provider-completion time could slip through as a
         // second overlapping `run_turn` instead of joining the queue.
-        payload = takeNextQueuedMessage(sessionForSend.session_id);
+        payload = takeNextQueuedMessage(targetSessionId);
         if (payload) {
           addLog(
             new Date().toLocaleTimeString(),
             'sys',
-            `Dispatching queued message (${getQueuedMessagesForSession(sessionForSend.session_id).length} remaining): ${describeSendPayload(payload)}`,
+            `Dispatching queued message (${getQueuedMessagesForSession(targetSessionId).length} remaining): ${describeSendPayload(payload)}`,
           );
         }
       }
     } finally {
-      isDispatchingRef.current = false;
-      activeRuntimeSessionIdRef.current = null;
-      if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
+      dispatchingSessionIdsRef.current.delete(targetSessionId);
+      if (selectedSessionRef.current?.session_id === targetSessionId) {
         setIsGenerating(false);
       } else {
-        patchSessionUiSnapshot(sessionForSend.session_id, {
+        patchSessionUiSnapshot(targetSessionId, {
           isGenerating: false,
           activeCoreTurnId: null,
           activePeerTurnId: null,
@@ -4082,10 +4077,6 @@ function App() {
           runtimeDispatchStartedAt: null,
           runtimePreparingPhase: null,
         });
-      }
-      const nextQueuedDispatch = takeNextQueuedDispatch();
-      if (nextQueuedDispatch) {
-        void dispatchMessage(nextQueuedDispatch.session, nextQueuedDispatch.payload);
       }
     }
   };
@@ -4302,29 +4293,24 @@ function App() {
       return;
     }
 
-    // If a turn is already running, queue this message under the currently
-    // selected session. The dispatcher drains queues per session, so a message
-    // typed in Session B while Session A is busy cannot accidentally execute
-    // inside Session A's context.
-    if (isSendPipelineBusy()) {
-      const queuedSessionId = selectedSessionRef.current?.session_id;
-      if (!queuedSessionId) {
-        restoreText?.(rawPayload.text);
-        appendSystemNote('A turn is already running. Select a session before queueing another message.');
-        return;
-      }
-      enqueueQueuedMessage(payload, queuedSessionId);
-      return;
-    }
-
     // No session yet? Mint one on the fly using the current core
     // provider — same path the Sidebar's "+ New" button takes — then
     // dispatch the message into it. This is what the user expects
     // when typing into a fresh workspace: just send, don't make me
     // click "New Session" first.
-    let target = selectedSession;
+    let target = selectedSessionRef.current ?? selectedSession;
+    if (target && isSessionSendPipelineBusy(target.session_id)) {
+      enqueueQueuedMessage(payload, target.session_id);
+      return;
+    }
+
     if (!target) {
-      isPreparingDispatchRef.current = true;
+      if (isSessionSendPipelineBusy(NEW_SESSION_PIPELINE_ID)) {
+        restoreText?.(rawPayload.text);
+        appendSystemNote('正在创建新会话，请稍后再发送。');
+        return;
+      }
+      preparingSessionIdsRef.current.add(NEW_SESSION_PIPELINE_ID);
       setIsGenerating(true);
       try {
         const created = await invoke<Session>('create_session', {
@@ -4348,13 +4334,17 @@ function App() {
         appendSystemNote(`Failed to create session: ${e}`);
         // Restore the user's text so they can retry without retyping.
         restoreText?.(rawPayload.text);
-        isPreparingDispatchRef.current = false;
         setIsGenerating(false);
         return;
+      } finally {
+        preparingSessionIdsRef.current.delete(NEW_SESSION_PIPELINE_ID);
       }
-      isPreparingDispatchRef.current = false;
     }
 
+    if (isSessionSendPipelineBusy(target.session_id)) {
+      enqueueQueuedMessage(payload, target.session_id);
+      return;
+    }
     void dispatchMessage(target, payload);
   };
 
@@ -4410,7 +4400,7 @@ function App() {
           : extractFilePathsFromAttachmentReferences(newText),
         attachments: attachments.length > 0 ? attachments : undefined,
       };
-      if (isSendPipelineBusy()) {
+      if (isSessionSendPipelineBusy(sessionForSend.session_id)) {
         enqueueQueuedMessage(payload, sessionForSend.session_id);
       } else {
         void dispatchMessage(sessionForSend, payload);
@@ -4464,7 +4454,7 @@ function App() {
           : extractFilePathsFromAttachmentReferences(message),
         attachments: attachments.length > 0 ? attachments : undefined,
       };
-      if (isSendPipelineBusy()) {
+      if (isSessionSendPipelineBusy(sessionForSend.session_id)) {
         enqueueQueuedMessage(payload, sessionForSend.session_id);
       } else {
         void dispatchMessage(sessionForSend, payload);
@@ -4637,9 +4627,8 @@ function App() {
       runtimeTurnSessionIdRef.current = Object.fromEntries(
         Object.entries(runtimeTurnSessionIdRef.current).filter(([, value]) => value !== sessionId),
       );
-      if (activeRuntimeSessionIdRef.current === sessionId) {
-        activeRuntimeSessionIdRef.current = null;
-      }
+      preparingSessionIdsRef.current.delete(sessionId);
+      dispatchingSessionIdsRef.current.delete(sessionId);
       setSessions((prev) => {
         const next = prev.filter((s) => s.session_id !== sessionId);
         if (selectedSession?.session_id === sessionId) {

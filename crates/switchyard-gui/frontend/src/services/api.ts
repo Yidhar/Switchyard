@@ -70,8 +70,8 @@ export const resolveToolApproval = (
   return invoke<void>('resolve_tool_approval', { requestId, decision, reason });
 };
 
-export const cancelTurn = (): Promise<void> => {
-  return invoke<void>('cancel_turn');
+export const cancelTurn = (sessionId?: string | null): Promise<void> => {
+  return invoke<void>('cancel_turn', { sessionId: sessionId ?? null });
 };
 
 export const updateSessionPeers = (sessionId: string, enabledPeers: string[]): Promise<void> => {
