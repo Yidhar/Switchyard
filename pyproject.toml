@@ -1,0 +1,23 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [
+    ".switchyard",
+    "crates/switchyard-gui/frontend/dist",
+    "crates/switchyard-gui/frontend/node_modules",
+    "docs",
+    "target",
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812", # Ruff formatter manages trailing commas.
+    "CPY001", # The repository license is declared once; per-file notices are not required.
+    "D203", # Keep pydocstyle compatible with D211.
+    "D213", # Keep pydocstyle compatible with D212.
+    "ISC001", # Ruff formatter manages implicit string concatenation layout.
+]
+
+[tool.ruff.format]
+line-ending = "lf"

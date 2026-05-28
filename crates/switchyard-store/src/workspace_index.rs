@@ -45,7 +45,7 @@ impl WorkspaceIndex {
             Ok(s) if !s.trim().is_empty() => {
                 let mut idx: Self = serde_json::from_str(&s)?;
                 idx.workspaces
-                    .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                    .sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
                 Ok(idx)
             }
             Ok(_) => Ok(Self::default()),

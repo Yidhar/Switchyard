@@ -2,7 +2,7 @@
 
 > A local command center for AI coding CLIs.
 
-Switchyard 把你已经安装并登录好的 **Codex CLI**、**Claude Code**、**Gemini CLI** 和 **Antigravity CLI** 放到同一个本地工作台里。你可以用 CLI、TUI 或桌面 GUI 与不同 provider 对话、切换 sandbox 权限、查看流式输出与文件变更，并在需要时把子任务委托给其他 provider 在后台执行。
+Switchyard 把你已经安装并登录好的 **Codex CLI**、**Claude Code**、**Gemini CLI** 和 **Antigravity CLI** 放到同一个本地工作台里。普通用户推荐优先使用桌面 App/GUI：它能可视化管理多会话、切换 sandbox 权限、查看流式输出与文件变更，并支持图片/文件附件。CLI、TUI 和 HYARD bridge 更适合终端用户、脚本自动化和高级协作场景。
 
 Switchyard 不托管模型，也不替代任何厂商账号、订阅、登录或安全策略。它是一层运行在你本机的路由、会话、工作区和协作界面。
 
@@ -24,7 +24,7 @@ Switchyard 目前处于早期可用阶段，适合愿意从源码构建、并且
 
 - Provider CLI 需要你自行安装、登录并放入 `PATH`。
 - 默认优先支持 Windows 本地使用；Rust workspace 本身尽量保持跨平台。
-- 桌面 GUI 目前以源码/dev 方式启动，正式安装包会在发布流程稳定后提供。
+- 推荐入口是桌面 App/GUI。当前可以通过源码/dev 方式启动；CI 也会尝试自动构建 Windows App artifact，正式安装包会在发布流程稳定后优先提供。
 
 ## 支持的 provider
 
@@ -89,9 +89,35 @@ target\release\switchyard.exe
 
 下文为了简洁统一使用 `switchyard` 作为命令名；如果你没有安装到 `PATH`，请替换为实际路径或 `./switchyard.cmd`。
 
-## 快速开始
+## 快速开始（推荐 App 优先）
 
-### 1. 检查 provider 与配置
+### 1. 打开桌面 App
+
+Windows 源码环境可以直接运行：
+
+```powershell
+.\start-gui.ps1
+```
+
+这个脚本会：
+
+1. 检查 GUI 前端依赖；如果缺失则执行 `npm install`。
+2. 启动 Vite dev server。
+3. 启动 Tauri 桌面窗口。
+4. GUI 关闭后清理后台 dev server。
+
+推荐从 App 开始，因为它更适合日常使用：
+
+- 选择或隔离不同 workspace / session。
+- 在发送前快速切换 `read-only`、`workspace-write`、`danger-full-access` sandbox。
+- 查看流式正文、工具运行状态、文件编辑摘要和 diff。
+- 处理长会话、大历史和大 diff 的虚拟化展示。
+- 粘贴截图、拖拽文件/图片，并在消息区查看附件预览。
+- 在多个 session 间切换，同时保持后端任务继续运行。
+
+### 2. 检查 provider 与配置
+
+App 启动前后，都建议确认至少一个 provider CLI 已安装并登录：
 
 ```bash
 switchyard check
@@ -103,7 +129,7 @@ switchyard check
 switchyard check --json
 ```
 
-### 2. 运行单次任务
+### 3. 可选：运行单次 CLI 任务
 
 使用默认 provider：
 
@@ -135,36 +161,35 @@ switchyard run \
   --message "Update the integration code that depends on ../shared"
 ```
 
-### 3. 打开终端界面
+### 4. 可选：打开终端界面
 
 ```bash
 switchyard tui
-```
-
-常用选项：
-
-```bash
 switchyard tui --provider codex
 switchyard tui --resume-latest
 switchyard tui --session <session-id-or-prefix>
 ```
 
-### 4. 打开桌面 GUI
+## App 打包与发布
 
-Windows 源码环境可以直接运行：
+每次推送到 `main` / `master` 或创建 pull request 时，GitHub Actions 会执行 Windows CI：
+
+- Ruff format/lint：检查 Python 辅助脚本和 CI 合约测试。
+- Rust format、Clippy、workspace tests。
+- Tauri Windows App 打包，产物上传为 `switchyard-windows-app` artifact。
+
+如果你只想从源码本地打包 App，可以在安装前端依赖后运行：
 
 ```powershell
-.\start-gui.ps1
+cd crates\switchyard-gui
+npm --prefix frontend install
+npm run build
+.\frontend\node_modules\.bin\tauri.cmd build --bundles nsis --ci
 ```
 
-这个脚本会：
+本地生成 NSIS 安装包需要系统里可用 `makensis`。如果只想验证 release 版 App 是否能编译，可以把最后一行改为 `.\frontend\node_modules\.bin\tauri.cmd build --no-bundle --ci`。
 
-1. 检查 GUI 前端依赖；如果缺失则执行 `npm install`。
-2. 启动 Vite dev server。
-3. 启动 Tauri 桌面窗口。
-4. GUI 关闭后清理后台 dev server。
-
-GUI 适合需要可视化管理多会话、查看文件 diff、处理图片/附件、切换 sandbox 权限以及同时观察多个 session 运行状态的场景。
+正式 release 稳定后，普通用户应优先下载桌面 App 安装包；CLI/TUI 仍会保留给脚本和终端工作流。
 
 ## 配置
 
