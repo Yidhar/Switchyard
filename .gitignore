@@ -23,3 +23,9 @@ Thumbs.db
 .idea/
 *.local
 .env
+
+# Local AI/agent tool state
+/.claude/
+/.antigravitycli/
+/.antigravity/
+/.codex/
