@@ -17,6 +17,8 @@ REQUIRED_SNIPPETS = (
     "ruff check .",
     "tags:",
     '"v*"',
+    'paths-ignore:\n      - "README.md"\n      - "docs/**"',
+    'pull_request:\n    paths-ignore:\n      - "README.md"\n      - "docs/**"',
     "tauri-apps/tauri-action",
     "actions/upload-artifact@v4",
     "contents: write",
