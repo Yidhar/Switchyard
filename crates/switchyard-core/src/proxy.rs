@@ -22,6 +22,7 @@ pub struct PersistentProviderProxy {
     session_id: Uuid,
     inner: Box<dyn Provider>,
     registry: Option<Arc<dyn LiveInstanceRegistry>>,
+    runtime_tx: Option<mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
     results: Arc<Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
 }
 
@@ -32,13 +33,64 @@ impl PersistentProviderProxy {
         inner: Box<dyn Provider>,
         registry: Option<Arc<dyn LiveInstanceRegistry>>,
     ) -> Self {
+        Self::new_with_runtime_events(provider_name, session_id, inner, registry, None)
+    }
+
+    pub fn new_with_runtime_events(
+        provider_name: impl Into<String>,
+        session_id: Uuid,
+        inner: Box<dyn Provider>,
+        registry: Option<Arc<dyn LiveInstanceRegistry>>,
+        runtime_tx: Option<mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
+    ) -> Self {
         Self {
             provider_name: provider_name.into(),
             session_id,
             inner,
             registry,
+            runtime_tx,
             results: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn forward_runtime_event(&self, event: crate::runtime_events::RuntimeEvent) {
+        let Some(tx) = self.runtime_tx.as_ref() else {
+            return;
+        };
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(event).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    fn emit_worker_state(
+        &self,
+        instance_id: Uuid,
+        state: impl Into<String>,
+        in_flight_turn_id: Option<Uuid>,
+    ) {
+        self.forward_runtime_event(crate::runtime_events::RuntimeEvent::WorkerStateChanged {
+            session_id: self.session_id,
+            instance_id,
+            state: state.into(),
+            in_flight_turn_id,
+        });
+    }
+
+    fn emit_worker_terminated(&self, instance_id: Uuid, reason: impl Into<String>) {
+        self.forward_runtime_event(crate::runtime_events::RuntimeEvent::WorkerTerminated {
+            session_id: self.session_id,
+            instance_id,
+            provider: self.provider_name.clone(),
+            label: None,
+            reason: reason.into(),
+        });
     }
 }
 
@@ -62,9 +114,11 @@ impl Provider for PersistentProviderProxy {
                 reg.checkout_any_idle(&self.provider_name, self.session_id)
         {
             reg.update_state(instance_id, InstanceState::Busy { turn_id });
+            self.emit_worker_state(instance_id, "busy", Some(turn_id));
             let mut inst = inst_lock.lock().await;
             if let Err(e) = inst.update_context(context).await {
                 reg.release(instance_id);
+                self.emit_worker_state(instance_id, "idle", None);
                 return Err(ProviderError::ExecutionFailed(format!(
                     "Failed to sync context to persistent instance: {e}"
                 )));
@@ -81,6 +135,7 @@ impl Provider for PersistentProviderProxy {
                 Ok(rx) => rx,
                 Err(e) => {
                     reg.release(instance_id);
+                    self.emit_worker_state(instance_id, "idle", None);
                     return Err(ProviderError::ExecutionFailed(format!(
                         "Failed to execute on persistent instance: {e}"
                     )));
@@ -131,8 +186,17 @@ impl Provider for PersistentProviderProxy {
 
             if timed_out || cancelled_by_user {
                 reg.terminate(instance_id);
+                self.emit_worker_terminated(
+                    instance_id,
+                    if timed_out {
+                        "turn_timeout"
+                    } else {
+                        "cancelled_by_user"
+                    },
+                );
             } else {
                 reg.release(instance_id);
+                self.emit_worker_state(instance_id, "idle", None);
             }
 
             if timed_out {

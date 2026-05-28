@@ -3099,11 +3099,12 @@ async fn run_turn(
     }
 
     let registry_dyn: Arc<dyn switchyard_provider_api::LiveInstanceRegistry> = pool.inner().clone();
-    let core_proxy = switchyard_core::PersistentProviderProxy::new(
+    let core_proxy = switchyard_core::PersistentProviderProxy::new_with_runtime_events(
         provider.clone(),
         session.session_id,
         provider_impl,
         Some(registry_dyn.clone()),
+        Some(tx.clone()),
     );
 
     tx.send(switchyard_core::RuntimeEvent::TurnPreparing {
