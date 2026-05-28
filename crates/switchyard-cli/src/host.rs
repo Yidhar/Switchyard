@@ -33,6 +33,10 @@ use switchyard_host_jobs::{
     HostJobState, HostJobStatus, HostJobStore, HostJobWorkerMode, load_job_with_refresh,
 };
 use switchyard_provider_api::{CancellationToken, PromptMode, Provider};
+use switchyard_runtime::{
+    CreateHostJob, HostJobMutation as RuntimeHostJobMutation,
+    HostJobStatus as RuntimeHostJobStatus, RuntimeDb,
+};
 use switchyard_session::{InboxDeliveryMode, InboxEntry, InboxStatus, Session, TurnStatus};
 use switchyard_store::{
     ArtifactStore, SessionCatalog, SessionInboxRepository, SessionRepository, StoreHandle,
@@ -166,6 +170,196 @@ fn open_configured_store(config: &SwitchyardConfig, cwd: &Path) -> Result<StoreH
         .map_err(|err| format!("open store: {err}"))
 }
 
+fn runtime_host_job_client_request_id(job_id: Uuid) -> String {
+    format!("host-job:{job_id}")
+}
+
+fn runtime_owner_session_id(job: &HostJobState) -> Option<Uuid> {
+    job.callback_session_id.or(job.session_id)
+}
+
+fn runtime_worker_mode(job: &HostJobState) -> Option<String> {
+    job.worker_mode.map(|mode| match mode {
+        HostJobWorkerMode::Inline => "inline".to_string(),
+        HostJobWorkerMode::Subprocess => "subprocess".to_string(),
+    })
+}
+
+fn runtime_status_from_host_job(job: &HostJobState) -> RuntimeHostJobStatus {
+    let worker_boot_event = matches!(
+        job.last_event.as_deref(),
+        Some("worker_launching") | Some("worker_spawned") | Some("worker_booting")
+    );
+    match job.status {
+        HostJobStatus::Queued if worker_boot_event => RuntimeHostJobStatus::WorkerBooting,
+        HostJobStatus::Queued => RuntimeHostJobStatus::Queued,
+        HostJobStatus::Running if worker_boot_event => RuntimeHostJobStatus::WorkerBooting,
+        HostJobStatus::Running => RuntimeHostJobStatus::Running,
+        HostJobStatus::CancelRequested => RuntimeHostJobStatus::CancelRequested,
+        HostJobStatus::Completed => RuntimeHostJobStatus::Completed,
+        HostJobStatus::Failed => RuntimeHostJobStatus::Failed,
+        HostJobStatus::Cancelled => RuntimeHostJobStatus::Cancelled,
+    }
+}
+
+fn runtime_host_job_payload(job: &HostJobState, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "reason": reason,
+        "job_id": job.job_id.to_string(),
+        "provider": job.provider,
+        "status": job.status.to_string(),
+        "runtime_status": runtime_status_from_host_job(job).to_string(),
+        "worker_mode": runtime_worker_mode(job),
+        "pid": job.pid,
+        "owner_session_id": runtime_owner_session_id(job).map(|id| id.to_string()),
+        "worker_session_id": job.session_id.map(|id| id.to_string()),
+        "callback_session_id": job.callback_session_id.map(|id| id.to_string()),
+        "turn_id": job.turn_id.map(|id| id.to_string()),
+        "last_event": job.last_event,
+        "wait_timeout_count": job.wait_timeout_count,
+        "result_ready": job.result_ready,
+        "artifact_count": job.artifact_count,
+        "summary": job.result_summary,
+        "error": job.error,
+    })
+}
+
+fn build_runtime_create_host_job(job: &HostJobState, source: &str, reason: &str) -> CreateHostJob {
+    let mut input = CreateHostJob::new(job.provider.clone(), job.task.clone(), job.cwd.clone())
+        .with_job_id(job.job_id)
+        .with_client_request_id(runtime_host_job_client_request_id(job.job_id))
+        .with_source(source.to_string())
+        .with_payload(runtime_host_job_payload(job, reason));
+    input.owner_session_id = runtime_owner_session_id(job);
+    input.callback_session_id = job.callback_session_id;
+    input.worker_mode = runtime_worker_mode(job);
+    input
+}
+
+fn apply_runtime_host_job_mutation(mutation: &mut RuntimeHostJobMutation, job: &HostJobState) {
+    mutation.owner_session_id = runtime_owner_session_id(job);
+    mutation.callback_session_id = job.callback_session_id;
+    mutation.status = runtime_status_from_host_job(job);
+    mutation.worker_mode = runtime_worker_mode(job);
+    mutation.pid = job.pid;
+    mutation.wait_timeout_count = job.wait_timeout_count;
+    mutation.last_event = job.last_event.clone();
+    mutation.last_output_preview = job.last_output_preview.clone();
+    mutation.result_ready = job.result_ready;
+    mutation.artifact_count = job.artifact_count;
+    mutation.result_summary = job.result_summary.clone();
+    mutation.error = job.error.clone();
+    mutation.worker_session_id = job.session_id;
+    mutation.turn_id = job.turn_id;
+    mutation.callback_inbox_id = job.callback_inbox_id;
+    mutation.callback_emitted_at = job.callback_emitted_at;
+    mutation.started_at = job.started_at;
+    mutation.completed_at = job.completed_at;
+    mutation.last_heartbeat_at = Some(job.updated_at);
+}
+
+fn create_runtime_host_job(
+    config: &SwitchyardConfig,
+    cwd: &Path,
+    job: &HostJobState,
+) -> Result<(), String> {
+    let runtime_db_path = config.runtime_db_path(cwd);
+    create_runtime_host_job_at_path(&runtime_db_path, job)
+}
+
+fn create_runtime_host_job_at_path(
+    runtime_db_path: &Path,
+    job: &HostJobState,
+) -> Result<(), String> {
+    let mut db = RuntimeDb::open(runtime_db_path)
+        .map_err(|err| format!("open runtime db '{}': {err}", runtime_db_path.display()))?;
+    db.create_host_job(build_runtime_create_host_job(job, "hyard_host", "created"))
+        .map(|_| ())
+        .map_err(|err| format!("create runtime host job '{}': {err}", job.job_id))
+}
+
+fn ensure_runtime_host_job_exists(db: &mut RuntimeDb, job: &HostJobState) -> Result<(), String> {
+    if db
+        .get_host_job(job.job_id)
+        .map_err(|err| format!("load runtime host job '{}': {err}", job.job_id))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    db.create_host_job(build_runtime_create_host_job(
+        job,
+        "hyard_host",
+        "recovered_from_manifest",
+    ))
+    .map(|_| ())
+    .map_err(|err| format!("create runtime host job '{}': {err}", job.job_id))
+}
+
+fn sync_runtime_host_job_at_path(
+    runtime_db_path: &Path,
+    job: &HostJobState,
+    event_type: &'static str,
+    source: &'static str,
+) -> Result<(), String> {
+    let mut db = RuntimeDb::open(runtime_db_path)
+        .map_err(|err| format!("open runtime db '{}': {err}", runtime_db_path.display()))?;
+    ensure_runtime_host_job_exists(&mut db, job)?;
+    let payload = runtime_host_job_payload(job, event_type);
+    db.transition_host_job(job.job_id, event_type, source, payload, |mutation| {
+        apply_runtime_host_job_mutation(mutation, job);
+    })
+    .map(|_| ())
+    .map_err(|err| format!("sync runtime host job '{}': {err}", job.job_id))
+}
+
+fn sync_runtime_host_job_or_warn(
+    config: &SwitchyardConfig,
+    cwd: &Path,
+    job: &HostJobState,
+    event_type: &'static str,
+) {
+    let runtime_db_path = config.runtime_db_path(cwd);
+    sync_runtime_host_job_at_path_or_warn(&runtime_db_path, job, event_type, "hyard_host");
+}
+
+fn sync_runtime_host_job_at_path_or_warn(
+    runtime_db_path: &Path,
+    job: &HostJobState,
+    event_type: &'static str,
+    source: &'static str,
+) {
+    if let Err(err) = sync_runtime_host_job_at_path(runtime_db_path, job, event_type, source) {
+        eprintln!("[hyard] WARNING: {err}");
+    }
+}
+
+fn runtime_host_job_event_type_for_runtime_event(event: &RuntimeEvent) -> Option<&'static str> {
+    match event {
+        RuntimeEvent::TurnPreparing { .. } => Some("host_job.turn_preparing"),
+        RuntimeEvent::CoreTurnStarted { .. } => Some("host_job.turn_started"),
+        RuntimeEvent::CoreExecutionTelemetry { .. } => Some("host_job.execution_resolved"),
+        RuntimeEvent::CoreOutputCompleted { .. } => Some("host_job.output_completed"),
+        RuntimeEvent::TurnCompleted { .. } => Some("host_job.turn_completed"),
+        RuntimeEvent::TurnFailed { .. } => Some("host_job.turn_failed"),
+        RuntimeEvent::CoreItemUpdated { .. } | RuntimeEvent::CoreTerminalOutput { .. } => None,
+        RuntimeEvent::CallbackReceiptsInjected { .. }
+        | RuntimeEvent::DelegateRequested { .. }
+        | RuntimeEvent::HyardJobObserved { .. }
+        | RuntimeEvent::PeerExecutionTelemetry { .. }
+        | RuntimeEvent::PeerTurnStarted { .. }
+        | RuntimeEvent::PeerItemUpdated { .. }
+        | RuntimeEvent::PeerTerminalOutput { .. }
+        | RuntimeEvent::DelegateCompleted { .. }
+        | RuntimeEvent::PeerOutputCompleted { .. }
+        | RuntimeEvent::FinalizationStarted { .. }
+        | RuntimeEvent::WorkerSpawned { .. }
+        | RuntimeEvent::WorkerStateChanged { .. }
+        | RuntimeEvent::WorkerRetrying { .. }
+        | RuntimeEvent::WorkerTerminated { .. } => None,
+    }
+}
+
 /// Execute `switchyard host list` — list available peers with probe status.
 pub async fn host_list(registry: &ProviderRegistry, config: &SwitchyardConfig) {
     let catalog = build_peer_catalog_probed(
@@ -269,6 +463,10 @@ pub async fn host_delegate_with_wait(
         print_error("execution_failed", &format!("job init: {err}"));
         std::process::exit(1);
     }
+    if let Err(err) = create_runtime_host_job(config, cwd, &job) {
+        print_error("execution_failed", &err);
+        std::process::exit(1);
+    }
 
     let launch_start = Instant::now();
     let launch_result = if should_run_worker_inline() {
@@ -276,7 +474,9 @@ pub async fn host_delegate_with_wait(
         {
             Ok(prepared) => prepared,
             Err(err) => {
-                mark_job_failed(&job_store, job.job_id, &err);
+                if let Some(failed) = mark_job_failed(&job_store, job.job_id, &err) {
+                    sync_runtime_host_job_or_warn(config, cwd, &failed, "host_job.failed");
+                }
                 print_error("execution_failed", &err);
                 std::process::exit(1);
             }
@@ -284,9 +484,17 @@ pub async fn host_delegate_with_wait(
 
         let job_store_for_task = job_store.clone();
         let job_id = job.job_id;
+        let runtime_db_path_for_task = config.runtime_db_path(cwd);
         tokio::spawn(async move {
             if let Err(err) = run_host_job(job_store_for_task.clone(), job_id, prepared).await {
-                mark_job_failed(&job_store_for_task, job_id, &err);
+                if let Some(failed) = mark_job_failed(&job_store_for_task, job_id, &err) {
+                    sync_runtime_host_job_at_path_or_warn(
+                        &runtime_db_path_for_task,
+                        &failed,
+                        "host_job.failed",
+                        "hyard_host",
+                    );
+                }
             }
         });
 
@@ -296,12 +504,19 @@ pub async fn host_delegate_with_wait(
     };
 
     if let Err(err) = launch_result {
-        mark_job_failed(&job_store, job.job_id, &err);
+        if let Some(failed) = mark_job_failed(&job_store, job.job_id, &err) {
+            sync_runtime_host_job_or_warn(config, cwd, &failed, "host_job.failed");
+        }
         print_error("execution_failed", &err);
         std::process::exit(1);
     }
+    if let Ok(Some(launched)) = job_store.load(job.job_id) {
+        sync_runtime_host_job_or_warn(config, cwd, &launched, "host_job.worker_launched");
+    }
 
     emit_wait_result(
+        config,
+        cwd,
         &job_store,
         job.job_id,
         wait_secs,
@@ -348,17 +563,24 @@ pub async fn host_worker(
     }
 
     if job.status == HostJobStatus::CancelRequested {
-        let _ = job_store.update(parsed_job_id, |job| {
+        if let Ok(cancelled) = job_store.update(parsed_job_id, |job| {
             job.status = HostJobStatus::Cancelled;
             job.completed_at = Some(Utc::now());
             job.last_event = Some("cancelled_before_start".to_string());
             job.error = Some("cancelled".to_string());
-        });
+        }) {
+            sync_runtime_host_job_or_warn(
+                config,
+                cwd,
+                &cancelled,
+                "host_job.cancelled_before_start",
+            );
+        }
         return;
     }
 
     let worker_pid = std::process::id();
-    let _ = job_store.update(parsed_job_id, |job| {
+    if let Ok(booting) = job_store.update(parsed_job_id, |job| {
         job.pid = Some(worker_pid);
         if matches!(job.status, HostJobStatus::Queued) {
             job.status = HostJobStatus::Running;
@@ -369,19 +591,25 @@ pub async fn host_worker(
         if !job.status.is_terminal() {
             job.last_event = Some("worker_booting".to_string());
         }
-    });
+    }) {
+        sync_runtime_host_job_or_warn(config, cwd, &booting, "host_job.worker_booting");
+    }
 
     let prepared =
         match prepare_host_job_run(registry, config, &job.provider, &job.task, &job.cwd).await {
             Ok(prepared) => prepared,
             Err(err) => {
-                mark_job_failed(&job_store, parsed_job_id, &err);
+                if let Some(failed) = mark_job_failed(&job_store, parsed_job_id, &err) {
+                    sync_runtime_host_job_or_warn(config, cwd, &failed, "host_job.failed");
+                }
                 return;
             }
         };
 
     if let Err(err) = run_host_job(job_store.clone(), parsed_job_id, prepared).await {
-        mark_job_failed(&job_store, parsed_job_id, &err);
+        if let Some(failed) = mark_job_failed(&job_store, parsed_job_id, &err) {
+            sync_runtime_host_job_or_warn(config, cwd, &failed, "host_job.failed");
+        }
     }
 }
 
@@ -432,6 +660,8 @@ pub async fn host_await(config: &SwitchyardConfig, job_id: &str, cwd: &Path, tim
     }
 
     emit_wait_result(
+        config,
+        cwd,
         &job_store,
         parsed_job_id,
         timeout_secs,
@@ -526,6 +756,7 @@ pub async fn host_cancel(config: &SwitchyardConfig, job_id: &str, cwd: &Path) {
         }
     };
 
+    sync_runtime_host_job_or_warn(config, cwd, &updated, "host_job.cancel_requested");
     emit_json(&job_bridge_json("cancel", &updated));
 }
 
@@ -2352,6 +2583,8 @@ fn collapse_whitespace(value: &str) -> String {
 }
 
 async fn emit_wait_result(
+    config: &SwitchyardConfig,
+    cwd: &Path,
     job_store: &HostJobStore,
     job_id: Uuid,
     wait_secs: u64,
@@ -2375,6 +2608,7 @@ async fn emit_wait_result(
     timing.total_ms = clamp_millis_u64(total_start.elapsed());
 
     if job.status.is_terminal() {
+        sync_runtime_host_job_or_warn(config, cwd, &job, "host_job.observed_terminal");
         emit_json(&attach_timing(job_bridge_json(command, &job), timing));
         return;
     }
@@ -2389,6 +2623,7 @@ async fn emit_wait_result(
             process::exit(1);
         }
     };
+    sync_runtime_host_job_or_warn(config, cwd, &timed_out, "host_job.wait_timeout");
     emit_json(&attach_timing(
         wait_timeout_bridge_json(command, &timed_out),
         timing,
@@ -2722,13 +2957,14 @@ async fn run_host_job(
     job_id: Uuid,
     prepared: PreparedHostJobRun,
 ) -> Result<(), String> {
+    let runtime_db_path = prepared.config.runtime_db_path(&prepared.cwd);
     let preflight_job = job_store
         .load(job_id)
         .map_err(|err| format!("load job '{job_id}': {err}"))?
         .ok_or_else(|| format!("job '{job_id}' not found"))?;
 
     if preflight_job.status == HostJobStatus::CancelRequested {
-        job_store
+        let cancelled = job_store
             .update(job_id, |job| {
                 job.status = HostJobStatus::Cancelled;
                 job.completed_at = Some(Utc::now());
@@ -2736,6 +2972,12 @@ async fn run_host_job(
                 job.error = Some("cancelled".to_string());
             })
             .map_err(|err| format!("cancel job '{job_id}' before start: {err}"))?;
+        sync_runtime_host_job_at_path_or_warn(
+            &runtime_db_path,
+            &cancelled,
+            "host_job.cancelled_before_start",
+            "hyard_host",
+        );
         return Ok(());
     }
 
@@ -2749,7 +2991,7 @@ async fn run_host_job(
         .save_session(&session)
         .map_err(|err| format!("session init: {err}"))?;
 
-    job_store
+    let running_job = job_store
         .update(job_id, |job| {
             job.status = HostJobStatus::Running;
             if job.started_at.is_none() {
@@ -2759,15 +3001,34 @@ async fn run_host_job(
             job.last_event = Some("worker_started".to_string());
         })
         .map_err(|err| format!("mark job running: {err}"))?;
+    sync_runtime_host_job_at_path_or_warn(
+        &runtime_db_path,
+        &running_job,
+        "host_job.worker_started",
+        "hyard_host",
+    );
 
     let (runtime_tx, mut runtime_rx) = mpsc::channel(128);
     let cancel = CancellationToken::new();
 
     let event_store = job_store.clone();
     let event_job_id = job_id;
+    let runtime_db_path_for_events = runtime_db_path.clone();
     let event_task = tokio::spawn(async move {
         while let Some(event) = runtime_rx.recv().await {
-            let _ = event_store.update(event_job_id, |job| apply_runtime_event(job, &event));
+            let event_type = runtime_host_job_event_type_for_runtime_event(&event);
+            if let Ok(updated) =
+                event_store.update(event_job_id, |job| apply_runtime_event(job, &event))
+            {
+                if let Some(event_type) = event_type {
+                    sync_runtime_host_job_at_path_or_warn(
+                        &runtime_db_path_for_events,
+                        &updated,
+                        event_type,
+                        "hyard_host_runtime_observer",
+                    );
+                }
+            }
         }
     });
 
@@ -2857,6 +3118,26 @@ async fn run_host_job(
                 })
                 .map_err(|err| format!("write final job state '{job_id}': {err}"))?;
             emit_job_callback_receipt_if_needed(&mut store, &job_store, &final_job)?;
+            if let Ok(Some(callback_job)) = job_store.load(job_id) {
+                let event_type = if callback_job.callback_emitted_at.is_some() {
+                    "host_job.callback_emitted"
+                } else {
+                    "host_job.turn_finished"
+                };
+                sync_runtime_host_job_at_path_or_warn(
+                    &runtime_db_path,
+                    &callback_job,
+                    event_type,
+                    "hyard_host",
+                );
+            } else {
+                sync_runtime_host_job_at_path_or_warn(
+                    &runtime_db_path,
+                    &final_job,
+                    "host_job.turn_finished",
+                    "hyard_host",
+                );
+            }
             Ok(())
         }
         Err(err) => {
@@ -2877,6 +3158,26 @@ async fn run_host_job(
                 })
                 .map_err(|write_err| format!("write failed job state '{job_id}': {write_err}"))?;
             emit_job_callback_receipt_if_needed(&mut store, &job_store, &final_job)?;
+            if let Ok(Some(callback_job)) = job_store.load(job_id) {
+                let event_type = if callback_job.callback_emitted_at.is_some() {
+                    "host_job.callback_emitted"
+                } else {
+                    "host_job.turn_finished"
+                };
+                sync_runtime_host_job_at_path_or_warn(
+                    &runtime_db_path,
+                    &callback_job,
+                    event_type,
+                    "hyard_host",
+                );
+            } else {
+                sync_runtime_host_job_at_path_or_warn(
+                    &runtime_db_path,
+                    &final_job,
+                    "host_job.turn_finished",
+                    "hyard_host",
+                );
+            }
             Ok(())
         }
     }
@@ -2995,13 +3296,15 @@ fn legacy_turn_json(job_id: &str, turn: &switchyard_session::Turn) -> serde_json
     })
 }
 
-fn mark_job_failed(job_store: &HostJobStore, job_id: Uuid, message: &str) {
-    let _ = job_store.update(job_id, |job| {
-        job.status = HostJobStatus::Failed;
-        job.completed_at = Some(Utc::now());
-        job.error = Some(message.to_string());
-        job.last_event = Some("worker_failed".to_string());
-    });
+fn mark_job_failed(job_store: &HostJobStore, job_id: Uuid, message: &str) -> Option<HostJobState> {
+    job_store
+        .update(job_id, |job| {
+            job.status = HostJobStatus::Failed;
+            job.completed_at = Some(Utc::now());
+            job.error = Some(message.to_string());
+            job.last_event = Some("worker_failed".to_string());
+        })
+        .ok()
 }
 
 #[cfg(test)]
@@ -3391,6 +3694,76 @@ I have analyzed the current command surface.\n\
         assert_eq!(job.error.as_deref(), Some("provider crashed"));
         assert!(job.completed_at.is_some());
         assert!(!job.result_ready);
+    }
+
+    #[test]
+    fn runtime_host_job_status_maps_worker_boot_events() {
+        let mut job = HostJobState::new("claude", "task", PathBuf::from("."));
+        job.status = HostJobStatus::Running;
+        job.last_event = Some("worker_booting".to_string());
+
+        assert_eq!(
+            runtime_status_from_host_job(&job),
+            RuntimeHostJobStatus::WorkerBooting
+        );
+
+        job.last_event = Some("worker_started".to_string());
+        assert_eq!(
+            runtime_status_from_host_job(&job),
+            RuntimeHostJobStatus::Running
+        );
+    }
+
+    #[test]
+    fn runtime_host_job_sync_creates_and_transitions_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_db_path = dir.path().join("runtime.sqlite3");
+        let session_id = Uuid::now_v7();
+        let callback_session_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let mut job = HostJobState::new("claude", "review", PathBuf::from("E:/repo"));
+        job.worker_mode = Some(HostJobWorkerMode::Subprocess);
+        create_runtime_host_job_at_path(&runtime_db_path, &job).unwrap();
+
+        job.status = HostJobStatus::Running;
+        job.session_id = Some(session_id);
+        job.callback_session_id = Some(callback_session_id);
+        job.turn_id = Some(turn_id);
+        job.pid = Some(1234);
+        job.started_at = Some(Utc::now());
+        job.last_event = Some("worker_started".to_string());
+        sync_runtime_host_job_at_path(&runtime_db_path, &job, "host_job.worker_started", "test")
+            .unwrap();
+
+        job.status = HostJobStatus::Completed;
+        job.completed_at = Some(Utc::now());
+        job.result_ready = true;
+        job.result_summary = Some("done".to_string());
+        job.artifact_count = 2;
+        job.callback_inbox_id = Some(Uuid::now_v7());
+        job.callback_emitted_at = Some(Utc::now());
+        job.last_event = Some("turn_completed".to_string());
+        sync_runtime_host_job_at_path(&runtime_db_path, &job, "host_job.callback_emitted", "test")
+            .unwrap();
+
+        let db = RuntimeDb::open(&runtime_db_path).unwrap();
+        let record = db.get_host_job(job.job_id).unwrap().unwrap();
+        assert_eq!(record.status, RuntimeHostJobStatus::Completed);
+        assert_eq!(record.owner_session_id, Some(callback_session_id));
+        assert_eq!(record.callback_session_id, Some(callback_session_id));
+        assert_eq!(record.worker_session_id, Some(session_id));
+        assert_eq!(record.turn_id, Some(turn_id));
+        assert_eq!(record.pid, Some(1234));
+        assert_eq!(record.result_summary.as_deref(), Some("done"));
+        assert_eq!(record.artifact_count, 2);
+        assert!(record.result_ready);
+        assert!(record.callback_emitted_at.is_some());
+        assert!(
+            db.runtime_events_after(None, 0, 10)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == "host_job.callback_emitted")
+        );
     }
 
     #[test]

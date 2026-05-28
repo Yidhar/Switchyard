@@ -266,6 +266,20 @@ impl SwitchyardConfig {
         project_root.join(DOT_DIR).join("artifacts")
     }
 
+    /// Resolved runtime-authority SQLite database path.
+    ///
+    /// Runtime state is intentionally stored next to the HYARD job directory
+    /// rather than inside the session store.  This keeps the event-log authority
+    /// independent from the user-facing conversation backend while still
+    /// honoring absolute `session.directory = ".../sessions"` deployments that
+    /// place Switchyard state outside the project tree.
+    pub fn runtime_db_path(&self, project_root: &Path) -> PathBuf {
+        self.job_dir(project_root)
+            .parent()
+            .map(|parent| parent.join("runtime.sqlite3"))
+            .unwrap_or_else(|| project_root.join(DOT_DIR).join("runtime.sqlite3"))
+    }
+
     /// Additional sandbox allow-list paths resolved relative to
     /// `project_root`. The primary workspace directory is not included here;
     /// core policy builders add it automatically for `workspace-write`.
@@ -597,6 +611,13 @@ allowed_paths = ["../shared", "scratch"]
     }
 
     #[test]
+    fn runtime_db_path_defaults_next_to_jobs() {
+        let cfg = SwitchyardConfig::default();
+        let path = cfg.runtime_db_path(Path::new("/project"));
+        assert_eq!(path, PathBuf::from("/project/.switchyard/runtime.sqlite3"));
+    }
+
+    #[test]
     fn job_dir_uses_absolute_session_parent_when_named_sessions() {
         let mut cfg = SwitchyardConfig::default();
         cfg.session.directory = Some(PathBuf::from("/custom/sessions"));
@@ -605,11 +626,27 @@ allowed_paths = ["../shared", "scratch"]
     }
 
     #[test]
+    fn runtime_db_path_uses_absolute_session_parent_when_named_sessions() {
+        let mut cfg = SwitchyardConfig::default();
+        cfg.session.directory = Some(PathBuf::from("/custom/sessions"));
+        let path = cfg.runtime_db_path(Path::new("/project"));
+        assert_eq!(path, PathBuf::from("/custom/runtime.sqlite3"));
+    }
+
+    #[test]
     fn job_dir_falls_back_for_custom_session_name() {
         let mut cfg = SwitchyardConfig::default();
         cfg.session.directory = Some(PathBuf::from(".custom-sessions"));
         let dir = cfg.job_dir(Path::new("/project"));
         assert_eq!(dir, PathBuf::from("/project/.switchyard/jobs"));
+    }
+
+    #[test]
+    fn runtime_db_path_falls_back_for_custom_session_name() {
+        let mut cfg = SwitchyardConfig::default();
+        cfg.session.directory = Some(PathBuf::from(".custom-sessions"));
+        let path = cfg.runtime_db_path(Path::new("/project"));
+        assert_eq!(path, PathBuf::from("/project/.switchyard/runtime.sqlite3"));
     }
 
     #[test]

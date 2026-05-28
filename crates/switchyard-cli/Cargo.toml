@@ -23,6 +23,7 @@ switchyard-provider-claude = { workspace = true }
 switchyard-provider-gemini = { workspace = true }
 switchyard-provider-antigravity = { workspace = true }
 switchyard-provider-subprocess = { workspace = true }
+switchyard-runtime = { workspace = true }
 switchyard-tui = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
