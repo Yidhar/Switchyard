@@ -2858,7 +2858,9 @@ fn apply_runtime_event(job: &mut HostJobState, event: &RuntimeEvent) {
             job.status = HostJobStatus::Running;
             job.last_event = Some(format!("turn_preparing:{provider}:{phase}"));
         }
-        RuntimeEvent::CoreTurnStarted { turn_id, provider } => {
+        RuntimeEvent::CoreTurnStarted {
+            turn_id, provider, ..
+        } => {
             job.status = HostJobStatus::Running;
             job.turn_id = Some(*turn_id);
             job.last_event = Some(format!("turn_started:{provider}"));
@@ -2867,6 +2869,7 @@ fn apply_runtime_event(job: &mut HostJobState, event: &RuntimeEvent) {
             turn_id,
             provider,
             execution,
+            ..
         } => {
             job.status = HostJobStatus::Running;
             job.turn_id = Some(*turn_id);
@@ -2895,7 +2898,9 @@ fn apply_runtime_event(job: &mut HostJobState, event: &RuntimeEvent) {
             job.last_event = Some(format!("terminal_output:{provider}"));
             apply_live_job_preview(job, Some(text));
         }
-        RuntimeEvent::CoreOutputCompleted { turn_id, provider } => {
+        RuntimeEvent::CoreOutputCompleted {
+            turn_id, provider, ..
+        } => {
             job.turn_id = Some(*turn_id);
             job.last_event = Some(format!("output_completed:{provider}"));
         }
@@ -2903,6 +2908,7 @@ fn apply_runtime_event(job: &mut HostJobState, event: &RuntimeEvent) {
             turn_id,
             provider,
             response,
+            ..
         } => {
             job.turn_id = Some(*turn_id);
             job.last_event = Some(format!("turn_completed:{provider}"));
@@ -2912,6 +2918,7 @@ fn apply_runtime_event(job: &mut HostJobState, event: &RuntimeEvent) {
             turn_id,
             provider,
             error,
+            ..
         } => {
             job.turn_id = Some(*turn_id);
             job.last_event = Some(format!("turn_failed:{provider}"));
@@ -3277,6 +3284,7 @@ I have analyzed the current command surface.\n\
         apply_runtime_event(
             &mut job,
             &RuntimeEvent::CoreItemUpdated {
+                session_id: uuid::Uuid::nil(),
                 turn_id,
                 provider: "claude".to_string(),
                 event_type: "item_updated".to_string(),

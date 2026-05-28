@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[spike] turn/start sent, draining events until turn boundary…");
 
     let mut saw_turn_completed = false;
-    let mut started_at = std::time::Instant::now();
+    let started_at = std::time::Instant::now();
     loop {
         let timeout = Duration::from_secs(60).saturating_sub(started_at.elapsed());
         let frame = match tokio::time::timeout(timeout, frame_rx.recv()).await {
@@ -150,13 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Notification or response.
         if let Some(method) = frame.get("method").and_then(|m| m.as_str()) {
             println!("[notification {method}] {}", preview(&frame, 200));
-            if method.starts_with("turn/") {
-                if method == "turn/completed" || method == "turn/failed" {
-                    saw_turn_completed = true;
-                    started_at = std::time::Instant::now();
-                    println!("[spike] turn boundary: {method}");
-                    break;
-                }
+            if method.starts_with("turn/")
+                && (method == "turn/completed" || method == "turn/failed")
+            {
+                saw_turn_completed = true;
+                println!("[spike] turn boundary: {method}");
+                break;
             }
             continue;
         }

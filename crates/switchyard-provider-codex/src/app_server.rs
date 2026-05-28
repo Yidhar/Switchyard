@@ -1310,7 +1310,7 @@ fn is_approval_method(method: &str) -> bool {
 fn is_legacy_permissive_policy(policy: &ExecutionPolicy) -> bool {
     policy.write_access
         && policy.allowed_paths.is_empty()
-        && lexical_normalize(&policy.cwd) == PathBuf::from(".")
+        && lexical_normalize(&policy.cwd) == Path::new(".")
 }
 
 fn approval_request_id(turn_id: Uuid, rpc_id: &Value, method: &str) -> String {
@@ -1582,7 +1582,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir => match out.components().last() {
+            Component::ParentDir => match out.components().next_back() {
                 Some(Component::Normal(_)) => {
                     out.pop();
                 }

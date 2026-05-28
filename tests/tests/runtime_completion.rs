@@ -30,6 +30,7 @@ async fn drain_events(rx: &mut mpsc::Receiver<RuntimeEvent>) -> Vec<RuntimeEvent
 fn event_name(e: &RuntimeEvent) -> &'static str {
     match e {
         RuntimeEvent::CallbackReceiptsInjected { .. } => "CallbackReceiptsInjected",
+        RuntimeEvent::TurnPreparing { .. } => "TurnPreparing",
         RuntimeEvent::CoreTurnStarted { .. } => "CoreTurnStarted",
         RuntimeEvent::CoreExecutionTelemetry { .. } => "CoreExecutionTelemetry",
         RuntimeEvent::CoreItemUpdated { .. } => "CoreItemUpdated",
@@ -265,9 +266,9 @@ async fn flood_events_do_not_block_completion_milestones() {
     let mut session = Session::new("flood".to_string());
     store.save_session(&session).unwrap();
 
-    // Small runtime channel to verify milestones use send().await
-    // while streaming items use try_send (droppable).
-    // A background consumer drains rx so milestones don't deadlock.
+    // Small runtime channel plus a background consumer verify that both
+    // streaming items and milestones can be forwarded reliably without
+    // deadlocking completion.
     let provider = FloodProvider::new(500);
     let (tx, mut rx) = mpsc::channel::<RuntimeEvent>(16);
 
@@ -308,12 +309,10 @@ async fn flood_events_do_not_block_completion_milestones() {
     );
     assert!(names.contains(&"TurnCompleted"), "missing TurnCompleted");
 
-    // Some CoreItemUpdated may have been dropped — that's expected with try_send.
+    // CoreItemUpdated events are now forwarded reliably so the GUI does not
+    // appear silent during long-running turns.
     let item_count = names.iter().filter(|n| **n == "CoreItemUpdated").count();
-    assert!(
-        item_count < 500,
-        "expected some dropped items, got all {item_count}"
-    );
+    assert_eq!(item_count, 500, "expected all streamed items");
 
     assert!(
         elapsed < Duration::from_secs(5),

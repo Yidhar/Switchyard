@@ -1689,6 +1689,7 @@ impl App {
                 turn_id,
                 response,
                 provider,
+                ..
             } => {
                 if let Some(last) = self.turns.last_mut() {
                     last.turn_id = *turn_id;
@@ -4132,10 +4133,12 @@ mod tests {
         let core_turn_id = Uuid::now_v7();
         let peer_turn_id = Uuid::now_v7();
         runtime.apply(&RuntimeEvent::CoreTurnStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: core_turn_id,
             provider: "codex".to_string(),
         });
         runtime.apply(&RuntimeEvent::CoreItemUpdated {
+            session_id: uuid::Uuid::nil(),
             turn_id: core_turn_id,
             provider: "codex".to_string(),
             event_type: "item_updated".to_string(),
@@ -4143,16 +4146,19 @@ mod tests {
             payload: None,
         });
         runtime.apply(&RuntimeEvent::DelegateRequested {
+            session_id: uuid::Uuid::nil(),
             core_turn_id,
             peer: "claude".to_string(),
             role: "reviewer".to_string(),
             task_summary: "review".to_string(),
         });
         runtime.apply(&RuntimeEvent::PeerTurnStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: peer_turn_id,
             provider: "claude".to_string(),
         });
         runtime.apply(&RuntimeEvent::PeerItemUpdated {
+            session_id: uuid::Uuid::nil(),
             turn_id: peer_turn_id,
             provider: "claude".to_string(),
             event_type: "item_updated".to_string(),
@@ -4239,6 +4245,7 @@ mod tests {
     fn provider_message_view_prefers_terminal_transcript_when_available() {
         let mut runtime = RuntimeState::new("codex");
         runtime.apply(&RuntimeEvent::CoreItemUpdated {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "codex".to_string(),
             event_type: "item_updated".to_string(),
@@ -4246,6 +4253,7 @@ mod tests {
             payload: None,
         });
         runtime.apply(&RuntimeEvent::CoreTerminalOutput {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "codex".to_string(),
             text: "terminal line".to_string(),

@@ -527,11 +527,11 @@ fn accumulate_response_text_from_event_with_hint(
     // Raw protocol delta payloads should also append. This matters for live
     // adapters that forward native provider JSON instead of normalizing to
     // text_message first.
-    if let Some(delta) = payload.get("delta") {
-        if let Some(text) = delta_text(delta, text_protocol_hint) {
-            response_text.push_str(&text);
-            return;
-        }
+    if let Some(delta) = payload.get("delta")
+        && let Some(text) = delta_text(delta, text_protocol_hint)
+    {
+        response_text.push_str(&text);
+        return;
     }
 
     // Be tolerant of raw JSON-RPC notifications (`{ method, params: ... }`).

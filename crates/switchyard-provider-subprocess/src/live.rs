@@ -131,9 +131,6 @@ impl LiveInstance for SubprocessLiveInstance {
     }
 
     fn is_healthy(&mut self) -> bool {
-        match self.child.try_wait() {
-            Ok(None) => true,
-            _ => false,
-        }
+        matches!(self.child.try_wait(), Ok(None))
     }
 }

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use serde::{Deserialize, Serialize};
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data")]
 pub enum RuntimeEvent {

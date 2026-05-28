@@ -204,6 +204,7 @@ impl WorkerSupervisor {
     /// recipe's provider name — the supervisor uses it to spawn (and respawn)
     /// live instances. It must implement `PersistentProvider`; otherwise the
     /// supervisor returns immediately with `worker_died_permanently`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         provider: &dyn Provider,

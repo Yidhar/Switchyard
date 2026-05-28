@@ -1040,11 +1040,11 @@ fn update_accumulated_response_with_hint(
     }
 
     // 2. Check for delta updates (Codex/Claude delta)
-    if let Some(delta) = payload.get("delta") {
-        if let Some(t) = delta_text(delta, text_protocol_hint) {
-            accumulated.push_str(&t);
-            return;
-        }
+    if let Some(delta) = payload.get("delta")
+        && let Some(t) = delta_text(delta, text_protocol_hint)
+    {
+        accumulated.push_str(&t);
+        return;
     }
 
     if let Some(params) = payload.get("params") {

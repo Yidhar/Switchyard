@@ -79,10 +79,12 @@ mod tests {
 
     #[test]
     fn workspace_write_merges_and_dedups_allowed_paths() {
-        let mut config = SwitchyardConfig::default();
-        config.sandbox = SandboxConfig {
-            mode: SandboxMode::WorkspaceWrite,
-            allowed_paths: vec![PathBuf::from("../shared"), PathBuf::from(".")],
+        let config = SwitchyardConfig {
+            sandbox: SandboxConfig {
+                mode: SandboxMode::WorkspaceWrite,
+                allowed_paths: vec![PathBuf::from("../shared"), PathBuf::from(".")],
+            },
+            ..Default::default()
         };
 
         let policy = execution_policy_from_config_with_overrides(

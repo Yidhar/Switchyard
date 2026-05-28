@@ -795,7 +795,9 @@ impl RuntimeState {
     pub fn apply(&mut self, event: &switchyard_core::RuntimeEvent) {
         use switchyard_core::RuntimeEvent;
         match event {
-            RuntimeEvent::CallbackReceiptsInjected { provider, count } => {
+            RuntimeEvent::CallbackReceiptsInjected {
+                provider, count, ..
+            } => {
                 self.delivered_callback_receipt_count = *count;
                 self.ensure_provider_view(provider);
                 self.push_provider_view_line(
@@ -817,7 +819,9 @@ impl RuntimeState {
                 self.push_provider_view_line(provider, format!("[system] 正在准备：{phase}"));
                 self.push_event(format!("[core/{provider}] 准备中：{phase}"));
             }
-            RuntimeEvent::CoreTurnStarted { turn_id, provider } => {
+            RuntimeEvent::CoreTurnStarted {
+                turn_id, provider, ..
+            } => {
                 self.clear_live_hyard_jobs();
                 self.phase = Phase::CoreRunning;
                 self.current_provider = provider.clone();
@@ -916,7 +920,9 @@ impl RuntimeState {
                     truncate(task_summary, 50)
                 ));
             }
-            RuntimeEvent::PeerTurnStarted { provider, turn_id } => {
+            RuntimeEvent::PeerTurnStarted {
+                provider, turn_id, ..
+            } => {
                 self.phase = Phase::PeerRunning;
                 self.provider_turn_ids.insert(provider.clone(), *turn_id);
                 self.ensure_provider_view(provider);
@@ -1088,6 +1094,7 @@ impl RuntimeState {
                 source_provider,
                 observed_at,
                 job,
+                ..
             } => {
                 self.ensure_provider_view(&job.provider);
                 self.push_provider_view_line(
@@ -1122,7 +1129,9 @@ impl RuntimeState {
                     job.provider, job.status, source_provider
                 ));
             }
-            RuntimeEvent::FinalizationStarted { provider, turn_id } => {
+            RuntimeEvent::FinalizationStarted {
+                provider, turn_id, ..
+            } => {
                 self.phase = Phase::Finalizing;
                 self.current_provider = provider.clone();
                 self.current_turn_id = Some(*turn_id);
@@ -1151,6 +1160,7 @@ impl RuntimeState {
                 provider,
                 turn_id,
                 error,
+                ..
             } => {
                 self.phase = Phase::Idle;
                 self.delivered_callback_receipt_count = 0;
@@ -1409,6 +1419,7 @@ mod tests {
         }]);
 
         state.apply(&RuntimeEvent::HyardJobObserved {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             source_provider: "codex".to_string(),
             observed_at: "2026-04-04T12:05:00Z".to_string(),
@@ -1550,6 +1561,7 @@ mod tests {
         let mut state = new_state();
 
         state.apply(&RuntimeEvent::CallbackReceiptsInjected {
+            session_id: uuid::Uuid::nil(),
             provider: "codex".to_string(),
             count: 2,
         });
@@ -1577,6 +1589,7 @@ mod tests {
         let turn_id = Uuid::now_v7();
 
         state.apply(&RuntimeEvent::CoreTurnStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id,
             provider: "claude".to_string(),
         });
@@ -1596,6 +1609,7 @@ mod tests {
         assert!(!state.stream_lines.is_empty());
 
         state.apply(&RuntimeEvent::CoreTurnStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "claude".to_string(),
         });
@@ -1609,10 +1623,12 @@ mod tests {
         let execution = sample_execution();
 
         state.apply(&RuntimeEvent::CoreTurnStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "codex".to_string(),
         });
         state.apply(&RuntimeEvent::CoreExecutionTelemetry {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "codex".to_string(),
             execution: execution.clone(),
@@ -1628,12 +1644,14 @@ mod tests {
         );
 
         state.apply(&RuntimeEvent::DelegateRequested {
+            session_id: uuid::Uuid::nil(),
             core_turn_id: Uuid::now_v7(),
             peer: "gemini".to_string(),
             role: "researcher".to_string(),
             task_summary: "inspect".to_string(),
         });
         state.apply(&RuntimeEvent::PeerExecutionTelemetry {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
             execution: execution.clone(),
@@ -1643,6 +1661,7 @@ mod tests {
         assert_eq!(state.active_execution(), Some(&execution));
 
         state.apply(&RuntimeEvent::FinalizationStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "codex".to_string(),
         });
@@ -1657,6 +1676,7 @@ mod tests {
     fn core_item_updated_pushes_stream_and_raw_not_event_log() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::CoreItemUpdated {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "claude".to_string(),
             event_type: "item_updated".to_string(),
@@ -1675,6 +1695,7 @@ mod tests {
     fn terminal_output_populates_provider_terminal_transcript() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::CoreTerminalOutput {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "codex".to_string(),
             text: "Applying patch...".to_string(),
@@ -1695,6 +1716,7 @@ mod tests {
     fn delegate_requested_sets_phase_and_peer() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::DelegateRequested {
+            session_id: uuid::Uuid::nil(),
             core_turn_id: Uuid::now_v7(),
             peer: "gemini".to_string(),
             role: "reviewer".to_string(),
@@ -1721,6 +1743,7 @@ mod tests {
     fn authoritative_hyard_job_beats_inferred_placeholder() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::DelegateRequested {
+            session_id: uuid::Uuid::nil(),
             core_turn_id: Uuid::now_v7(),
             peer: "claude".to_string(),
             role: "researcher".to_string(),
@@ -1757,6 +1780,7 @@ mod tests {
     fn peer_runtime_hints_do_not_overwrite_authoritative_live_job() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::HyardJobObserved {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             source_provider: "codex".to_string(),
             observed_at: "2026-04-04T12:05:00Z".to_string(),
@@ -1776,6 +1800,7 @@ mod tests {
         });
 
         state.apply(&RuntimeEvent::PeerItemUpdated {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
             event_type: "item_updated".to_string(),
@@ -1807,6 +1832,7 @@ mod tests {
     fn peer_turn_started_sets_phase() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::PeerTurnStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
         });
@@ -1820,6 +1846,7 @@ mod tests {
     fn peer_item_updated_pushes_stream_and_raw_not_event_log() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::PeerItemUpdated {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
             event_type: "item_updated".to_string(),
@@ -1843,6 +1870,7 @@ mod tests {
     fn delegate_completed_logs_event() {
         let mut state = new_state();
         state.apply(&RuntimeEvent::DelegateCompleted {
+            session_id: uuid::Uuid::nil(),
             core_turn_id: Uuid::now_v7(),
             peer: "gemini".to_string(),
             status: "success".to_string(),
@@ -1865,6 +1893,7 @@ mod tests {
         state.phase = Phase::CoreRunning;
 
         state.apply(&RuntimeEvent::CoreOutputCompleted {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "claude".to_string(),
         });
@@ -1881,6 +1910,7 @@ mod tests {
         state.phase = Phase::PeerRunning;
 
         state.apply(&RuntimeEvent::PeerOutputCompleted {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "gemini".to_string(),
         });
@@ -1910,6 +1940,7 @@ mod tests {
         state.current_peer = Some("gemini".to_string());
 
         state.apply(&RuntimeEvent::FinalizationStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "claude".to_string(),
         });
@@ -1928,6 +1959,7 @@ mod tests {
         state.current_peer = Some("gemini".to_string());
 
         state.apply(&RuntimeEvent::TurnCompleted {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "claude".to_string(),
             response: Some("done".to_string()),
@@ -1947,6 +1979,7 @@ mod tests {
         state.started_at = Some(std::time::Instant::now());
 
         state.apply(&RuntimeEvent::TurnFailed {
+            session_id: uuid::Uuid::nil(),
             turn_id: Uuid::now_v7(),
             provider: "claude".to_string(),
             error: "crash".to_string(),
@@ -1967,6 +2000,7 @@ mod tests {
 
         // 1. Core starts
         state.apply(&RuntimeEvent::CoreTurnStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: core_turn,
             provider: "claude".to_string(),
         });
@@ -1974,6 +2008,7 @@ mod tests {
 
         // 2. Core produces output
         state.apply(&RuntimeEvent::CoreItemUpdated {
+            session_id: uuid::Uuid::nil(),
             turn_id: core_turn,
             provider: "claude".to_string(),
             event_type: "item_updated".to_string(),
@@ -1984,6 +2019,7 @@ mod tests {
 
         // 3. Core output finishes
         state.apply(&RuntimeEvent::CoreOutputCompleted {
+            session_id: uuid::Uuid::nil(),
             turn_id: core_turn,
             provider: "claude".to_string(),
         });
@@ -1991,6 +2027,7 @@ mod tests {
 
         // 4. Core turn fully committed
         state.apply(&RuntimeEvent::TurnCompleted {
+            session_id: uuid::Uuid::nil(),
             turn_id: core_turn,
             provider: "claude".to_string(),
             response: Some("delegate block".to_string()),
@@ -1999,6 +2036,7 @@ mod tests {
 
         // 5. Delegate requested
         state.apply(&RuntimeEvent::DelegateRequested {
+            session_id: uuid::Uuid::nil(),
             core_turn_id: core_turn,
             peer: "gemini".to_string(),
             role: "reviewer".to_string(),
@@ -2009,6 +2047,7 @@ mod tests {
 
         // 6. Peer starts
         state.apply(&RuntimeEvent::PeerTurnStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: peer_turn,
             provider: "gemini".to_string(),
         });
@@ -2016,6 +2055,7 @@ mod tests {
 
         // 7. Peer produces output
         state.apply(&RuntimeEvent::PeerItemUpdated {
+            session_id: uuid::Uuid::nil(),
             turn_id: peer_turn,
             provider: "gemini".to_string(),
             event_type: "item_updated".to_string(),
@@ -2026,6 +2066,7 @@ mod tests {
 
         // 8. Delegate completed
         state.apply(&RuntimeEvent::DelegateCompleted {
+            session_id: uuid::Uuid::nil(),
             core_turn_id: core_turn,
             peer: "gemini".to_string(),
             status: "success".to_string(),
@@ -2035,6 +2076,7 @@ mod tests {
         // 9. Finalization starts
         let final_turn = Uuid::now_v7();
         state.apply(&RuntimeEvent::FinalizationStarted {
+            session_id: uuid::Uuid::nil(),
             turn_id: final_turn,
             provider: "claude".to_string(),
         });
@@ -2043,6 +2085,7 @@ mod tests {
 
         // 10. Finalization output done
         state.apply(&RuntimeEvent::CoreOutputCompleted {
+            session_id: uuid::Uuid::nil(),
             turn_id: final_turn,
             provider: "claude".to_string(),
         });
@@ -2050,6 +2093,7 @@ mod tests {
 
         // 11. Final turn committed
         state.apply(&RuntimeEvent::TurnCompleted {
+            session_id: uuid::Uuid::nil(),
             turn_id: final_turn,
             provider: "claude".to_string(),
             response: Some("final answer".to_string()),

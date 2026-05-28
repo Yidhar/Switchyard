@@ -128,7 +128,7 @@ pub async fn run_antigravity_turn(
                 .send(ProviderEvent::text_message(
                     turn_id,
                     "antigravity",
-                    &format!("{trimmed}\n"),
+                    format!("{trimmed}\n"),
                 ))
                 .await
                 .ok();

@@ -813,7 +813,12 @@ fn summarize_item_activity(
         | "function_call_output"
         | "custom_tool_call_output"
         | "mcp_tool_call_output" => with_label("[工具] 工具结果已返回"),
-        "local_shell_call_output" | "command_output_delta" => with_label("[命令] 输出已更新"),
+        "local_shell_call_output" => with_label("[命令] 本地 Shell 输出已返回"),
+        "command_output_delta"
+        | "shell_output_delta"
+        | "stdout_delta"
+        | "stderr_delta"
+        | "process_output_delta" => with_label("[命令] 输出已更新"),
         "terminal_interaction" => with_label("[终端] 已发送交互输入"),
         "file_change" | "file_change_delta" | "patch_delta" => "[文件] 正在修改".to_string(),
         "diff_ready" => "[Diff] 已生成差异".to_string(),

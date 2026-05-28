@@ -23,10 +23,17 @@ fn temp_store() -> (JsonlStore, tempfile::TempDir) {
     (JsonlStore::new(dir.path().to_path_buf()), dir)
 }
 
-/// Collect all RuntimeEvents from a channel into a Vec.
+/// Collect RuntimeEvents from a channel into a Vec.
+///
+/// Some runtime events are forwarded through short-lived async fan-out tasks.
+/// Give those tasks a brief chance to flush after the caller drops its sender;
+/// otherwise tests that immediately `try_recv` can race a correctly produced
+/// event that has not reached the assertion channel yet.
 async fn drain_events(rx: &mut mpsc::Receiver<RuntimeEvent>) -> Vec<RuntimeEvent> {
     let mut events = Vec::new();
-    while let Ok(evt) = rx.try_recv() {
+    while let Ok(Some(evt)) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+    {
         events.push(evt);
     }
     events
@@ -819,6 +826,7 @@ async fn full_delegation_event_order() {
         .iter()
         .map(|e| match e {
             RuntimeEvent::CallbackReceiptsInjected { .. } => "CallbackReceiptsInjected",
+            RuntimeEvent::TurnPreparing { .. } => "TurnPreparing",
             RuntimeEvent::CoreTurnStarted { .. } => "CoreTurnStarted",
             RuntimeEvent::CoreExecutionTelemetry { .. } => "CoreExecutionTelemetry",
             RuntimeEvent::CoreItemUpdated { .. } => "CoreItemUpdated",

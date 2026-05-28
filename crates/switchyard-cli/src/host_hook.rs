@@ -14,8 +14,8 @@
 //!    entries to the provider's official hook config file:
 //!    - Codex: `~/.codex/config.toml` (TOML, `[[hooks.<EventName>]]` array)
 //!    - Claude: `~/.claude/hooks.json` (JSON, `hooks.<EventName>: [...]`)
-//!    Idempotent: existing user-managed entries are preserved; only entries
-//!    flagged `switchyard_managed = true` are touched.
+//!      Idempotent: existing user-managed entries are preserved; only entries
+//!      flagged `switchyard_managed = true` are touched.
 //!
 //! 3. `uninstall --provider <codex|claude|all>` — inverse of install.
 //!

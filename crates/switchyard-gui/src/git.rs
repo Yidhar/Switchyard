@@ -140,7 +140,7 @@ pub fn status(primary_root: &Path) -> Result<GitStatus, String> {
             "status",
             "--porcelain=v1",
             "--branch",
-            "--untracked-files=normal",
+            "--untracked-files=all",
             "-z",
         ],
     )?;
@@ -269,9 +269,7 @@ fn parse_porcelain_v1(raw: &str) -> Result<GitStatus, String> {
     // file records (older docs said `\n`; observed behavior on
     // 2.x is NUL). Accept whichever the host git emits.
     if rest.starts_with("## ") {
-        let nl = rest
-            .find(|c: char| c == '\n' || c == '\0')
-            .unwrap_or(rest.len());
+        let nl = rest.find(['\n', '\0']).unwrap_or(rest.len());
         let header = rest[3..nl].trim_end_matches('\r');
         parse_branch_header(header, &mut status);
         rest = &rest[(nl + 1).min(rest.len())..];

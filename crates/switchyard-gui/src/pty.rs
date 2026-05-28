@@ -416,7 +416,7 @@ fn default_shell() -> String {
         if let Some(p) = standard_windows_powershell() {
             return p.to_string_lossy().into_owned();
         }
-        return std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string())
     }
 
     #[cfg(not(target_os = "windows"))]

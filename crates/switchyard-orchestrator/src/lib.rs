@@ -7,7 +7,7 @@ pub mod supervisor;
 pub use supervisor::{RetryPolicy, SpawnRecipe, SupervisedOutcome, WorkerSupervisor};
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -724,9 +724,9 @@ fn execution_policy_from_delegate_task(task: &DelegateTask) -> ExecutionPolicy {
     policy
 }
 
-fn resolve_policy_path(base: &PathBuf, path: &PathBuf) -> PathBuf {
+fn resolve_policy_path(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
-        path.clone()
+        path.to_path_buf()
     } else {
         base.join(path)
     }
