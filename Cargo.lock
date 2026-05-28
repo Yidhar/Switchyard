@@ -3690,6 +3690,7 @@ dependencies = [
  "switchyard-provider-claude",
  "switchyard-provider-codex",
  "switchyard-provider-gemini",
+ "switchyard-runtime",
  "switchyard-session",
  "switchyard-store",
  "tauri",

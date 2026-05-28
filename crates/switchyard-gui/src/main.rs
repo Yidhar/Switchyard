@@ -31,6 +31,7 @@ use switchyard_provider_api::{
 use switchyard_provider_claude::ClaudeProvider;
 use switchyard_provider_codex::CodexProvider;
 use switchyard_provider_gemini::GeminiProvider;
+use switchyard_runtime::{RuntimeDb, RuntimeSnapshot};
 use switchyard_session::{Artifact, Event, Session, Turn, Workspace};
 use switchyard_store::{
     ArtifactStore, SessionCatalog, SessionEventRepository, SessionRepository, StoreBackend,
@@ -2457,6 +2458,33 @@ async fn get_session_events(
     Ok(events)
 }
 
+#[tauri::command]
+async fn get_runtime_snapshot(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    session_id: String,
+    after_event_id: Option<i64>,
+    event_limit: Option<usize>,
+    job_limit: Option<usize>,
+) -> Result<RuntimeSnapshot, String> {
+    let ws = workspace_state.current()?;
+    let config = SwitchyardConfig::resolve(&ws.primary_root).unwrap_or_default();
+    let runtime_db_path = config.runtime_db_path(&ws.primary_root);
+    let session_uuid =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("invalid session ID: {e}"))?;
+    let after_event_id = after_event_id.unwrap_or(0).max(0);
+    let event_limit = event_limit.unwrap_or(256).clamp(1, 5_000);
+    let job_limit = job_limit.unwrap_or(256).clamp(1, 5_000);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = RuntimeDb::open(runtime_db_path)
+            .map_err(|e| format!("failed to open runtime db: {e}"))?;
+        db.snapshot_for_session(session_uuid, after_event_id, event_limit, job_limit)
+            .map_err(|e| format!("failed to load runtime snapshot: {e}"))
+    })
+    .await
+    .map_err(|e| format!("runtime snapshot task failed: {e}"))?
+}
+
 fn validate_turn_attachments(
     cwd: &Path,
     image_paths: Vec<String>,
@@ -3996,6 +4024,7 @@ fn main() {
             create_session,
             get_session_turns,
             get_session_events,
+            get_runtime_snapshot,
             save_clipboard_attachment,
             persist_attachment_file,
             read_image_attachment_data_url,

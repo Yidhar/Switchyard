@@ -41,7 +41,7 @@ interface ControlCenterProps {
 
 type TabType = 'topology' | 'agents' | 'checklist' | 'summary' | 'telemetry';
 
-const ACTIVE_HYARD_JOB_STATUSES = new Set(['queued', 'running', 'cancel_requested', 'wait_timeout']);
+const ACTIVE_HYARD_JOB_STATUSES = new Set(['queued', 'worker_booting', 'running', 'cancel_requested', 'wait_timeout']);
 
 function normalizeStatus(value: unknown): string {
   const text = value === undefined || value === null ? '' : String(value).trim();

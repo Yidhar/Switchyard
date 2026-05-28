@@ -69,6 +69,12 @@ const TURN_ATTACHMENTS_STORAGE_KEY = 'switchyard.turnAttachments.v1';
 const TEMP_USER_TURN_ID_PREFIX = 'temp-user-';
 const NEW_SESSION_PIPELINE_ID = '__switchyard_new_session__';
 
+interface RuntimeSnapshot {
+  max_event_id?: number;
+  host_jobs?: any[];
+  events?: any[];
+}
+
 interface PendingTurnAttachmentBinding {
   bindingId: string;
   sessionId: string;
@@ -525,7 +531,7 @@ const KNOWN_WORKER_STATES = new Set<InstanceMetadata['state']>([
   'dead',
 ]);
 
-const ACTIVE_HYARD_JOB_STATUSES = new Set(['queued', 'running', 'cancel_requested', 'wait_timeout']);
+const ACTIVE_HYARD_JOB_STATUSES = new Set(['queued', 'worker_booting', 'running', 'cancel_requested', 'wait_timeout']);
 
 function normalizedString(value: any): string | null {
   if (value === undefined || value === null) return null;
@@ -620,6 +626,47 @@ function hyardJobRecordFromRuntimeEvent(data: any): any | null {
   if (sessionId) record.session_id = sessionId;
   if (sourceProvider) record.source_provider = sourceProvider;
   return record;
+}
+
+function hyardJobRecordFromRuntimeHostJob(source: any): any | null {
+  const jobId = normalizedString(source?.job_id ?? source?.id);
+  if (!source || !jobId) return null;
+
+  const sessionId = normalizedString(
+    source?.session_id ??
+    source?.owner_session_id ??
+    source?.callback_session_id ??
+    source?.worker_session_id,
+  );
+  const observedAt = normalizedString(
+    source?.observed_at ??
+    source?.updated_at ??
+    source?.started_at ??
+    source?.created_at,
+  );
+  const turnId = normalizedString(source?.turn_id ?? source?.turnId);
+  const record: Record<string, any> = {
+    ...source,
+    job_id: jobId,
+    // The older live HYARD UI shape used `session_id` and `observed_at`.
+    // Keep those aliases so cards restored from the SQLite runtime snapshot
+    // render through the same reducer/components as broadcast events.
+    ...(sessionId ? { session_id: sessionId } : {}),
+    ...(observedAt ? { observed_at: observedAt } : {}),
+    ...(turnId ? { turn_id: turnId } : {}),
+  };
+  return record;
+}
+
+function hyardJobsFromRuntimeSnapshot(snapshot: RuntimeSnapshot | null | undefined): Record<string, any> {
+  const jobs: Record<string, any> = {};
+  const hostJobs = Array.isArray(snapshot?.host_jobs) ? snapshot?.host_jobs ?? [] : [];
+  hostJobs.forEach((item) => {
+    const record = hyardJobRecordFromRuntimeHostJob(item);
+    if (!record?.job_id) return;
+    jobs[record.job_id] = record;
+  });
+  return jobs;
 }
 
 function upsertHyardJobRecord(jobs: Record<string, any>, record: any | null): Record<string, any> {
@@ -1627,6 +1674,7 @@ function App() {
   const [activePeerTurnId, setActivePeerTurnId] = useState<string | null>(null);
   const [selectedAgentTurnId, setSelectedAgentTurnId] = useState<string | null>(null);
   const [hyardJobs, setHyardJobs] = useState<Record<string, any>>({});
+  const runtimeSnapshotCursorRef = useRef<Record<string, number>>({});
   const [runtimeTurnPhases, setRuntimeTurnPhases] = useState<Record<string, RuntimeTurnPhase>>({});
   const [runtimeTurnStartedAt, setRuntimeTurnStartedAt] = useState<Record<string, number>>({});
   const [runtimeTurnPhaseChangedAt, setRuntimeTurnPhaseChangedAt] = useState<Record<string, number>>({});
@@ -2565,6 +2613,24 @@ function App() {
     return eventList;
   };
 
+  const fetchRuntimeSnapshot = async (sessionId: string, mode: 'full' | 'incremental' = 'incremental') => {
+    const afterEventId = mode === 'incremental' ? (runtimeSnapshotCursorRef.current[sessionId] ?? 0) : 0;
+    const snapshot = await invoke<RuntimeSnapshot>('get_runtime_snapshot', {
+      sessionId,
+      afterEventId,
+      eventLimit: mode === 'full' ? 512 : 256,
+      jobLimit: 512,
+    });
+    const maxEventId = Number(snapshot?.max_event_id ?? 0);
+    if (Number.isFinite(maxEventId)) {
+      runtimeSnapshotCursorRef.current = {
+        ...runtimeSnapshotCursorRef.current,
+        [sessionId]: Math.max(runtimeSnapshotCursorRef.current[sessionId] ?? 0, maxEventId),
+      };
+    }
+    return snapshot;
+  };
+
   // Listen for Tauri events
   useEffect(() => {
     let active = true;
@@ -2601,6 +2667,15 @@ function App() {
           // instead of wholesale replacement so a refresh triggered by a status
           // event cannot erase just-rendered streaming/tool cards.
           setSessionEvents((prev) => mergeSessionEventLists(prev, eventList));
+          const runtimeSnapshot = await fetchRuntimeSnapshot(sessionId, 'incremental');
+          if (!active || selectedSessionRef.current?.session_id !== sessionId) return;
+          const runtimeHyardJobs = hyardJobsFromRuntimeSnapshot(runtimeSnapshot);
+          if (Object.keys(runtimeHyardJobs).length > 0) {
+            setHyardJobs((prev) => ({
+              ...prev,
+              ...runtimeHyardJobs,
+            }));
+          }
         } catch (e) {
           console.error('Error fetching session turns/events:', e);
         }
@@ -3320,7 +3395,6 @@ function App() {
                 enqueueLog(now, 'sys', `[HYARD] Observed background job ${job.job_id} (${job.provider}) status: ${job.status}`);
               }
             }
-            scheduleRefreshTurns();
             break;
 
           case 'FinalizationStarted':
@@ -3661,6 +3735,7 @@ function App() {
   const resetWorkspaceScopedUi = () => {
     selectedSessionRef.current = null;
     sessionEventsCursorRef.current = {};
+    runtimeSnapshotCursorRef.current = {};
     sessionUiSnapshotsRef.current = {};
     runtimeTurnSessionIdRef.current = {};
     pendingAttachmentBindingsRef.current = [];
@@ -3737,16 +3812,26 @@ function App() {
       ...sessionEventsCursorRef.current,
       [session.session_id]: '',
     };
+    runtimeSnapshotCursorRef.current = {
+      ...runtimeSnapshotCursorRef.current,
+      [session.session_id]: 0,
+    };
     try {
-      const turnList = await invoke<Turn[]>('get_session_turns', { sessionId: session.session_id });
+      const [turnList, runtimeSnapshot] = await Promise.all([
+        invoke<Turn[]>('get_session_turns', { sessionId: session.session_id }),
+        fetchRuntimeSnapshot(session.session_id, 'full'),
+      ]);
+      const runtimeHyardJobs = hyardJobsFromRuntimeSnapshot(runtimeSnapshot);
       const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
       reconcileTurnAttachmentBindings(session.session_id, turnListWithFinalResponses);
       patchSessionUiSnapshot(session.session_id, {
         turns: turnListWithFinalResponses,
+        hyardJobs: runtimeHyardJobs,
         loaded: true,
       });
       if (selectedSessionRef.current?.session_id === session.session_id) {
         commitTurns(turnListWithFinalResponses);
+        setHyardJobs(runtimeHyardJobs);
       }
       const eventList = await fetchSessionEventsForMerge(session.session_id, 'full');
       const mergedEvents = mergeSessionEventLists([], eventList);
