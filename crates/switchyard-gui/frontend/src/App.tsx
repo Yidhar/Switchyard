@@ -75,6 +75,19 @@ interface RuntimeSnapshot {
   events?: any[];
 }
 
+interface RuntimeEventRecord {
+  event_id?: number;
+  workspace_id?: string | null;
+  session_id?: string | null;
+  aggregate_type?: string;
+  aggregate_id?: string;
+  aggregate_version?: number;
+  event_type?: string;
+  payload?: any;
+  occurred_at?: string;
+  source?: string;
+}
+
 const RUNTIME_TURN_SESSION_CACHE_MAX_ENTRIES = 2_048;
 const RUNTIME_TURN_SESSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
@@ -664,6 +677,39 @@ function hyardJobRecordFromRuntimeHostJob(source: any): any | null {
     ...(turnId ? { turn_id: turnId } : {}),
   };
   return record;
+}
+
+function hyardJobRecordFromRuntimeDbEvent(event: RuntimeEventRecord): any | null {
+  if (!event || event.aggregate_type !== 'host_job') return null;
+
+  const payload = event.payload ?? {};
+  const jobId = normalizedString(payload.job_id ?? event.aggregate_id);
+  if (!jobId) return null;
+
+  const sessionId = normalizedString(
+    event.session_id ??
+    payload.owner_session_id ??
+    payload.callback_session_id ??
+    payload.worker_session_id,
+  );
+  const runtimeStatus = normalizedString(payload.runtime_status);
+  const bridgeStatus = normalizedString(payload.status);
+  const observedAt = normalizedString(event.occurred_at);
+  const sourceProvider = normalizedString(event.source) ?? payload.source_provider;
+
+  return hyardJobRecordFromRuntimeHostJob({
+    ...payload,
+    id: jobId,
+    job_id: jobId,
+    ...(sessionId ? { session_id: sessionId } : {}),
+    ...(runtimeStatus ? { status: runtimeStatus } : bridgeStatus ? { status: bridgeStatus } : {}),
+    ...(bridgeStatus ? { bridge_status: bridgeStatus } : {}),
+    ...(observedAt ? { observed_at: observedAt } : {}),
+    ...(sourceProvider ? { source_provider: sourceProvider } : {}),
+    event_id: event.event_id,
+    event_type: event.event_type,
+    aggregate_version: event.aggregate_version,
+  });
 }
 
 function hyardJobsFromRuntimeSnapshot(snapshot: RuntimeSnapshot | null | undefined): Record<string, any> {
@@ -3573,6 +3619,64 @@ function App() {
         flushRuntimeEventBatchContext(context);
       };
 
+      const handleRuntimeDbEventBatch = (batch: RuntimeEventRecord[]) => {
+        if (!active || batch.length === 0) return;
+
+        const recordsBySession: Record<string, Record<string, any>> = {};
+        const maxEventIdBySession: Record<string, number> = {};
+
+        batch.forEach((dbEvent) => {
+          const eventId = Number(dbEvent?.event_id ?? 0);
+          const job = hyardJobRecordFromRuntimeDbEvent(dbEvent);
+          const sessionId = normalizedString(job?.session_id ?? dbEvent?.session_id);
+
+          if (sessionId && Number.isFinite(eventId) && eventId > 0) {
+            maxEventIdBySession[sessionId] = Math.max(maxEventIdBySession[sessionId] ?? 0, eventId);
+          }
+
+          if (!job?.job_id || !sessionId) return;
+
+          if (!recordsBySession[sessionId]) recordsBySession[sessionId] = {};
+          recordsBySession[sessionId][job.job_id] = job;
+        });
+
+        const cursorEntries = Object.entries(maxEventIdBySession);
+        if (cursorEntries.length > 0) {
+          const nextCursor = { ...runtimeSnapshotCursorRef.current };
+          cursorEntries.forEach(([sessionId, maxId]) => {
+            nextCursor[sessionId] = Math.max(nextCursor[sessionId] ?? 0, maxId);
+          });
+          runtimeSnapshotCursorRef.current = nextCursor;
+        }
+
+        const currentSessionId = selectedSessionRef.current?.session_id;
+        Object.entries(recordsBySession).forEach(([sessionId, jobs]) => {
+          if (sessionId === currentSessionId) {
+            setHyardJobs((prev) => ({ ...prev, ...jobs }));
+          } else {
+            patchSessionUiSnapshot(sessionId, (previous) => ({
+              ...previous,
+              hyardJobs: {
+                ...(previous.hyardJobs ?? {}),
+                ...jobs,
+              },
+              loadedAt: Date.now(),
+            }));
+          }
+        });
+
+        if (runtimeDebug) {
+          console.debug('[runtime_db_event_batch]', {
+            events: batch.length,
+            sessions: Object.keys(recordsBySession),
+            jobs: Object.values(recordsBySession).reduce(
+              (count, jobs) => count + Object.keys(jobs).length,
+              0,
+            ),
+          });
+        }
+      };
+
       const uEvent = await listen<any>('runtime_event', (event) => {
         unstable_batchedUpdates(() => {
           handleRuntimeEventPayload(event.payload || {});
@@ -3584,11 +3688,18 @@ function App() {
           handleRuntimeEventBatchPayloads(batch);
         });
       });
+      const uRuntimeDbBatch = await listen<RuntimeEventRecord[]>('runtime_db_event_batch', (event) => {
+        const batch = Array.isArray(event.payload) ? event.payload : [];
+        unstable_batchedUpdates(() => {
+          handleRuntimeDbEventBatch(batch);
+        });
+      });
       if (!active) {
         uEvent();
         uBatch();
+        uRuntimeDbBatch();
       } else {
-        unlistenFns.push(uEvent, uBatch);
+        unlistenFns.push(uEvent, uBatch, uRuntimeDbBatch);
       }
       } catch (err) {
         console.error('Error setting up Tauri event listener:', err);
