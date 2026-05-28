@@ -6,11 +6,13 @@
 //! while this event log remains the exactly-once source of truth.
 
 mod error;
+pub mod ipc;
 pub mod protocol;
 pub mod schema;
 pub mod store;
 
 pub use error::RuntimeError;
+pub use ipc::{RuntimeIpcMessage, RuntimeIpcRequest};
 pub use protocol::{
     CreateHostJob, HostJobMutation, HostJobRecord, HostJobStatus, RuntimeEventRecord,
     RuntimeSnapshot, RuntimeWrite, WorkerInstanceState,

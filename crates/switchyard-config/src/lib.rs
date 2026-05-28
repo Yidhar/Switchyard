@@ -280,6 +280,27 @@ impl SwitchyardConfig {
             .unwrap_or_else(|| project_root.join(DOT_DIR).join("runtime.sqlite3"))
     }
 
+    /// Resolved runtime IPC endpoint for local committed-event broadcasts.
+    ///
+    /// The endpoint is derived from the durable runtime DB path so independent
+    /// workspaces do not collide. On Windows this is a named pipe; on Unix it is
+    /// a socket file next to the runtime DB.
+    pub fn runtime_ipc_endpoint(&self, project_root: &Path) -> String {
+        let runtime_db_path = self.runtime_db_path(project_root);
+        let hash = stable_path_hash(&runtime_db_path);
+        #[cfg(windows)]
+        {
+            format!(r"\\.\pipe\switchyard-runtime-{hash:016x}")
+        }
+        #[cfg(unix)]
+        {
+            runtime_db_path
+                .with_file_name(format!("runtime-{hash:016x}.sock"))
+                .to_string_lossy()
+                .to_string()
+        }
+    }
+
     /// Additional sandbox allow-list paths resolved relative to
     /// `project_root`. The primary workspace directory is not included here;
     /// core policy builders add it automatically for `workspace-write`.
@@ -395,6 +416,18 @@ fn infer_backend_from_path_hint(path: &Path) -> StoreBackend {
         Some("sqlite") | Some("sqlite3") | Some("db") | Some("db3") => StoreBackend::Sqlite,
         _ => StoreBackend::Sqlite,
     }
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    // FNV-1a: tiny, deterministic, and sufficient for local endpoint naming.
+    // Avoid DefaultHasher because its exact output is not a stable API.
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    text.as_bytes().iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 impl FromStr for SwitchyardConfig {
@@ -647,6 +680,21 @@ allowed_paths = ["../shared", "scratch"]
         cfg.session.directory = Some(PathBuf::from(".custom-sessions"));
         let path = cfg.runtime_db_path(Path::new("/project"));
         assert_eq!(path, PathBuf::from("/project/.switchyard/runtime.sqlite3"));
+    }
+
+    #[test]
+    fn runtime_ipc_endpoint_is_stable_and_workspace_scoped() {
+        let cfg = SwitchyardConfig::default();
+        let left = cfg.runtime_ipc_endpoint(Path::new("/project-a"));
+        let left_again = cfg.runtime_ipc_endpoint(Path::new("/project-a"));
+        let right = cfg.runtime_ipc_endpoint(Path::new("/project-b"));
+
+        assert_eq!(left, left_again);
+        assert_ne!(left, right);
+        #[cfg(windows)]
+        assert!(left.starts_with(r"\\.\pipe\switchyard-runtime-"));
+        #[cfg(unix)]
+        assert!(left.ends_with(".sock"));
     }
 
     #[test]
