@@ -4,8 +4,8 @@
 //! 2026-05-21 its CLI surface is significantly thinner than Gemini's: there
 //! is no `--output-format`, no `--acp`, no `stream-json`, no `--session-id`
 //! analogue, no `--model`. Headless execution is one-shot plain-text via
-//! `agy -p "<prompt>"`. See `docs/research/CLI_SESSION_SEMANTICS_2026-05-21.md`
-//! for the full capability matrix.
+//! `agy -p "<prompt>"`. The full capability matrix is kept in local-only
+//! development notes.
 //!
 //! Implications for this adapter:
 //!

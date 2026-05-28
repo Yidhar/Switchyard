@@ -386,7 +386,7 @@ fn install_codex() -> io::Result<()> {
         })?
     };
 
-    // Codex's hook format (verified against codex/docs/hooks): an array of
+    // Codex's hook format (verified against upstream hook documentation): an array of
     // tables under `hooks.<EventName>` with `type = "command"` + `command`.
     let exe_path = current_exe_display();
     let root_table = root.as_table_mut().ok_or_else(|| {

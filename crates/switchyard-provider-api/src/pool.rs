@@ -8,9 +8,8 @@
 //!
 //! Cross-session isolation is hard: an instance registered for
 //! `(claude, session-A)` is never visible to lookups in `(claude, session-B)`.
-//! This matches the "single window, single project" model — see
-//! `docs/research/CLI_SESSION_SEMANTICS_2026-05-21.md` § Switchyard
-//! implications for the design rationale.
+//! This matches the "single window, single project" model and keeps provider
+//! subprocess/session state isolated between Switchyard sessions.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

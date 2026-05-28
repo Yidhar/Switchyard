@@ -29,3 +29,5 @@ Thumbs.db
 /.antigravitycli/
 /.antigravity/
 /.codex/
+# Local development documentation
+/docs/

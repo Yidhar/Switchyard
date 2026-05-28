@@ -12,36 +12,18 @@ Switchyard 是一个官方 coding CLI 路由器与统一 TUI 外壳。
 
 ## 当前范围
 
-当前目录只落文档，不落实现。
+当前仓库包含 Switchyard 的 Rust workspace、CLI/TUI/GUI、provider 适配层、host pack 与测试代码。
 
-首批文档覆盖：
+本地开发文档、ADR、路线图和研究笔记保存在仓库根目录的 `docs/` 下，但这些内容只用于本地迭代，不随公开 Git 历史发布。公开 README 只保留项目定位、核心判断和可运行入口，避免把未整理的内部开发记录暴露到 GitHub。
 
-- 产品愿景与非目标
-- 架构分层与数据流
-- canonical session 与 orchestration 协议
-- provider 能力模型与适配约束
-- Rust workspace 模块拆分
-- 工程规则、任务流程与路线图
+## 主要入口
 
-## 文档索引
-
-- [愿景](./docs/VISION.md)
-- [路线图](./docs/ROADMAP.md)
-- [总体架构](./docs/architecture/ARCHITECTURE.md)
-- [Canonical Session](./docs/architecture/CANONICAL_SESSION.md)
-- [Provider 执行模型](./docs/architecture/PROVIDER_EXECUTION_MODEL.md)
-- [事件通路](./docs/architecture/EVENT_PIPELINE.md)
-- [Provider 能力矩阵](./docs/architecture/PROVIDER_CAPABILITIES.md)
-- [编排协议](./docs/architecture/ORCHESTRATION_PROTOCOL.md)
-- [模块拆分](./docs/modules/MODULE_BREAKDOWN.md)
-- [Provider 合同](./docs/modules/PROVIDER_CONTRACT.md)
-- [仓库布局](./docs/development/REPOSITORY_LAYOUT.md)
-- [本地工具链](./docs/development/LOCAL_TOOLCHAIN.md)
-- [工程规则](./docs/development/ENGINEERING_RULES.md)
-- [测试策略](./docs/development/TEST_STRATEGY.md)
-- [任务流程](./docs/development/TASK_WORKFLOW.md)
-- [ADR-0001](./docs/adr/0001-rust-first-cli-router.md)
-- [ADR-0002](./docs/adr/0002-store-context-and-routing-boundaries.md)
+- `crates/switchyard-cli`：命令行入口与 HYARD host bridge。
+- `crates/switchyard-tui`：终端 UI。
+- `crates/switchyard-gui`：桌面 GUI 与前端。
+- `crates/switchyard-core`：turn runner、router、runtime event pipeline 与 provider proxy。
+- `crates/switchyard-provider-*`：各 provider 适配层。
+- `tests/`：跨 crate 集成测试、runtime observable/completion 测试与 CLI 回归测试。
 
 ## 核心判断
 
@@ -54,7 +36,7 @@ Switchyard 采用 Rust-first 路线，原因如下：
 
 ## 当前结构决策
 
-为了避免边界模糊，当前文档已经明确：
+为了避免边界模糊，当前实现遵循：
 
 - `switchyard-session` 只负责会话领域模型，不负责持久化
 - `switchyard-store` 负责 canonical session、event log、summary cache 和 native bindings 的持久化

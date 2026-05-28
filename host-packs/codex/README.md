@@ -35,8 +35,16 @@ flat-file path still accepted by probe logic for compatibility.
 
 ## Commands
 
-Same as other host packs — see `docs/protocol/HYARD_COMMAND_PROTOCOL_V1.md`
-(the file now documents the HYARD v2 async job bridge semantics).
+Use the installed `switchyard` binary as the HYARD bridge:
+
+```bash
+switchyard host list
+switchyard host delegate --provider claude --task "Review this code" --wait-sec 1
+switchyard host status <job_id>
+switchyard host result <job_id>
+switchyard host await <job_id>
+switchyard host cancel <job_id>
+```
 
 Important behavior:
 
