@@ -2346,7 +2346,7 @@ async fn list_sessions(
             }
         }
     }
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
     Ok(sessions)
 }
 
@@ -3424,7 +3424,7 @@ async fn list_artifacts(
     }
 
     // Sort by modified time descending (newest first)
-    items.sort_by(|a, b| b.modified.cmp(&a.modified));
+    items.sort_by_key(|item| std::cmp::Reverse(item.modified.clone()));
 
     Ok(items)
 }
