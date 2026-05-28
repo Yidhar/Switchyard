@@ -150,11 +150,11 @@ impl RuntimeDb {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some(request_id) = input.client_request_id.as_deref() {
-            if let Some(existing) = get_host_job_by_client_request_tx(&tx, request_id)? {
-                tx.commit()?;
-                return Ok(RuntimeWrite::idempotent(existing));
-            }
+        if let Some(request_id) = input.client_request_id.as_deref()
+            && let Some(existing) = get_host_job_by_client_request_tx(&tx, request_id)?
+        {
+            tx.commit()?;
+            return Ok(RuntimeWrite::idempotent(existing));
         }
 
         let now = Utc::now();
@@ -237,14 +237,7 @@ impl RuntimeDb {
             .ok_or(RuntimeError::HostJobNotFound(input.job_id))?;
         let event = append_runtime_event_tx(
             &tx,
-            record.workspace_id.clone(),
-            record.owner_session_id.or(record.callback_session_id),
-            "host_job",
-            &record.job_id.to_string(),
-            record.version,
-            "host_job.created",
-            input.payload,
-            input.source,
+            RuntimeEventInsert::host_job(&record, "host_job.created", input.payload, input.source),
         )?;
         tx.commit()?;
         Ok(RuntimeWrite::committed(record, event))
@@ -332,14 +325,7 @@ impl RuntimeDb {
         let record = get_host_job_tx(&tx, job_id)?.ok_or(RuntimeError::HostJobNotFound(job_id))?;
         let event = append_runtime_event_tx(
             &tx,
-            record.workspace_id.clone(),
-            record.owner_session_id.or(record.callback_session_id),
-            "host_job",
-            &record.job_id.to_string(),
-            record.version,
-            event_type,
-            payload,
-            source,
+            RuntimeEventInsert::host_job(&record, event_type, payload, source),
         )?;
         tx.commit()?;
         Ok(RuntimeWrite::committed(record, event))
@@ -458,21 +444,42 @@ fn get_host_job_by_client_request_tx(
         .and_then(|row| row.transpose())
 }
 
-fn append_runtime_event_tx(
-    tx: &Transaction<'_>,
+struct RuntimeEventInsert {
     workspace_id: Option<String>,
     session_id: Option<Uuid>,
-    aggregate_type: impl Into<String>,
-    aggregate_id: &str,
+    aggregate_type: String,
+    aggregate_id: String,
     aggregate_version: i64,
-    event_type: impl Into<String>,
+    event_type: String,
     payload: Value,
-    source: impl Into<String>,
+    source: String,
+}
+
+impl RuntimeEventInsert {
+    fn host_job(
+        record: &HostJobRecord,
+        event_type: impl Into<String>,
+        payload: Value,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            workspace_id: record.workspace_id.clone(),
+            session_id: record.owner_session_id.or(record.callback_session_id),
+            aggregate_type: "host_job".to_string(),
+            aggregate_id: record.job_id.to_string(),
+            aggregate_version: record.version,
+            event_type: event_type.into(),
+            payload,
+            source: source.into(),
+        }
+    }
+}
+
+fn append_runtime_event_tx(
+    tx: &Transaction<'_>,
+    input: RuntimeEventInsert,
 ) -> Result<RuntimeEventRecord, RuntimeError> {
-    let aggregate_type = aggregate_type.into();
-    let event_type = event_type.into();
-    let source = source.into();
-    let payload_json = serde_json::to_string(&payload)?;
+    let payload_json = serde_json::to_string(&input.payload)?;
     let occurred_at = Utc::now();
 
     tx.execute(
@@ -490,15 +497,15 @@ fn append_runtime_event_tx(
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         "#,
         params![
-            workspace_id,
-            uuid_to_text(session_id),
-            aggregate_type,
-            aggregate_id,
-            aggregate_version,
-            event_type,
+            input.workspace_id,
+            uuid_to_text(input.session_id),
+            input.aggregate_type,
+            input.aggregate_id,
+            input.aggregate_version,
+            input.event_type,
             payload_json,
             occurred_at.to_rfc3339(),
-            source,
+            input.source,
         ],
     )?;
 
