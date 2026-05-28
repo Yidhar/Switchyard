@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tauri::Emitter;
 use tauri::Manager;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use file_watcher::{CapturedChange, FileWatcherState};
 
@@ -31,7 +32,7 @@ use switchyard_provider_api::{
 use switchyard_provider_claude::ClaudeProvider;
 use switchyard_provider_codex::CodexProvider;
 use switchyard_provider_gemini::GeminiProvider;
-use switchyard_runtime::{RuntimeDb, RuntimeSnapshot};
+use switchyard_runtime::{RuntimeDb, RuntimeIpcMessage, RuntimeIpcRequest, RuntimeSnapshot};
 use switchyard_session::{Artifact, Event, Session, Turn, Workspace};
 use switchyard_store::{
     ArtifactStore, SessionCatalog, SessionEventRepository, SessionRepository, StoreBackend,
@@ -90,6 +91,121 @@ impl GitStatusCache {
             primary_root: None,
             captured_at: None,
             status: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeIpcServerState {
+    inner: StdMutex<Option<RuntimeIpcServerHandle>>,
+}
+
+struct RuntimeIpcServerHandle {
+    endpoint: String,
+    task: tokio::task::JoinHandle<()>,
+    #[cfg(unix)]
+    socket_path: PathBuf,
+}
+
+impl RuntimeIpcServerState {
+    fn start_for_workspace(
+        &self,
+        app: tauri::AppHandle,
+        workspace: &Workspace,
+        config: &SwitchyardConfig,
+    ) {
+        let endpoint = config.runtime_ipc_endpoint(&workspace.primary_root);
+        let runtime_db_path = config.runtime_db_path(&workspace.primary_root);
+        let bridge_debug = env_flag_enabled("SWITCHYARD_RUNTIME_BRIDGE_DEBUG");
+
+        let Ok(mut guard) = self.inner.lock() else {
+            eprintln!("[runtime ipc] server state lock poisoned; live IPC disabled");
+            return;
+        };
+
+        if guard
+            .as_ref()
+            .is_some_and(|handle| handle.endpoint == endpoint)
+        {
+            return;
+        }
+
+        Self::stop_locked(&mut guard);
+
+        #[cfg(unix)]
+        let socket_path = PathBuf::from(&endpoint);
+        #[cfg(unix)]
+        {
+            if let Some(parent) = socket_path.parent()
+                && let Err(err) = std::fs::create_dir_all(parent)
+            {
+                eprintln!(
+                    "[runtime ipc] failed to create socket directory {}: {err}",
+                    parent.display()
+                );
+                return;
+            }
+            if socket_path.exists()
+                && let Err(err) = std::fs::remove_file(&socket_path)
+            {
+                eprintln!(
+                    "[runtime ipc] failed to remove stale socket {}: {err}",
+                    socket_path.display()
+                );
+                return;
+            }
+        }
+
+        let workspace_id = workspace.workspace_id;
+        let endpoint_for_task = endpoint.clone();
+        let task = tokio::spawn(async move {
+            run_runtime_ipc_server(
+                app,
+                endpoint_for_task,
+                runtime_db_path,
+                workspace_id,
+                bridge_debug,
+            )
+            .await;
+        });
+
+        *guard = Some(RuntimeIpcServerHandle {
+            endpoint,
+            task,
+            #[cfg(unix)]
+            socket_path,
+        });
+    }
+
+    fn stop(&self) {
+        let Ok(mut guard) = self.inner.lock() else {
+            eprintln!("[runtime ipc] server state lock poisoned while stopping");
+            return;
+        };
+        Self::stop_locked(&mut guard);
+    }
+
+    fn stop_locked(guard: &mut Option<RuntimeIpcServerHandle>) {
+        let Some(handle) = guard.take() else {
+            return;
+        };
+        handle.task.abort();
+        #[cfg(unix)]
+        if let Err(err) = std::fs::remove_file(&handle.socket_path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "[runtime ipc] failed to remove socket {}: {err}",
+                handle.socket_path.display()
+            );
+        }
+    }
+}
+
+impl Drop for RuntimeIpcServerState {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            RuntimeIpcServerState::stop_locked(&mut guard);
         }
     }
 }
@@ -574,6 +690,253 @@ fn spawn_runtime_event_bridge(
     tx
 }
 
+const RUNTIME_IPC_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const RUNTIME_IPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(windows)]
+async fn run_runtime_ipc_server(
+    app: tauri::AppHandle,
+    endpoint: String,
+    runtime_db_path: PathBuf,
+    workspace_id: uuid::Uuid,
+    bridge_debug: bool,
+) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    if bridge_debug {
+        eprintln!("[runtime ipc] listening workspace_id={workspace_id} endpoint={endpoint}");
+    }
+
+    loop {
+        let server = match ServerOptions::new().create(&endpoint) {
+            Ok(server) => server,
+            Err(err) => {
+                eprintln!("[runtime ipc] failed to create named pipe {endpoint}: {err}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        match server.connect().await {
+            Ok(()) => {
+                let app = app.clone();
+                let runtime_db_path = runtime_db_path.clone();
+                tokio::spawn(async move {
+                    handle_runtime_ipc_connection(server, app, runtime_db_path, bridge_debug).await;
+                });
+            }
+            Err(err) => {
+                if bridge_debug {
+                    eprintln!("[runtime ipc] named pipe connect failed: {err}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn run_runtime_ipc_server(
+    app: tauri::AppHandle,
+    endpoint: String,
+    runtime_db_path: PathBuf,
+    workspace_id: uuid::Uuid,
+    bridge_debug: bool,
+) {
+    use tokio::net::UnixListener;
+
+    let listener = match UnixListener::bind(&endpoint) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("[runtime ipc] failed to bind socket {endpoint}: {err}");
+            return;
+        }
+    };
+
+    if bridge_debug {
+        eprintln!("[runtime ipc] listening workspace_id={workspace_id} endpoint={endpoint}");
+    }
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let app = app.clone();
+                let runtime_db_path = runtime_db_path.clone();
+                tokio::spawn(async move {
+                    handle_runtime_ipc_connection(stream, app, runtime_db_path, bridge_debug).await;
+                });
+            }
+            Err(err) => {
+                if bridge_debug {
+                    eprintln!("[runtime ipc] socket accept failed: {err}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+async fn run_runtime_ipc_server(
+    _app: tauri::AppHandle,
+    endpoint: String,
+    _runtime_db_path: PathBuf,
+    workspace_id: uuid::Uuid,
+    _bridge_debug: bool,
+) {
+    eprintln!(
+        "[runtime ipc] unsupported platform; live IPC disabled workspace_id={workspace_id} endpoint={endpoint}"
+    );
+}
+
+async fn handle_runtime_ipc_connection<S>(
+    stream: S,
+    app: tauri::AppHandle,
+    runtime_db_path: PathBuf,
+    bridge_debug: bool,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    let read_result = tokio::time::timeout(
+        RUNTIME_IPC_READ_TIMEOUT,
+        reader.read_until(b'\n', &mut line),
+    )
+    .await;
+
+    let mut stream = reader.into_inner();
+    let response = match read_result {
+        Ok(Ok(0)) => return,
+        Ok(Ok(_)) if line.len() > RUNTIME_IPC_MAX_FRAME_BYTES => RuntimeIpcMessage::Error {
+            message: "runtime IPC frame too large".to_string(),
+        },
+        Ok(Ok(_)) => match serde_json::from_slice::<RuntimeIpcRequest>(&line) {
+            Ok(request) => handle_runtime_ipc_request(request, app, runtime_db_path).await,
+            Err(err) => RuntimeIpcMessage::Error {
+                message: format!("invalid runtime IPC request: {err}"),
+            },
+        },
+        Ok(Err(err)) => RuntimeIpcMessage::Error {
+            message: format!("failed to read runtime IPC request: {err}"),
+        },
+        Err(_) => RuntimeIpcMessage::Error {
+            message: "runtime IPC read timed out".to_string(),
+        },
+    };
+
+    if let Err(err) = write_runtime_ipc_message(&mut stream, &response).await
+        && bridge_debug
+    {
+        eprintln!("[runtime ipc] failed to write response: {err}");
+    }
+}
+
+async fn handle_runtime_ipc_request(
+    request: RuntimeIpcRequest,
+    app: tauri::AppHandle,
+    runtime_db_path: PathBuf,
+) -> RuntimeIpcMessage {
+    match request {
+        RuntimeIpcRequest::Publish { events } => {
+            let accepted = events.len();
+            if accepted > 0
+                && let Err(err) = app.emit("runtime_db_event_batch", events)
+            {
+                return RuntimeIpcMessage::Error {
+                    message: format!("failed to emit runtime DB events: {err}"),
+                };
+            }
+            RuntimeIpcMessage::Ack { accepted }
+        }
+        RuntimeIpcRequest::Snapshot {
+            session_id,
+            after_event_id,
+            event_limit,
+            job_limit,
+        } => {
+            let task = tauri::async_runtime::spawn_blocking(move || {
+                let db = RuntimeDb::open(runtime_db_path)
+                    .map_err(|e| format!("failed to open runtime db: {e}"))?;
+                db.snapshot_for_session(
+                    session_id,
+                    after_event_id.max(0),
+                    event_limit.clamp(1, 5_000),
+                    job_limit.clamp(1, 5_000),
+                )
+                .map_err(|e| format!("failed to load runtime snapshot: {e}"))
+            });
+            match task.await {
+                Ok(Ok(snapshot)) => RuntimeIpcMessage::Snapshot(snapshot),
+                Ok(Err(message)) => RuntimeIpcMessage::Error { message },
+                Err(err) => RuntimeIpcMessage::Error {
+                    message: format!("runtime snapshot task failed: {err}"),
+                },
+            }
+        }
+        RuntimeIpcRequest::Subscribe {
+            session_id,
+            after_event_id,
+        } => {
+            let task = tauri::async_runtime::spawn_blocking(move || {
+                let db = RuntimeDb::open(runtime_db_path)
+                    .map_err(|e| format!("failed to open runtime db: {e}"))?;
+                let events = db
+                    .runtime_events_after(session_id, after_event_id.max(0), 1_000)
+                    .map_err(|e| format!("failed to replay runtime events: {e}"))?;
+                let max_event_id = db
+                    .max_event_id()
+                    .map_err(|e| format!("failed to load max event id: {e}"))?;
+                Ok::<_, String>((events, max_event_id))
+            });
+            match task.await {
+                Ok(Ok((events, max_event_id))) => RuntimeIpcMessage::Events {
+                    events,
+                    max_event_id,
+                },
+                Ok(Err(message)) => RuntimeIpcMessage::Error { message },
+                Err(err) => RuntimeIpcMessage::Error {
+                    message: format!("runtime event replay task failed: {err}"),
+                },
+            }
+        }
+        RuntimeIpcRequest::Heartbeat => {
+            let task = tauri::async_runtime::spawn_blocking(move || {
+                let db = RuntimeDb::open(runtime_db_path)
+                    .map_err(|e| format!("failed to open runtime db: {e}"))?;
+                db.max_event_id()
+                    .map_err(|e| format!("failed to load max event id: {e}"))
+            });
+            match task.await {
+                Ok(Ok(max_event_id)) => RuntimeIpcMessage::Heartbeat { max_event_id },
+                Ok(Err(message)) => RuntimeIpcMessage::Error { message },
+                Err(err) => RuntimeIpcMessage::Error {
+                    message: format!("runtime heartbeat task failed: {err}"),
+                },
+            }
+        }
+    }
+}
+
+async fn write_runtime_ipc_message<W>(
+    writer: &mut W,
+    message: &RuntimeIpcMessage,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut line = serde_json::to_vec(message).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to encode runtime IPC response: {err}"),
+        )
+    })?;
+    line.push(b'\n');
+    writer.write_all(&line).await?;
+    writer.flush().await?;
+    writer.shutdown().await
+}
+
 fn runtime_worker_state_coalesce_key(event: &RuntimeEvent) -> Option<String> {
     match event {
         RuntimeEvent::WorkerStateChanged {
@@ -1052,8 +1415,10 @@ fn spawn_external_terminal(cwd: &Path) -> Result<(), String> {
 
 #[tauri::command]
 fn set_current_workspace(
+    app: tauri::AppHandle,
     workspace_state: tauri::State<'_, WorkspaceState>,
     file_watcher: tauri::State<'_, FileWatcherState>,
+    runtime_ipc: tauri::State<'_, RuntimeIpcServerState>,
     workspace_id: String,
 ) -> Result<Workspace, String> {
     let id =
@@ -1075,6 +1440,8 @@ fn set_current_workspace(
     if let Err(e) = file_watcher.watch_workspace(&new_ws) {
         eprintln!("[file_watcher] watch_workspace on switch failed: {e}");
     }
+    let config = SwitchyardConfig::resolve(&new_ws.primary_root).unwrap_or_default();
+    runtime_ipc.start_for_workspace(app, &new_ws, &config);
     Ok(new_ws)
 }
 
@@ -1082,6 +1449,7 @@ fn set_current_workspace(
 fn clear_current_workspace(
     workspace_state: tauri::State<'_, WorkspaceState>,
     file_watcher: tauri::State<'_, FileWatcherState>,
+    runtime_ipc: tauri::State<'_, RuntimeIpcServerState>,
 ) -> Result<(), String> {
     workspace_state.mutate(|idx| {
         idx.current = None;
@@ -1091,13 +1459,16 @@ fn clear_current_workspace(
     if let Err(e) = file_watcher.clear_workspace() {
         eprintln!("[file_watcher] clear_workspace failed: {e}");
     }
+    runtime_ipc.stop();
     Ok(())
 }
 
 #[tauri::command]
 fn create_workspace(
+    app: tauri::AppHandle,
     workspace_state: tauri::State<'_, WorkspaceState>,
     file_watcher: tauri::State<'_, FileWatcherState>,
+    runtime_ipc: tauri::State<'_, RuntimeIpcServerState>,
     primary_root: String,
     name: Option<String>,
 ) -> Result<Workspace, String> {
@@ -1120,13 +1491,17 @@ fn create_workspace(
     if let Err(e) = file_watcher.watch_workspace(&created) {
         eprintln!("[file_watcher] watch_workspace on create failed: {e}");
     }
+    let config = SwitchyardConfig::resolve(&created.primary_root).unwrap_or_default();
+    runtime_ipc.start_for_workspace(app, &created, &config);
     Ok(created)
 }
 
 #[tauri::command]
 fn update_workspace(
+    app: tauri::AppHandle,
     workspace_state: tauri::State<'_, WorkspaceState>,
     file_watcher: tauri::State<'_, FileWatcherState>,
+    runtime_ipc: tauri::State<'_, RuntimeIpcServerState>,
     workspace_id: String,
     name: Option<String>,
     extra_roots: Option<Vec<String>>,
@@ -1166,6 +1541,8 @@ fn update_workspace(
             if let Err(e) = file_watcher.watch_workspace(&updated) {
                 eprintln!("[file_watcher] re-watch on update failed: {e}");
             }
+            let config = SwitchyardConfig::resolve(&updated.primary_root).unwrap_or_default();
+            runtime_ipc.start_for_workspace(app, &updated, &config);
         }
     }
     Ok(updated)
@@ -1173,7 +1550,9 @@ fn update_workspace(
 
 #[tauri::command]
 fn delete_workspace(
+    app: tauri::AppHandle,
     workspace_state: tauri::State<'_, WorkspaceState>,
+    runtime_ipc: tauri::State<'_, RuntimeIpcServerState>,
     workspace_id: String,
 ) -> Result<(), String> {
     let id =
@@ -1181,7 +1560,14 @@ fn delete_workspace(
     workspace_state.mutate(|idx| {
         idx.remove(id);
         Ok(())
-    })
+    })?;
+    if let Ok(current) = workspace_state.current() {
+        let config = SwitchyardConfig::resolve(&current.primary_root).unwrap_or_default();
+        runtime_ipc.start_for_workspace(app, &current, &config);
+    } else {
+        runtime_ipc.stop();
+    }
+    Ok(())
     // Note: we intentionally don't delete the workspace's on-disk data
     // dir here. That's a separate destructive op the user can do
     // manually if they want — keeping it around protects against
@@ -4010,6 +4396,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(RuntimeIpcServerState::default())
         .manage(ActiveTurnState {
             cancel_by_session: std::sync::Mutex::new(HashMap::new()),
         })
@@ -4017,6 +4404,18 @@ fn main() {
         .manage(workspace_state)
         .manage(file_watcher)
         .manage(pty::PtyState::new())
+        .setup(|app| {
+            let workspace_state = app.state::<WorkspaceState>();
+            if let Ok(ws) = workspace_state.current() {
+                let config = SwitchyardConfig::resolve(&ws.primary_root).unwrap_or_default();
+                app.state::<RuntimeIpcServerState>().start_for_workspace(
+                    app.handle().clone(),
+                    &ws,
+                    &config,
+                );
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_config,
             save_config,
