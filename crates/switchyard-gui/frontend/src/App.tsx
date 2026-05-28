@@ -75,6 +75,14 @@ interface RuntimeSnapshot {
   events?: any[];
 }
 
+const RUNTIME_TURN_SESSION_CACHE_MAX_ENTRIES = 2_048;
+const RUNTIME_TURN_SESSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+interface RuntimeTurnSessionCacheEntry {
+  sessionId: string;
+  lastSeenAt: number;
+}
+
 interface PendingTurnAttachmentBinding {
   bindingId: string;
   sessionId: string;
@@ -667,6 +675,23 @@ function hyardJobsFromRuntimeSnapshot(snapshot: RuntimeSnapshot | null | undefin
     jobs[record.job_id] = record;
   });
   return jobs;
+}
+
+function pruneRuntimeTurnSessionCache(
+  entries: Record<string, RuntimeTurnSessionCacheEntry>,
+  nowMs = Date.now(),
+): Record<string, RuntimeTurnSessionCacheEntry> {
+  const freshEntries = Object.entries(entries).filter(([, entry]) => (
+    entry &&
+    entry.sessionId &&
+    Number.isFinite(entry.lastSeenAt) &&
+    nowMs - entry.lastSeenAt <= RUNTIME_TURN_SESSION_CACHE_TTL_MS
+  ));
+  if (freshEntries.length <= RUNTIME_TURN_SESSION_CACHE_MAX_ENTRIES) {
+    return Object.fromEntries(freshEntries);
+  }
+  freshEntries.sort((a, b) => b[1].lastSeenAt - a[1].lastSeenAt);
+  return Object.fromEntries(freshEntries.slice(0, RUNTIME_TURN_SESSION_CACHE_MAX_ENTRIES));
 }
 
 function upsertHyardJobRecord(jobs: Record<string, any>, record: any | null): Record<string, any> {
@@ -1682,7 +1707,7 @@ function App() {
   const [runtimePreparingPhase, setRuntimePreparingPhase] = useState<string | null>(null);
   const runtimeDispatchStartedAtRef = useRef<number | null>(null);
   const sessionUiSnapshotsRef = useRef<Record<string, SessionUiSnapshot>>({});
-  const runtimeTurnSessionIdRef = useRef<Record<string, string>>({});
+  const runtimeTurnSessionIdRef = useRef<Record<string, RuntimeTurnSessionCacheEntry>>({});
   const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [providerStatusLoading, setProviderStatusLoading] = useState(false);
   const [providerStatusError, setProviderStatusError] = useState<string | null>(null);
@@ -2774,9 +2799,10 @@ function App() {
         const turnId = normalizedString(turnIdValue);
         const sessionId = normalizedString(sessionIdValue);
         if (!turnId || !sessionId) return;
+        const nowMs = Date.now();
         runtimeTurnSessionIdRef.current = {
-          ...runtimeTurnSessionIdRef.current,
-          [turnId]: sessionId,
+          ...pruneRuntimeTurnSessionCache(runtimeTurnSessionIdRef.current, nowMs),
+          [turnId]: { sessionId, lastSeenAt: nowMs },
         };
       };
 
@@ -2792,8 +2818,10 @@ function App() {
         const explicit = normalizedString(data?.session_id);
         if (explicit) return explicit;
         const turnId = normalizedString(data?.turn_id ?? data?.core_turn_id ?? data?.in_flight_turn_id);
-        if (turnId && runtimeTurnSessionIdRef.current[turnId]) {
-          return runtimeTurnSessionIdRef.current[turnId];
+        const remembered = turnId ? runtimeTurnSessionIdRef.current[turnId] : null;
+        if (remembered) {
+          remembered.lastSeenAt = Date.now();
+          return remembered.sessionId;
         }
         return null;
       };
@@ -4729,7 +4757,7 @@ function App() {
       delete remainingSnapshots[sessionId];
       sessionUiSnapshotsRef.current = remainingSnapshots;
       runtimeTurnSessionIdRef.current = Object.fromEntries(
-        Object.entries(runtimeTurnSessionIdRef.current).filter(([, value]) => value !== sessionId),
+        Object.entries(runtimeTurnSessionIdRef.current).filter(([, value]) => value.sessionId !== sessionId),
       );
       preparingSessionIdsRef.current.delete(sessionId);
       dispatchingSessionIdsRef.current.delete(sessionId);
