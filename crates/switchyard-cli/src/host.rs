@@ -35,7 +35,8 @@ use switchyard_host_jobs::{
 use switchyard_provider_api::{CancellationToken, PromptMode, Provider};
 use switchyard_runtime::{
     CreateHostJob, HostJobMutation as RuntimeHostJobMutation,
-    HostJobStatus as RuntimeHostJobStatus, RuntimeDb,
+    HostJobStatus as RuntimeHostJobStatus, RuntimeDb, RuntimeEventRecord,
+    ipc::{DEFAULT_RUNTIME_IPC_PUBLISH_TIMEOUT, publish_runtime_events_with_timeout},
 };
 use switchyard_session::{InboxDeliveryMode, InboxEntry, InboxStatus, Session, TurnStatus};
 use switchyard_store::{
@@ -258,33 +259,87 @@ fn apply_runtime_host_job_mutation(mutation: &mut RuntimeHostJobMutation, job: &
     mutation.last_heartbeat_at = Some(job.updated_at);
 }
 
+fn runtime_ipc_debug_enabled() -> bool {
+    std::env::var("SWITCHYARD_RUNTIME_IPC_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn publish_runtime_events_best_effort(endpoint: &str, events: Vec<RuntimeEventRecord>) {
+    if endpoint.trim().is_empty() || events.is_empty() {
+        return;
+    }
+
+    let endpoint = endpoint.to_string();
+    let debug = runtime_ipc_debug_enabled();
+    let publish = async move {
+        publish_runtime_events_with_timeout(&endpoint, events, DEFAULT_RUNTIME_IPC_PUBLISH_TIMEOUT)
+            .await
+    };
+
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(publish)),
+        Err(_) => {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    if debug {
+                        eprintln!("[hyard] runtime IPC publish runtime init failed: {err}");
+                    }
+                    return;
+                }
+            };
+            runtime.block_on(publish)
+        }
+    };
+
+    if debug && let Err(err) = result {
+        eprintln!("[hyard] runtime IPC publish skipped: {err}");
+    }
+}
+
 fn create_runtime_host_job(
     config: &SwitchyardConfig,
     cwd: &Path,
     job: &HostJobState,
 ) -> Result<(), String> {
     let runtime_db_path = config.runtime_db_path(cwd);
-    create_runtime_host_job_at_path(&runtime_db_path, job)
+    let runtime_ipc_endpoint = config.runtime_ipc_endpoint(cwd);
+    let events = create_runtime_host_job_at_path(&runtime_db_path, job)?;
+    publish_runtime_events_best_effort(&runtime_ipc_endpoint, events);
+    Ok(())
 }
 
 fn create_runtime_host_job_at_path(
     runtime_db_path: &Path,
     job: &HostJobState,
-) -> Result<(), String> {
+) -> Result<Vec<RuntimeEventRecord>, String> {
     let mut db = RuntimeDb::open(runtime_db_path)
         .map_err(|err| format!("open runtime db '{}': {err}", runtime_db_path.display()))?;
     db.create_host_job(build_runtime_create_host_job(job, "hyard_host", "created"))
-        .map(|_| ())
+        .map(|write| write.event.into_iter().collect())
         .map_err(|err| format!("create runtime host job '{}': {err}", job.job_id))
 }
 
-fn ensure_runtime_host_job_exists(db: &mut RuntimeDb, job: &HostJobState) -> Result<(), String> {
+fn ensure_runtime_host_job_exists(
+    db: &mut RuntimeDb,
+    job: &HostJobState,
+) -> Result<Vec<RuntimeEventRecord>, String> {
     if db
         .get_host_job(job.job_id)
         .map_err(|err| format!("load runtime host job '{}': {err}", job.job_id))?
         .is_some()
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     db.create_host_job(build_runtime_create_host_job(
@@ -292,7 +347,7 @@ fn ensure_runtime_host_job_exists(db: &mut RuntimeDb, job: &HostJobState) -> Res
         "hyard_host",
         "recovered_from_manifest",
     ))
-    .map(|_| ())
+    .map(|write| write.event.into_iter().collect())
     .map_err(|err| format!("create runtime host job '{}': {err}", job.job_id))
 }
 
@@ -301,16 +356,18 @@ fn sync_runtime_host_job_at_path(
     job: &HostJobState,
     event_type: &'static str,
     source: &'static str,
-) -> Result<(), String> {
+) -> Result<Vec<RuntimeEventRecord>, String> {
     let mut db = RuntimeDb::open(runtime_db_path)
         .map_err(|err| format!("open runtime db '{}': {err}", runtime_db_path.display()))?;
-    ensure_runtime_host_job_exists(&mut db, job)?;
+    let mut events = ensure_runtime_host_job_exists(&mut db, job)?;
     let payload = runtime_host_job_payload(job, event_type);
-    db.transition_host_job(job.job_id, event_type, source, payload, |mutation| {
-        apply_runtime_host_job_mutation(mutation, job);
-    })
-    .map(|_| ())
-    .map_err(|err| format!("sync runtime host job '{}': {err}", job.job_id))
+    let write = db
+        .transition_host_job(job.job_id, event_type, source, payload, |mutation| {
+            apply_runtime_host_job_mutation(mutation, job);
+        })
+        .map_err(|err| format!("sync runtime host job '{}': {err}", job.job_id))?;
+    events.extend(write.event);
+    Ok(events)
 }
 
 fn sync_runtime_host_job_or_warn(
@@ -320,17 +377,32 @@ fn sync_runtime_host_job_or_warn(
     event_type: &'static str,
 ) {
     let runtime_db_path = config.runtime_db_path(cwd);
-    sync_runtime_host_job_at_path_or_warn(&runtime_db_path, job, event_type, "hyard_host");
+    let runtime_ipc_endpoint = config.runtime_ipc_endpoint(cwd);
+    sync_runtime_host_job_at_path_or_warn(
+        &runtime_db_path,
+        Some(&runtime_ipc_endpoint),
+        job,
+        event_type,
+        "hyard_host",
+    );
 }
 
 fn sync_runtime_host_job_at_path_or_warn(
     runtime_db_path: &Path,
+    runtime_ipc_endpoint: Option<&str>,
     job: &HostJobState,
     event_type: &'static str,
     source: &'static str,
 ) {
-    if let Err(err) = sync_runtime_host_job_at_path(runtime_db_path, job, event_type, source) {
-        eprintln!("[hyard] WARNING: {err}");
+    match sync_runtime_host_job_at_path(runtime_db_path, job, event_type, source) {
+        Ok(events) => {
+            if let Some(endpoint) = runtime_ipc_endpoint {
+                publish_runtime_events_best_effort(endpoint, events);
+            }
+        }
+        Err(err) => {
+            eprintln!("[hyard] WARNING: {err}");
+        }
     }
 }
 
@@ -485,11 +557,13 @@ pub async fn host_delegate_with_wait(
         let job_store_for_task = job_store.clone();
         let job_id = job.job_id;
         let runtime_db_path_for_task = config.runtime_db_path(cwd);
+        let runtime_ipc_endpoint_for_task = config.runtime_ipc_endpoint(cwd);
         tokio::spawn(async move {
             if let Err(err) = run_host_job(job_store_for_task.clone(), job_id, prepared).await {
                 if let Some(failed) = mark_job_failed(&job_store_for_task, job_id, &err) {
                     sync_runtime_host_job_at_path_or_warn(
                         &runtime_db_path_for_task,
+                        Some(&runtime_ipc_endpoint_for_task),
                         &failed,
                         "host_job.failed",
                         "hyard_host",
@@ -2958,6 +3032,7 @@ async fn run_host_job(
     prepared: PreparedHostJobRun,
 ) -> Result<(), String> {
     let runtime_db_path = prepared.config.runtime_db_path(&prepared.cwd);
+    let runtime_ipc_endpoint = prepared.config.runtime_ipc_endpoint(&prepared.cwd);
     let preflight_job = job_store
         .load(job_id)
         .map_err(|err| format!("load job '{job_id}': {err}"))?
@@ -2974,6 +3049,7 @@ async fn run_host_job(
             .map_err(|err| format!("cancel job '{job_id}' before start: {err}"))?;
         sync_runtime_host_job_at_path_or_warn(
             &runtime_db_path,
+            Some(&runtime_ipc_endpoint),
             &cancelled,
             "host_job.cancelled_before_start",
             "hyard_host",
@@ -3003,6 +3079,7 @@ async fn run_host_job(
         .map_err(|err| format!("mark job running: {err}"))?;
     sync_runtime_host_job_at_path_or_warn(
         &runtime_db_path,
+        Some(&runtime_ipc_endpoint),
         &running_job,
         "host_job.worker_started",
         "hyard_host",
@@ -3014,6 +3091,7 @@ async fn run_host_job(
     let event_store = job_store.clone();
     let event_job_id = job_id;
     let runtime_db_path_for_events = runtime_db_path.clone();
+    let runtime_ipc_endpoint_for_events = runtime_ipc_endpoint.clone();
     let event_task = tokio::spawn(async move {
         while let Some(event) = runtime_rx.recv().await {
             let event_type = runtime_host_job_event_type_for_runtime_event(&event);
@@ -3023,6 +3101,7 @@ async fn run_host_job(
                 if let Some(event_type) = event_type {
                     sync_runtime_host_job_at_path_or_warn(
                         &runtime_db_path_for_events,
+                        Some(&runtime_ipc_endpoint_for_events),
                         &updated,
                         event_type,
                         "hyard_host_runtime_observer",
@@ -3126,6 +3205,7 @@ async fn run_host_job(
                 };
                 sync_runtime_host_job_at_path_or_warn(
                     &runtime_db_path,
+                    Some(&runtime_ipc_endpoint),
                     &callback_job,
                     event_type,
                     "hyard_host",
@@ -3133,6 +3213,7 @@ async fn run_host_job(
             } else {
                 sync_runtime_host_job_at_path_or_warn(
                     &runtime_db_path,
+                    Some(&runtime_ipc_endpoint),
                     &final_job,
                     "host_job.turn_finished",
                     "hyard_host",
@@ -3166,6 +3247,7 @@ async fn run_host_job(
                 };
                 sync_runtime_host_job_at_path_or_warn(
                     &runtime_db_path,
+                    Some(&runtime_ipc_endpoint),
                     &callback_job,
                     event_type,
                     "hyard_host",
@@ -3173,6 +3255,7 @@ async fn run_host_job(
             } else {
                 sync_runtime_host_job_at_path_or_warn(
                     &runtime_db_path,
+                    Some(&runtime_ipc_endpoint),
                     &final_job,
                     "host_job.turn_finished",
                     "hyard_host",
