@@ -3823,6 +3823,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchyard-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "switchyard-session"
 version = "0.1.0"
 dependencies = [
