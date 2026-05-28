@@ -1,41 +1,45 @@
 # Switchyard
 
-> A local command center for AI coding CLIs.
+> 用一个桌面 App 管理你本机的 AI coding CLI。
 
-Switchyard 把你已经安装并登录好的 **Codex CLI**、**Claude Code**、**Gemini CLI** 和 **Antigravity CLI** 放到同一个本地工作台里。普通用户推荐优先使用桌面 App/GUI：它能可视化管理多会话、切换 sandbox 权限、查看流式输出与文件变更，并支持图片/文件附件。CLI、TUI 和 HYARD bridge 更适合终端用户、脚本自动化和高级协作场景。
+Switchyard 是一个本地 AI 编程工作台。它把你电脑里已经安装并登录好的 **Codex CLI**、**Claude Code**、**Gemini CLI**、**Antigravity CLI** 等工具放到同一个界面里，让你更方便地选择项目、切换 provider、管理会话、控制权限、发送附件、查看流式输出和文件变更。
 
-Switchyard 不托管模型，也不替代任何厂商账号、订阅、登录或安全策略。它是一层运行在你本机的路由、会话、工作区和协作界面。
+Switchyard 不提供模型账号，也不托管你的代码。它负责管理本机任务；具体模型能力、账号、计费和网络访问仍由你选择的 provider 决定。
 
-## 你可以用它做什么
+## 下载和安装
 
-- **统一入口**：用同一个命令或界面调用 Codex、Claude、Gemini、Antigravity 等 coding CLI。
-- **按任务切换 provider**：当前 turn 可以指定 provider，也可以在配置里设置默认 provider 和常用 peers。
-- **保留本地会话**：会话、事件、文件变更摘要和 artifacts 默认保存在项目本地的 `.switchyard/` 下。
-- **查看实时过程**：在 TUI/GUI 中查看模型正文、思考/执行状态、终端输出、工具活动、文件编辑和 diff。
-- **处理长会话**：GUI 面向长历史和大 diff 做了虚拟化/折叠处理，减少大型会话中的卡顿。
-- **发送附件**：GUI 输入区支持文本、复制粘贴、拖拽文件以及图片/截图附件。
-- **多会话并行**：不同 session 可以在后端同时运行，便于把互不相关的上下文隔离开。
-- **后台委托**：通过 HYARD host bridge 让一个 provider 把分析、审查或 worker 任务交给另一个 provider。
-- **权限控制**：每次运行可选择 `read-only`、`workspace-write` 或 `danger-full-access` sandbox 模式。
+推荐直接使用桌面 App。
 
-## 当前状态
+1. 打开 [Switchyard 下载页](https://github.com/Yidhar/Switchyard/releases/latest)。
+2. 下载适合 Windows 的文件：
+   - `Switchyard_..._x64-setup.exe`：推荐，适合大多数用户。
+   - `switchyard-gui.exe`：便携版，下载后可直接运行。
+3. 安装或启动 Switchyard。
+4. 确认你想使用的 provider CLI 已经在本机安装并登录。
 
-Switchyard 目前处于早期可用阶段，适合愿意从源码构建、并且已经熟悉至少一个 AI coding CLI 的用户试用。
+> Windows 首次运行未签名应用时可能出现 SmartScreen 提示。如果你信任当前下载来源，可以选择继续运行。
 
-- Provider CLI 需要你自行安装、登录并放入 `PATH`。
-- 默认优先支持 Windows 本地使用；Rust workspace 本身尽量保持跨平台。
-- 推荐入口是桌面 App/GUI。当前可以通过源码/dev 方式启动；CI 也会尝试自动构建 Windows App artifact，正式安装包会在发布流程稳定后优先提供。
+## 你可以用 Switchyard 做什么
 
-## 支持的 provider
+- 在一个 App 里使用 Codex、Claude、Gemini 或其他本机 provider。
+- 为每个项目或任务创建独立 session，避免上下文混在一起。
+- 在发送任务前选择权限模式，例如只读、允许修改当前项目、或完全访问。
+- 看到模型的实时正文、工具执行、权限请求、文件修改摘要和 diff。
+- 直接粘贴截图，或把图片、日志、文本文件拖进输入框。
+- 同时保留多个 session，让长任务在后台继续运行。
 
-| Provider 名称 | 默认命令 | 说明 |
+## 使用前准备 provider CLI
+
+Switchyard 调用的是你本机已有的 provider CLI。你只需要安装自己要用的 provider，不需要全部安装。
+
+| Provider | 默认命令 | 用途示例 |
 | --- | --- | --- |
-| `codex` | `codex` | 默认 provider。使用本机 Codex CLI 的账号、配置和权限流程。 |
-| `claude` | `claude` | 使用本机 Claude Code CLI。适合审查、分析、长文本整理等任务。 |
-| `gemini` | `gemini` | 使用本机 Gemini CLI。 |
-| `antigravity` | `agy` | 使用本机 Antigravity CLI。 |
+| Codex | `codex` | 代码阅读、修改、执行任务。 |
+| Claude Code | `claude` | 审查、分析、长上下文整理。 |
+| Gemini CLI | `gemini` | 作为另一个模型入口。 |
+| Antigravity CLI | `agy` | 作为另一个模型入口。 |
 
-运行前建议先确认对应命令可用：
+安装后，可以在终端里检查命令是否可用：
 
 ```bash
 codex --help
@@ -44,296 +48,106 @@ gemini --help
 agy --help
 ```
 
-不是每个 provider 都必须安装。你可以只安装并使用其中一个。
+如果某个命令在终端里也不可用，请先安装对应 CLI，或把它加入 `PATH`。如果命令可用但无法完成任务，请先直接运行该 CLI，完成登录、授权、模型选择或首次初始化。
 
-## 安装与构建
+## 第一次使用
 
-### 依赖
+### 1. 选择 workspace
 
-- Git
-- Rust 1.85 或更新版本
-- 需要使用 GUI 时：Node.js / npm，以及 Tauri 运行所需的系统依赖
-- 至少一个已经安装并登录的 provider CLI，例如 `codex` 或 `claude`
+打开 App 后，先选择一个 workspace。通常就是你希望 AI 阅读或修改的项目目录。
 
-### 从源码构建
+### 2. 选择 provider
 
-```bash
-git clone https://github.com/Yidhar/Switchyard.git
-cd Switchyard
-cargo build --release
-```
+选择这次要使用的 provider，例如 Codex 或 Claude。不同 session 可以使用不同 provider。
 
-构建完成后，二进制位于：
+### 3. 选择权限模式
 
-```text
-target/release/switchyard
-```
+发送任务前，先选择 sandbox 权限：
 
-Windows 下是：
-
-```text
-target\release\switchyard.exe
-```
-
-如果你还没有把它加入 `PATH`，可以直接从仓库目录运行：
-
-```powershell
-.\target\release\switchyard.exe check
-```
-
-仓库根目录也提供了一个 Windows 便捷脚本，它会优先寻找 debug/release 构建产物：
-
-```powershell
-.\switchyard.cmd check
-```
-
-下文为了简洁统一使用 `switchyard` 作为命令名；如果你没有安装到 `PATH`，请替换为实际路径或 `./switchyard.cmd`。
-
-## 快速开始（推荐 App 优先）
-
-### 1. 打开桌面 App
-
-Windows 源码环境可以直接运行：
-
-```powershell
-.\start-gui.ps1
-```
-
-这个脚本会：
-
-1. 检查 GUI 前端依赖；如果缺失则执行 `npm install`。
-2. 启动 Vite dev server。
-3. 启动 Tauri 桌面窗口。
-4. GUI 关闭后清理后台 dev server。
-
-推荐从 App 开始，因为它更适合日常使用：
-
-- 选择或隔离不同 workspace / session。
-- 在发送前快速切换 `read-only`、`workspace-write`、`danger-full-access` sandbox。
-- 查看流式正文、工具运行状态、文件编辑摘要和 diff。
-- 处理长会话、大历史和大 diff 的虚拟化展示。
-- 粘贴截图、拖拽文件/图片，并在消息区查看附件预览。
-- 在多个 session 间切换，同时保持后端任务继续运行。
-
-### 2. 检查 provider 与配置
-
-App 启动前后，都建议确认至少一个 provider CLI 已安装并登录：
-
-```bash
-switchyard check
-```
-
-需要机器可读输出时：
-
-```bash
-switchyard check --json
-```
-
-### 3. 可选：运行单次 CLI 任务
-
-使用默认 provider：
-
-```bash
-switchyard run --message "Summarize this repository"
-```
-
-指定 provider：
-
-```bash
-switchyard run --provider claude --message "Review the recent changes and list risks"
-```
-
-指定 sandbox 权限：
-
-```bash
-switchyard run \
-  --provider codex \
-  --sandbox read-only \
-  --message "Inspect the project and explain what it does"
-```
-
-允许 `workspace-write` 模式访问额外目录：
-
-```bash
-switchyard run \
-  --sandbox workspace-write \
-  --allow-path ../shared \
-  --message "Update the integration code that depends on ../shared"
-```
-
-### 4. 可选：打开终端界面
-
-```bash
-switchyard tui
-switchyard tui --provider codex
-switchyard tui --resume-latest
-switchyard tui --session <session-id-or-prefix>
-```
-
-## App 打包与发布
-
-每次推送到 `main` / `master` 或创建 pull request 时，GitHub Actions 会执行 Windows CI：
-
-- Ruff format/lint：检查 Python 辅助脚本和 CI 合约测试。
-- Rust format、Clippy、workspace tests。
-- Tauri Windows App 打包，产物上传为 `switchyard-windows-app` workflow artifact。
-
-发布 GitHub Release 时有两种推荐方式：
-
-1. 推送版本标签，例如：
-
-   ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-
-   `v*` 标签会触发 Windows App 打包，并把安装包、可执行文件和 `SHA256SUMS.txt` 上传到对应的 GitHub Release。
-
-2. 在 GitHub Actions 手动运行 `rust-windows` workflow，勾选 `publish_release`，并填写 `release_tag`。如果留空，CI 会创建一个 `app-<run_number>` 预发布标签。
-
-如果你只想从源码本地打包 App，可以在安装前端依赖后运行：
-
-```powershell
-cd crates\switchyard-gui
-npm --prefix frontend install
-npm run build
-.\frontend\node_modules\.bin\tauri.cmd build --bundles nsis --ci
-```
-
-本地生成 NSIS 安装包需要系统里可用 `makensis`。如果只想验证 release 版 App 是否能编译，可以把最后一行改为 `.\frontend\node_modules\.bin\tauri.cmd build --no-bundle --ci`。
-
-正式 release 稳定后，普通用户应优先下载桌面 App 安装包；CLI/TUI 仍会保留给脚本和终端工作流。
-
-## 配置
-
-Switchyard 会按以下顺序查找配置：
-
-1. 从当前工作目录向上查找 `switchyard.toml`。
-2. 如果项目内没有配置，则尝试读取 `~/.switchyard/switchyard.toml`。
-3. 如果都不存在，则使用内置默认值。
-
-最小配置可以只写默认 provider：
-
-```toml
-[core]
-default_provider = "codex"
-```
-
-一个更完整的示例：
-
-```toml
-[core]
-default_provider = "codex"
-default_peers = ["claude", "gemini"]
-
-[sandbox]
-mode = "workspace-write"
-allowed_paths = []
-
-[providers.codex]
-command = "codex"
-backend = "codex"
-timeout_secs = 900
-
-[providers.claude]
-command = "claude"
-backend = "claude"
-timeout_secs = 900
-
-[providers.gemini]
-command = "gemini"
-backend = "gemini"
-timeout_secs = 900
-
-[providers.antigravity]
-command = "agy"
-backend = "antigravity"
-timeout_secs = 900
-
-[store]
-backend = "sqlite"
-
-[ui]
-show_diff = true
-show_artifacts = true
-```
-
-配置说明：
-
-- `core.default_provider`：未显式指定 provider 时使用哪个 provider。
-- `core.default_peers`：常用后台委托 provider 列表。
-- `providers.<name>.command`：实际执行的 provider CLI 命令；也可以写绝对路径。
-- `providers.<name>.backend`：适配器类型，可用值包括 `codex`、`claude`、`gemini`、`antigravity`。
-- `providers.<name>.args`：附加传给 provider CLI 的参数。
-- `providers.<name>.env`：为该 provider 注入的环境变量。
-- `providers.<name>.timeout_secs`：单次调用超时时间，默认 900 秒。
-- `store.backend`：本地会话存储后端；通常使用 `sqlite` 即可。
-
-如果你的 CLI 命令名就是默认值，并且只需要默认行为，可以不写 `[providers.*]`；Switchyard 会注册内置 provider 适配器。
-
-## Sandbox 权限模式
-
-Switchyard 的 sandbox 是本地文件访问策略，用于告诉 provider 这一轮允许怎样访问工作区：
-
-| 模式 | 适合场景 | 行为 |
+| 模式 | 适合场景 | 含义 |
 | --- | --- | --- |
-| `read-only` | 代码审查、解释项目、风险分析 | 尽量只读，不应修改文件。 |
-| `workspace-write` | 常规开发任务 | 默认推荐模式。允许在当前工作区内写入，并可通过 `--allow-path` / `sandbox.allowed_paths` 添加额外路径。 |
-| `danger-full-access` | 你完全信任当前任务和工作区 | 不做文件系统 sandbox 限制。只建议在可信环境中临时使用。 |
+| `read-only` | 解释项目、代码审查、风险分析 | 只读查看，不修改文件。 |
+| `workspace-write` | 日常代码修改 | 允许修改当前 workspace 内的文件，适合大多数改代码任务。 |
+| `danger-full-access` | 你完全信任的任务 | 不限制文件访问。只建议临时用于可信任务。 |
 
-CLI 中可以每次运行覆盖配置：
+不确定时，先选 `read-only`。需要让模型改代码时，再切到 `workspace-write`。
 
-```bash
-switchyard run --sandbox read-only --message "Review only; do not edit files"
+### 4. 发送任务
+
+你可以像聊天一样描述目标，例如：
+
+```text
+阅读这个项目，告诉我主要功能和启动方式。
 ```
 
-GUI 中可以在发送前切换权限模式。遇到 provider 发起的权限请求时，GUI 会显示待处理 approval card；在用户明确 approve / deny 前，不应静默默认拒绝。
-
-## HYARD host bridge：后台委托与多 provider 协作
-
-`switchyard host` 提供机器可读的 bridge，适合把 Switchyard 嵌入其他 agent、脚本或 host pack。
-
-列出可用 provider：
-
-```bash
-switchyard host list
+```text
+修复登录页表单校验问题，并说明改了哪些文件。
 ```
 
-发起后台委托：
-
-```bash
-switchyard host delegate \
-  --provider claude \
-  --task "Review the authentication module and report risks" \
-  --wait-sec 1
+```text
+只做代码审查，不修改文件。重点检查权限、路径处理和并发问题。
 ```
 
-如果返回 `wait_timeout`，并不代表失败；任务仍可能在后台运行。使用返回的 `job_id` 查询：
+### 5. 查看过程和结果
 
-```bash
-switchyard host status --job-id <job_id>
-switchyard host result --job-id <job_id>
-switchyard host await --job-id <job_id> --timeout-sec 30
+任务运行时，消息区会持续显示：
+
+- 模型输出的正文。
+- 正在运行的工具或命令。
+- 需要你确认的权限请求。
+- 文件变更数量和摘要。
+- 可展开查看的 diff。
+
+如果出现权限确认卡片，需要你明确选择 approve 或 deny。没有确认前，任务不应该静默继续或被当作默认拒绝。
+
+## 图片和文件附件
+
+Switchyard 支持常见的附件输入方式：
+
+- 从剪贴板粘贴截图或图片。
+- 拖拽图片、日志、文本文件到输入框。
+- 在消息区查看已发送图片预览。
+- 点击图片预览查看大图。
+
+示例：
+
+```text
+参考这张截图，把当前页面的按钮间距调小一点。
 ```
 
-Bridge 输出为紧凑 JSON，便于其他工具读取 `status`、`job_id`、`message` 和 `next_actions`。
+```text
+根据我拖进来的日志文件，找出启动失败的原因。
+```
 
-## 本地数据保存位置
+## 会话和历史
 
-默认情况下，项目级数据保存在当前项目的 `.switchyard/` 目录下，例如：
+建议按任务拆分 session：
 
-- session 与事件记录
-- SQLite store
-- artifacts / 图片 / 文件附件
-- 后台 job 状态
+- 一个 bug 一个 session。
+- 一个功能一个 session。
+- 一个审查任务一个 session。
+- 不同项目使用不同 workspace。
 
-这些数据用于恢复会话和展示历史。Switchyard 本身不会把它们上传到远端仓库；你也不应该把包含私人会话、密钥或截图的 `.switchyard/` 提交到 Git。
+这样可以减少上下文混乱，也方便你在多个任务之间切换。长会话中，大型文件变更和大型 diff 会被折叠，避免页面一次性渲染太多内容。
+
+## 本地数据和隐私
+
+Switchyard 默认把会话、附件、文件变更记录和本地数据库保存在当前项目的 `.switchyard/` 目录下。
+
+这些数据只在你的电脑上使用，可能包含：
+
+- 对话历史。
+- 截图和附件。
+- 文件修改摘要。
+- 本地任务状态。
+
+不要把 `.switchyard/` 提交到公开仓库。如果你要分享项目，建议先确认 `.gitignore` 已经忽略该目录。
 
 ## 常见问题
 
-### `switchyard check` 提示 provider 不可用
+### 打开 App 后找不到 provider
 
-先确认对应 CLI 是否安装并登录：
+先在终端中确认 provider 命令可用：
 
 ```bash
 codex --help
@@ -342,29 +156,35 @@ gemini --help
 agy --help
 ```
 
-如果命令不在 `PATH`，可以在 `switchyard.toml` 中把 `providers.<name>.command` 设置为绝对路径。
+如果终端也找不到命令，请先安装对应 provider CLI，或把命令加入 `PATH`。
 
-### Provider 已安装，但仍然无法执行任务
+### Provider 命令存在，但任务无法运行
 
-通常需要先在 provider 自己的 CLI 中完成登录、模型选择或首次授权。Switchyard 复用本机 provider CLI，不会代替它完成账号登录。
+通常是 provider 自己还没有完成登录、模型选择、首次授权或初始化。请先直接运行对应 CLI，确认它可以独立完成一次简单任务。
 
-### GUI 启动失败
+### 我应该选哪个权限模式
 
-确认已经安装 Node.js / npm，并先构建过 Rust 项目：
+- 只想让模型阅读和解释：选 `read-only`。
+- 想让模型修改当前项目：选 `workspace-write`。
+- 需要访问工作区外的文件：优先添加允许访问的路径。
+- 只有完全信任任务和环境时才选 `danger-full-access`。
 
-```powershell
-cargo build
-.\start-gui.ps1
-```
+### 图片或附件无法读取
 
-如果前端依赖损坏，可以删除 `crates/switchyard-gui/frontend/node_modules` 后重新运行 `./start-gui.ps1`。
+请确认：
 
-### 我应该选哪个 sandbox？
+- 文件仍然存在，没有被系统清理。
+- 文件在当前 workspace 或允许访问的目录中。
+- App 有权限读取该路径。
+- 如果是临时截图，建议重新粘贴或拖拽一次。
 
-- 不确定或只想看分析：选 `read-only`。
-- 正常让 agent 改代码：选 `workspace-write`。
-- 明确需要访问工作区外的路径：优先使用 `workspace-write` + `--allow-path`。
-- 只有在完全可信时才使用 `danger-full-access`。
+### 任务看起来还在运行
+
+长任务可能会持续执行命令、读取文件或等待 provider 输出。你可以查看消息区中的运行状态、工具状态和权限请求。如果出现权限确认卡片，需要先 approve 或 deny。
+
+### 会话很多以后变慢怎么办
+
+可以把不同任务拆成更小的 session，并关闭暂时不看的大型 diff。Switchyard 会尽量折叠大块内容，但长会话仍建议按任务分开保存。
 
 ## License
 
