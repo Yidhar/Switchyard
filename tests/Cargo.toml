@@ -27,6 +27,7 @@ switchyard-provider-antigravity = { workspace = true }
 switchyard-cli = { workspace = true }
 switchyard-tui = { workspace = true }
 switchyard-host-jobs = { workspace = true }
+switchyard-runtime = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

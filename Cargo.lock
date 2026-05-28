@@ -3888,6 +3888,7 @@ dependencies = [
  "switchyard-provider-codex",
  "switchyard-provider-gemini",
  "switchyard-provider-subprocess",
+ "switchyard-runtime",
  "switchyard-session",
  "switchyard-store",
  "switchyard-tui",
