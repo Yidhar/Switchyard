@@ -10,6 +10,8 @@ Switchyard 不提供模型账号，也不托管你的代码。它负责管理本
 
 推荐直接使用桌面 App。
 
+### 方式一：下载桌面 App
+
 1. 打开 [Switchyard 下载页](https://github.com/Yidhar/Switchyard/releases/latest)。
 2. 下载适合 Windows 的文件：
    - `Switchyard_..._x64-setup.exe`：推荐，适合大多数用户。
@@ -18,6 +20,27 @@ Switchyard 不提供模型账号，也不托管你的代码。它负责管理本
 4. 确认你想使用的 provider CLI 已经在本机安装并登录。
 
 > Windows 首次运行未签名应用时可能出现 SmartScreen 提示。如果你信任当前下载来源，可以选择继续运行。
+
+### 方式二：从源码启动
+
+如果你想体验最新代码，或暂时无法使用桌面 App 文件，也可以从源码启动。
+
+需要先安装：
+
+- Git
+- Rust
+- Node.js / npm
+- 至少一个已经安装并登录的 provider CLI，例如 `codex` 或 `claude`
+
+然后在终端中运行：
+
+```powershell
+git clone https://github.com/Yidhar/Switchyard.git
+cd Switchyard
+.\start-gui.ps1
+```
+
+`start-gui.ps1` 会自动安装前端依赖并打开 Switchyard 桌面窗口。首次启动可能需要等待几分钟。
 
 ## 你可以用 Switchyard 做什么
 
