@@ -559,16 +559,16 @@ pub async fn host_delegate_with_wait(
         let runtime_db_path_for_task = config.runtime_db_path(cwd);
         let runtime_ipc_endpoint_for_task = config.runtime_ipc_endpoint(cwd);
         tokio::spawn(async move {
-            if let Err(err) = run_host_job(job_store_for_task.clone(), job_id, prepared).await {
-                if let Some(failed) = mark_job_failed(&job_store_for_task, job_id, &err) {
-                    sync_runtime_host_job_at_path_or_warn(
-                        &runtime_db_path_for_task,
-                        Some(&runtime_ipc_endpoint_for_task),
-                        &failed,
-                        "host_job.failed",
-                        "hyard_host",
-                    );
-                }
+            if let Err(err) = run_host_job(job_store_for_task.clone(), job_id, prepared).await
+                && let Some(failed) = mark_job_failed(&job_store_for_task, job_id, &err)
+            {
+                sync_runtime_host_job_at_path_or_warn(
+                    &runtime_db_path_for_task,
+                    Some(&runtime_ipc_endpoint_for_task),
+                    &failed,
+                    "host_job.failed",
+                    "hyard_host",
+                );
             }
         });
 
@@ -588,19 +588,19 @@ pub async fn host_delegate_with_wait(
         sync_runtime_host_job_or_warn(config, cwd, &launched, "host_job.worker_launched");
     }
 
-    emit_wait_result(
+    emit_wait_result(WaitResultRequest {
         config,
         cwd,
-        &job_store,
-        job.job_id,
+        job_store: &job_store,
+        job_id: job.job_id,
         wait_secs,
-        "delegate",
-        BridgeTimingMs {
+        command: "delegate",
+        timing: BridgeTimingMs {
             launch_ms: clamp_millis_u64(launch_start.elapsed()),
             ..BridgeTimingMs::default()
         },
         total_start,
-    )
+    })
     .await;
 }
 
@@ -680,10 +680,10 @@ pub async fn host_worker(
             }
         };
 
-    if let Err(err) = run_host_job(job_store.clone(), parsed_job_id, prepared).await {
-        if let Some(failed) = mark_job_failed(&job_store, parsed_job_id, &err) {
-            sync_runtime_host_job_or_warn(config, cwd, &failed, "host_job.failed");
-        }
+    if let Err(err) = run_host_job(job_store.clone(), parsed_job_id, prepared).await
+        && let Some(failed) = mark_job_failed(&job_store, parsed_job_id, &err)
+    {
+        sync_runtime_host_job_or_warn(config, cwd, &failed, "host_job.failed");
     }
 }
 
@@ -733,16 +733,16 @@ pub async fn host_await(config: &SwitchyardConfig, job_id: &str, cwd: &Path, tim
         }
     }
 
-    emit_wait_result(
+    emit_wait_result(WaitResultRequest {
         config,
         cwd,
-        &job_store,
-        parsed_job_id,
-        timeout_secs,
-        "await",
-        BridgeTimingMs::default(),
+        job_store: &job_store,
+        job_id: parsed_job_id,
+        wait_secs: timeout_secs,
+        command: "await",
+        timing: BridgeTimingMs::default(),
         total_start,
-    )
+    })
     .await;
 }
 
@@ -2656,16 +2656,29 @@ fn collapse_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-async fn emit_wait_result(
-    config: &SwitchyardConfig,
-    cwd: &Path,
-    job_store: &HostJobStore,
+struct WaitResultRequest<'a> {
+    config: &'a SwitchyardConfig,
+    cwd: &'a Path,
+    job_store: &'a HostJobStore,
     job_id: Uuid,
     wait_secs: u64,
     command: &'static str,
-    mut timing: BridgeTimingMs,
+    timing: BridgeTimingMs,
     total_start: Instant,
-) {
+}
+
+async fn emit_wait_result(request: WaitResultRequest<'_>) {
+    let WaitResultRequest {
+        config,
+        cwd,
+        job_store,
+        job_id,
+        wait_secs,
+        command,
+        mut timing,
+        total_start,
+    } = request;
+
     let wait_start = Instant::now();
     let job = wait_for_job(job_store, job_id, wait_secs).await;
     let job = match job {
@@ -3097,16 +3110,15 @@ async fn run_host_job(
             let event_type = runtime_host_job_event_type_for_runtime_event(&event);
             if let Ok(updated) =
                 event_store.update(event_job_id, |job| apply_runtime_event(job, &event))
+                && let Some(event_type) = event_type
             {
-                if let Some(event_type) = event_type {
-                    sync_runtime_host_job_at_path_or_warn(
-                        &runtime_db_path_for_events,
-                        Some(&runtime_ipc_endpoint_for_events),
-                        &updated,
-                        event_type,
-                        "hyard_host_runtime_observer",
-                    );
-                }
+                sync_runtime_host_job_at_path_or_warn(
+                    &runtime_db_path_for_events,
+                    Some(&runtime_ipc_endpoint_for_events),
+                    &updated,
+                    event_type,
+                    "hyard_host_runtime_observer",
+                );
             }
         }
     });
