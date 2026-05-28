@@ -32,6 +32,7 @@ pub enum TurnPhase {
 }
 
 /// Result of a completed turn.
+#[derive(Debug)]
 pub struct TurnOutput {
     pub turn_id: Uuid,
     pub response: Option<String>,
@@ -381,11 +382,13 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     let mut failed = false;
     let mut output_completed = false;
     let mut accumulated_response = String::new();
+    let mut failure_reason: Option<String> = None;
     let provider_result;
 
     async fn drain_event(
         pe: &switchyard_provider_api::ProviderEvent,
         failed: &mut bool,
+        failure_reason: &mut Option<String>,
         output_completed: &mut bool,
         runtime_tx: Option<&mpsc::Sender<crate::runtime_events::RuntimeEvent>>,
         store: &mut (impl CanonicalStore + ?Sized),
@@ -393,6 +396,9 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     ) -> Result<(), CoreError> {
         if pe.event_type == switchyard_provider_api::EventType::TurnFailed {
             *failed = true;
+            if failure_reason.is_none() {
+                *failure_reason = provider_event_failure_reason(pe);
+            }
         }
         let empty_reasoning_payload = is_empty_reasoning_payload(&pe.payload);
         if let Some(tx) = runtime_tx {
@@ -510,6 +516,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
                 drain_event(
                     &pe,
                     &mut failed,
+                    &mut failure_reason,
                     &mut output_completed,
                     runtime_tx,
                     store,
@@ -532,6 +539,7 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
         drain_event(
             &pe,
             &mut failed,
+            &mut failure_reason,
             &mut output_completed,
             runtime_tx,
             store,
@@ -541,10 +549,15 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     }
 
     if provider_result.is_err() || cancel.is_cancelled() {
-        let err_msg = match &provider_result {
-            Err(e) => e.to_string(),
-            Ok(_) => "cancelled".to_string(),
-        };
+        let err_msg = failure_reason
+            .clone()
+            .or_else(|| provider_result.as_ref().err().map(ToString::to_string))
+            .unwrap_or_else(|| "cancelled".to_string());
+        // A failed or cancelled provider may already have staged a result in
+        // its per-turn cache.  Finalize best-effort to avoid leaking that cache
+        // entry; the failure state below is authoritative and must not be
+        // overwritten by a late partial result.
+        let _ = provider.finalize_turn(turn_id).await;
         let mut failed_turn = turn;
         failed_turn.status = TurnStatus::Failed;
         failed_turn.error_message = Some(err_msg.clone());
@@ -564,15 +577,15 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
                 session_id,
                 turn_id,
                 provider: session.active_core.clone(),
-                error: err_msg,
+                error: err_msg.clone(),
             })
             .await
             .ok();
         }
-        return Ok(TurnOutput {
-            turn_id,
-            response: failed_turn.provider_response,
-        });
+        return match provider_result {
+            Err(err) => Err(err.into()),
+            Ok(_) => Err(CoreError::Runner(err_msg)),
+        };
     }
 
     // Provider output is done — signal UI before slow finalize/archive work.
@@ -590,8 +603,31 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     let (result, artifact_bundle) = match provider.finalize_turn(turn_id).await {
         Ok(result) => result,
         Err(err) => {
+            let err_msg = err.to_string();
+            let mut failed_turn = turn;
+            failed_turn.status = TurnStatus::Failed;
+            failed_turn.error_message = Some(err_msg.clone());
+            failed_turn.completed_at = Some(chrono::Utc::now());
+            if let Some(cleaned_response) = clean_provider_response_text(
+                &accumulated_response,
+                &stored_user_message,
+                &provider_user_message_for_echo_check,
+            ) {
+                failed_turn.provider_response = Some(cleaned_response);
+            }
+            store.append_turn(&failed_turn)?;
             session.clear_active_turn();
             store.save_session(session)?;
+            if let Some(tx) = runtime_tx {
+                tx.send(crate::runtime_events::RuntimeEvent::TurnFailed {
+                    session_id,
+                    turn_id,
+                    provider: session.active_core.clone(),
+                    error: err_msg,
+                })
+                .await
+                .ok();
+            }
             return Err(err.into());
         }
     };
@@ -659,17 +695,19 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
     );
     if failed || result.exit_code.is_some_and(|c| c != 0) {
         updated_turn.status = TurnStatus::Failed;
-        updated_turn.error_message = result
-            .stderr
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                result
-                    .exit_code
-                    .filter(|code| *code != 0)
-                    .map(|code| format!("non-zero exit ({code})"))
-            })
-            .or_else(|| failed.then(|| "provider reported failure".to_string()));
+        updated_turn.error_message = failure_reason.clone().or_else(|| {
+            result
+                .stderr
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    result
+                        .exit_code
+                        .filter(|code| *code != 0)
+                        .map(|code| format!("non-zero exit ({code})"))
+                })
+                .or_else(|| failed.then(|| "provider reported failure".to_string()))
+        });
     } else {
         updated_turn.status = TurnStatus::Completed;
     }
@@ -701,10 +739,52 @@ pub(crate) async fn run_turn_phased_with_messages_policy_and_attachments(
         }
     }
 
-    Ok(TurnOutput {
-        turn_id,
-        response: updated_turn.provider_response,
-    })
+    if updated_turn.status == TurnStatus::Completed {
+        Ok(TurnOutput {
+            turn_id,
+            response: updated_turn.provider_response,
+        })
+    } else {
+        Err(CoreError::Runner(
+            updated_turn
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "provider reported failure".to_string()),
+        ))
+    }
+}
+
+fn provider_event_failure_reason(pe: &switchyard_provider_api::ProviderEvent) -> Option<String> {
+    if pe.event_type != switchyard_provider_api::EventType::TurnFailed {
+        return None;
+    }
+    extract_failure_reason_from_payload(&pe.payload)
+}
+
+fn extract_failure_reason_from_payload(payload: &serde_json::Value) -> Option<String> {
+    fn non_empty(value: Option<&serde_json::Value>) -> Option<String> {
+        let value = value?;
+        if let Some(text) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text.to_string());
+        }
+        if !value.is_null() {
+            let rendered = value.to_string();
+            if !rendered.trim().is_empty() {
+                return Some(rendered);
+            }
+        }
+        None
+    }
+
+    non_empty(payload.get("error").and_then(|error| error.get("message")))
+        .or_else(|| non_empty(payload.get("error")))
+        .or_else(|| non_empty(payload.get("message")))
+        .or_else(|| non_empty(payload.get("reason")))
+        .or_else(|| non_empty(Some(payload)).filter(|_| !payload.is_object()))
 }
 
 fn is_system_status_line(text: &str) -> bool {
@@ -1594,7 +1674,7 @@ mod tests {
         store.save_session(&session).unwrap();
 
         let provider = FakeProvider::failure("crash");
-        let output = run_turn(
+        let err = run_turn(
             &mut store,
             &mut session,
             &provider,
@@ -1602,16 +1682,310 @@ mod tests {
             PathBuf::from("."),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+        assert!(err.to_string().contains("crash"));
 
-        let events = store.list_events(output.turn_id).unwrap();
+        let turns = store.list_turns(session.session_id).unwrap();
+        let turn_id = turns.last().unwrap().turn_id;
+        let events = store.list_events(turn_id).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].event_type, EventType::TurnFailed);
 
-        let turns = store.list_turns(session.session_id).unwrap();
         assert_eq!(turns.last().unwrap().status, TurnStatus::Failed);
         let persisted_session = store.load_session(session.session_id).unwrap().unwrap();
         assert!(persisted_session.active_turn_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_failed_reason_is_preserved_over_stderr() {
+        use switchyard_provider_api::*;
+
+        struct StreamReasonProvider {
+            results: Arc<tokio::sync::Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for StreamReasonProvider {
+            async fn probe(&self) -> Result<ProbeResult, ProviderError> {
+                Ok(ProbeResult {
+                    version: None,
+                    available: true,
+                    capabilities: Default::default(),
+                    issues: vec![],
+                    ..Default::default()
+                })
+            }
+
+            async fn start_turn(
+                &self,
+                turn_id: Uuid,
+                _input: TurnInput,
+                _policy: ExecutionPolicy,
+                _context: ContextBundle,
+                event_tx: mpsc::Sender<ProviderEvent>,
+                _cancel: CancellationToken,
+            ) -> Result<(), ProviderError> {
+                event_tx
+                    .send(ProviderEvent::turn_started(turn_id, "stream-reason"))
+                    .await
+                    .ok();
+                event_tx
+                    .send(ProviderEvent::turn_failed(
+                        turn_id,
+                        "stream-reason",
+                        "streamed failure reason",
+                    ))
+                    .await
+                    .ok();
+                self.results.lock().await.insert(
+                    turn_id,
+                    (
+                        TurnResult {
+                            response_text: String::new(),
+                            exit_code: Some(1),
+                            stderr: Some("stderr fallback reason".to_string()),
+                            metadata: HashMap::new(),
+                        },
+                        ArtifactBundle { artifacts: vec![] },
+                    ),
+                );
+                Ok(())
+            }
+
+            async fn finalize_turn(
+                &self,
+                turn_id: Uuid,
+            ) -> Result<(TurnResult, ArtifactBundle), ProviderError> {
+                self.results
+                    .lock()
+                    .await
+                    .remove(&turn_id)
+                    .ok_or(ProviderError::ExecutionFailed("no result".into()))
+            }
+        }
+
+        let (mut store, _dir) = temp_store();
+        let mut session = Session::new("stream-reason".to_string());
+        store.save_session(&session).unwrap();
+        let provider = StreamReasonProvider {
+            results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        };
+
+        let err = run_turn(
+            &mut store,
+            &mut session,
+            &provider,
+            "fail with stream reason".to_string(),
+            PathBuf::from("."),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("streamed failure reason"));
+        let turns = store.list_turns(session.session_id).unwrap();
+        let failed_turn = turns.last().unwrap();
+        assert_eq!(failed_turn.status, TurnStatus::Failed);
+        assert_eq!(
+            failed_turn.error_message.as_deref(),
+            Some("streamed failure reason")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_error_persists_failed_turn_and_runtime_event() {
+        use switchyard_provider_api::*;
+
+        struct FinalizeErrorProvider;
+
+        #[async_trait::async_trait]
+        impl Provider for FinalizeErrorProvider {
+            async fn probe(&self) -> Result<ProbeResult, ProviderError> {
+                Ok(ProbeResult {
+                    version: None,
+                    available: true,
+                    capabilities: Default::default(),
+                    issues: vec![],
+                    ..Default::default()
+                })
+            }
+
+            async fn start_turn(
+                &self,
+                turn_id: Uuid,
+                _input: TurnInput,
+                _policy: ExecutionPolicy,
+                _context: ContextBundle,
+                event_tx: mpsc::Sender<ProviderEvent>,
+                _cancel: CancellationToken,
+            ) -> Result<(), ProviderError> {
+                event_tx
+                    .send(ProviderEvent::turn_started(turn_id, "finalize-error"))
+                    .await
+                    .ok();
+                event_tx
+                    .send(ProviderEvent::text_message(
+                        turn_id,
+                        "finalize-error",
+                        "partial answer before finalize failed",
+                    ))
+                    .await
+                    .ok();
+                event_tx
+                    .send(ProviderEvent::turn_completed(turn_id, "finalize-error"))
+                    .await
+                    .ok();
+                Ok(())
+            }
+
+            async fn finalize_turn(
+                &self,
+                _turn_id: Uuid,
+            ) -> Result<(TurnResult, ArtifactBundle), ProviderError> {
+                Err(ProviderError::ExecutionFailed("finalize exploded".into()))
+            }
+        }
+
+        let (mut store, _dir) = temp_store();
+        let mut session = Session::new("finalize-error".to_string());
+        store.save_session(&session).unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::runtime_events::RuntimeEvent>(16);
+
+        let err = run_turn_full(
+            &mut store,
+            &mut session,
+            &FinalizeErrorProvider,
+            "trigger finalize error".to_string(),
+            PathBuf::from("."),
+            None,
+            Some(&tx),
+        )
+        .await
+        .unwrap_err();
+        drop(tx);
+
+        assert!(err.to_string().contains("finalize exploded"));
+        let turns = store.list_turns(session.session_id).unwrap();
+        let failed_turn = turns.last().unwrap();
+        assert_eq!(failed_turn.status, TurnStatus::Failed);
+        assert!(
+            failed_turn
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("finalize exploded"))
+        );
+        assert_eq!(
+            failed_turn.provider_response.as_deref(),
+            Some("partial answer before finalize failed")
+        );
+        let persisted_session = store.load_session(session.session_id).unwrap().unwrap();
+        assert!(persisted_session.active_turn_id.is_none());
+
+        let mut saw_turn_failed = false;
+        while let Some(event) = rx.recv().await {
+            if let crate::runtime_events::RuntimeEvent::TurnFailed { error, .. } = event {
+                saw_turn_failed = error.contains("finalize exploded");
+                break;
+            }
+        }
+        assert!(
+            saw_turn_failed,
+            "finalize error must emit TurnFailed runtime event"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_start_error_finalizes_best_effort_and_fails_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use switchyard_provider_api::*;
+
+        struct StartErrorProvider {
+            results: Arc<tokio::sync::Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
+            finalize_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for StartErrorProvider {
+            async fn probe(&self) -> Result<ProbeResult, ProviderError> {
+                Ok(ProbeResult {
+                    version: None,
+                    available: true,
+                    capabilities: Default::default(),
+                    issues: vec![],
+                    ..Default::default()
+                })
+            }
+
+            async fn start_turn(
+                &self,
+                turn_id: Uuid,
+                _input: TurnInput,
+                _policy: ExecutionPolicy,
+                _context: ContextBundle,
+                event_tx: mpsc::Sender<ProviderEvent>,
+                _cancel: CancellationToken,
+            ) -> Result<(), ProviderError> {
+                event_tx
+                    .send(ProviderEvent::turn_started(turn_id, "start-error"))
+                    .await
+                    .ok();
+                self.results.lock().await.insert(
+                    turn_id,
+                    (
+                        TurnResult {
+                            response_text: "cached partial result".to_string(),
+                            exit_code: Some(1),
+                            stderr: Some("cached stderr".to_string()),
+                            metadata: HashMap::new(),
+                        },
+                        ArtifactBundle { artifacts: vec![] },
+                    ),
+                );
+                Err(ProviderError::ExecutionFailed("start failed hard".into()))
+            }
+
+            async fn finalize_turn(
+                &self,
+                turn_id: Uuid,
+            ) -> Result<(TurnResult, ArtifactBundle), ProviderError> {
+                self.finalize_count.fetch_add(1, Ordering::SeqCst);
+                self.results
+                    .lock()
+                    .await
+                    .remove(&turn_id)
+                    .ok_or(ProviderError::ExecutionFailed("no result".into()))
+            }
+        }
+
+        let (mut store, _dir) = temp_store();
+        let mut session = Session::new("start-error".to_string());
+        store.save_session(&session).unwrap();
+        let provider = StartErrorProvider {
+            results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            finalize_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let err = run_turn(
+            &mut store,
+            &mut session,
+            &provider,
+            "trigger start error".to_string(),
+            PathBuf::from("."),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("start failed hard"));
+        assert_eq!(provider.finalize_count.load(Ordering::SeqCst), 1);
+        assert!(provider.results.lock().await.is_empty());
+        let turns = store.list_turns(session.session_id).unwrap();
+        let failed_turn = turns.last().unwrap();
+        assert_eq!(failed_turn.status, TurnStatus::Failed);
+        assert!(
+            failed_turn
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("start failed hard"))
+        );
     }
 
     #[tokio::test]
@@ -1821,7 +2195,7 @@ mod tests {
             results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
-        let output = run_turn(
+        let err = run_turn(
             &mut store,
             &mut session,
             &provider,
@@ -1829,14 +2203,15 @@ mod tests {
             PathBuf::from("."),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+        assert!(err.to_string().contains("non-zero exit (1)"));
 
         let turns = store.list_turns(session.session_id).unwrap();
         let last = turns.last().unwrap();
         assert_eq!(last.status, TurnStatus::Failed);
         assert_eq!(last.error_message.as_deref(), Some("non-zero exit (1)"));
 
-        let events = store.list_events(output.turn_id).unwrap();
+        let events = store.list_events(last.turn_id).unwrap();
         assert_eq!(
             events[1].event_type,
             switchyard_session::EventType::TurnCompleted

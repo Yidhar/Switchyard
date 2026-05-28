@@ -66,6 +66,7 @@ pub async fn run_codex_turn(
     let protocol_done_consumer = protocol_done.clone();
     let consumer = tokio::spawn(async move {
         let mut assistant_message = String::new();
+        let mut plain_text_fallback = String::new();
         let mut has_protocol_json = false;
         while let Some(output_line) = line_rx.recv().await {
             let line = output_line.text;
@@ -94,22 +95,18 @@ pub async fn run_codex_turn(
                         .ok();
                     continue;
                 }
-                // {"type":"item.delta","delta":{"type":"agent_message_delta","text":"..."}}
-                if msg_type == "item.delta"
-                    && let Some(delta) = json.get("delta")
-                    && delta.get("type").and_then(|t| t.as_str()) == Some("agent_message_delta")
-                    && let Some(text) = delta.get("text").and_then(|t| t.as_str())
-                {
-                    assistant_message.push_str(text);
-                }
-                // {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
-                if msg_type == "item.completed"
-                    && let Some(item) = json.get("item")
-                    && item.get("type").and_then(|t| t.as_str()) == Some("agent_message")
-                    && let Some(text) = item.get("text").and_then(|t| t.as_str())
-                    && assistant_message.is_empty()
-                {
-                    assistant_message.push_str(text);
+                if let Some(text) = extract_protocol_assistant_text(msg_type, &json) {
+                    // Codex commonly emits streaming deltas followed by a
+                    // completed agent_message item containing the same full
+                    // text.  Keep the completed item as a fallback only when
+                    // no deltas were seen so we do not duplicate responses.
+                    if msg_type == "item.completed" {
+                        if assistant_message.is_empty() {
+                            assistant_message.push_str(&text);
+                        }
+                    } else {
+                        assistant_message.push_str(&text);
+                    }
                 }
                 event_tx_clone
                     .send(ProviderEvent::new(
@@ -121,13 +118,17 @@ pub async fn run_codex_turn(
                     .await
                     .ok();
             } else if !line.trim().is_empty() {
+                if !plain_text_fallback.is_empty() {
+                    plain_text_fallback.push('\n');
+                }
+                plain_text_fallback.push_str(protocol_line);
                 event_tx_clone
                     .send(ProviderEvent::text_message(turn_id, "codex", protocol_line))
                     .await
                     .ok();
             }
         }
-        (assistant_message, has_protocol_json)
+        (assistant_message, plain_text_fallback, has_protocol_json)
     });
 
     let result = run_subprocess_streaming_until(
@@ -139,7 +140,17 @@ pub async fn run_codex_turn(
     )
     .await;
     drop(line_tx);
-    let (assistant_message, has_protocol_json) = consumer.await.unwrap_or_default();
+    let (assistant_message, plain_text_fallback, has_protocol_json) = match consumer.await {
+        Ok(output) => output,
+        Err(err) => {
+            let message = format!("codex output consumer failed: {err}");
+            event_tx
+                .send(ProviderEvent::turn_failed(turn_id, "codex", &message))
+                .await
+                .ok();
+            return Err(ProviderError::ExecutionFailed(message));
+        }
+    };
 
     let output = match result {
         Ok(o) => o,
@@ -153,13 +164,84 @@ pub async fn run_codex_turn(
         emit_completion_event(&output, turn_id, "codex", event_tx).await;
     }
 
-    let response_text = if assistant_message.is_empty() && !has_protocol_json {
+    let response_text = if !assistant_message.is_empty() {
+        assistant_message
+    } else if !plain_text_fallback.trim().is_empty() {
+        plain_text_fallback.trim().to_string()
+    } else if !has_protocol_json {
         output.stdout.trim().to_string()
     } else {
-        assistant_message
+        let message = "codex protocol completed without an assistant message".to_string();
+        event_tx
+            .send(ProviderEvent::turn_failed(turn_id, "codex", &message))
+            .await
+            .ok();
+        return Err(ProviderError::ExecutionFailed(message));
     };
 
     Ok(build_turn_result(response_text, &output, "codex"))
+}
+
+fn extract_protocol_assistant_text(msg_type: &str, json: &serde_json::Value) -> Option<String> {
+    match msg_type {
+        "item.delta" => json.get("delta").and_then(|delta| {
+            let delta_type = delta.get("type").and_then(|value| value.as_str());
+            let looks_like_message = matches!(
+                delta_type,
+                Some(
+                    "agent_message_delta"
+                        | "assistant_message_delta"
+                        | "output_text_delta"
+                        | "message_delta"
+                )
+            );
+            looks_like_message.then(|| {
+                delta
+                    .get("text")
+                    .or_else(|| delta.get("content"))
+                    .and_then(json_text_content)
+            })?
+        }),
+        "item.completed" => json.get("item").and_then(|item| {
+            let item_type = item.get("type").and_then(|value| value.as_str());
+            let looks_like_message = matches!(
+                item_type,
+                Some("agent_message" | "assistant_message" | "assistant" | "message")
+            );
+            looks_like_message.then(|| {
+                item.get("text")
+                    .or_else(|| item.get("content"))
+                    .and_then(json_text_content)
+            })?
+        }),
+        "response.output_text.delta" | "response/output_text/delta" => {
+            json.get("delta").and_then(json_text_content)
+        }
+        _ => None,
+    }
+}
+
+fn json_text_content(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+        return Some(text.to_string());
+    }
+    if let Some(blocks) = value.as_array() {
+        let joined = blocks
+            .iter()
+            .filter_map(|block| {
+                block
+                    .as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| block.get("text").and_then(json_text_content))
+                    .or_else(|| block.get("content").and_then(json_text_content))
+            })
+            .collect::<String>();
+        return (!joined.is_empty()).then_some(joined);
+    }
+    value
+        .get("text")
+        .and_then(json_text_content)
+        .or_else(|| value.get("content").and_then(json_text_content))
 }
 
 fn codex_policy_args(policy: &ExecutionPolicy) -> Vec<String> {
@@ -204,6 +286,42 @@ mod tests {
         assert_eq!(
             codex_policy_args(&danger),
             vec!["--sandbox", "danger-full-access"]
+        );
+    }
+
+    #[test]
+    fn extracts_protocol_assistant_text_from_delta_and_completed_shapes() {
+        let delta = serde_json::json!({
+            "type": "item.delta",
+            "delta": { "type": "agent_message_delta", "text": "hel" }
+        });
+        assert_eq!(
+            extract_protocol_assistant_text("item.delta", &delta).as_deref(),
+            Some("hel")
+        );
+
+        let completed = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "assistant_message",
+                "content": [{ "text": "hello" }, { "text": " world" }]
+            }
+        });
+        assert_eq!(
+            extract_protocol_assistant_text("item.completed", &completed).as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn ignores_non_assistant_protocol_text() {
+        let tool_delta = serde_json::json!({
+            "type": "item.delta",
+            "delta": { "type": "terminal_output_delta", "text": "tool stdout" }
+        });
+        assert_eq!(
+            extract_protocol_assistant_text("item.delta", &tool_delta),
+            None
         );
     }
 }

@@ -80,6 +80,9 @@ impl LiveInstance for SubprocessLiveInstance {
             let mut rx = rx_lock.lock().await;
             while let Some(line) = rx.recv().await {
                 if line.contains("__HYARD_TURN_FINISHED__") {
+                    let _ = event_tx
+                        .send(ProviderEvent::turn_completed(turn_id, &provider_name))
+                        .await;
                     break;
                 }
 
@@ -87,6 +90,13 @@ impl LiveInstance for SubprocessLiveInstance {
                     if let Some(event_type) = json.get("event_type").and_then(|t| t.as_str())
                         && (event_type == "turn.completed" || event_type == "turn.failed")
                     {
+                        let lifecycle_type = if event_type == "turn.failed" {
+                            EventType::TurnFailed
+                        } else {
+                            EventType::TurnCompleted
+                        };
+                        let pe = ProviderEvent::new(turn_id, lifecycle_type, &provider_name, json);
+                        let _ = event_tx.send(pe).await;
                         break;
                     }
                     let pe =

@@ -763,7 +763,7 @@ impl LiveInstance for CodexAppServerInstance {
                             .unwrap_or_else(|| Value::Object(Default::default()));
                         annotate_protocol_payload(&mut payload, method);
                         set_payload_field_if_absent(&mut payload, "item_type", "command_execution");
-                        set_payload_field_if_absent(&mut payload, "status", "completed");
+                        set_process_exit_status(&mut payload);
                         let pe = ProviderEvent::new(
                             canonical_turn_id,
                             EventType::ItemUpdated,
@@ -791,11 +791,7 @@ impl LiveInstance for CodexAppServerInstance {
                         return;
                     }
                     "turn/failed" => {
-                        let err_text = frame
-                            .get("params")
-                            .and_then(|p| p.get("error"))
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "turn/failed without error payload".into());
+                        let err_text = turn_failed_error_text(frame.get("params"));
                         let _ = event_tx
                             .send(ProviderEvent::turn_failed(
                                 canonical_turn_id,
@@ -947,6 +943,90 @@ fn set_payload_field_if_absent(payload: &mut Value, key: &str, value: &str) {
         map.entry(key.to_string())
             .or_insert_with(|| Value::String(value.to_string()));
     }
+}
+
+fn set_payload_field(payload: &mut Value, key: &str, value: &str) {
+    if let Value::Object(map) = payload {
+        map.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn set_process_exit_status(payload: &mut Value) {
+    if let Some(code) = process_exit_code(payload) {
+        let status = if code == 0 { "completed" } else { "failed" };
+        set_payload_field(payload, "status", status);
+    } else {
+        set_payload_field_if_absent(payload, "status", "completed");
+    }
+}
+
+fn process_exit_code(payload: &Value) -> Option<i64> {
+    [
+        "exitCode",
+        "exit_code",
+        "code",
+        "exitStatus",
+        "exit_status",
+        "statusCode",
+        "status_code",
+    ]
+    .into_iter()
+    .find_map(|key| json_i64(payload.get(key)))
+    .or_else(|| payload.get("exit").and_then(|exit| json_i64(Some(exit))))
+    .or_else(|| {
+        payload.get("process").and_then(|process| {
+            ["exitCode", "exit_code", "code"]
+                .into_iter()
+                .find_map(|key| json_i64(process.get(key)))
+        })
+    })
+}
+
+fn json_i64(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+}
+
+fn turn_failed_error_text(params: Option<&Value>) -> String {
+    params
+        .and_then(|params| {
+            human_json_text(params.get("error"))
+                .or_else(|| human_json_text(params.get("message")))
+                .or_else(|| human_json_text(Some(params)).filter(|_| !params.is_object()))
+        })
+        .unwrap_or_else(|| "turn/failed without error payload".to_string())
+}
+
+fn human_json_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    if let Some(message) = value
+        .get("message")
+        .and_then(|message| message.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(message.to_string());
+    }
+    if let Some(error) = value.get("error") {
+        return human_json_text(Some(error));
+    }
+    if !value.is_null() {
+        let rendered = value.to_string();
+        if !rendered.trim().is_empty() {
+            return Some(rendered);
+        }
+    }
+    None
 }
 
 fn debug_codex_stream_enabled() -> bool {
@@ -1723,6 +1803,35 @@ mod tests {
         assert_eq!(
             payload.get("item_type").and_then(|v| v.as_str()),
             Some("command_output_delta")
+        );
+    }
+
+    #[test]
+    fn process_exited_status_uses_exit_code() {
+        let mut success = json!({ "exitCode": 0 });
+        set_process_exit_status(&mut success);
+        assert_eq!(
+            success.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
+
+        let mut failure = json!({ "exit_code": "2" });
+        set_process_exit_status(&mut failure);
+        assert_eq!(
+            failure.get("status").and_then(|v| v.as_str()),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn turn_failed_error_text_avoids_json_string_quotes() {
+        assert_eq!(
+            turn_failed_error_text(Some(&json!({ "error": "plain failure" }))),
+            "plain failure"
+        );
+        assert_eq!(
+            turn_failed_error_text(Some(&json!({ "error": { "message": "nested failure" } }))),
+            "nested failure"
         );
     }
 
