@@ -1373,30 +1373,24 @@ impl App {
                         *pending_submit = Some(msg.clone());
                     }
                 }
-                KeyCode::Enter => {
-                    if !self.input.is_empty() {
-                        *pending_submit = Some(self.input.clone());
-                        self.input.clear();
-                        self.cursor = 0;
-                    }
+                KeyCode::Enter if !self.input.is_empty() => {
+                    *pending_submit = Some(self.input.clone());
+                    self.input.clear();
+                    self.cursor = 0;
                 }
                 KeyCode::Char(c) => {
                     let bp = char_to_byte(&self.input, self.cursor);
                     self.input.insert(bp, c);
                     self.cursor += 1;
                 }
-                KeyCode::Backspace => {
-                    if self.cursor > 0 {
-                        self.cursor -= 1;
-                        let bp = char_to_byte(&self.input, self.cursor);
-                        self.input.remove(bp);
-                    }
+                KeyCode::Backspace if self.cursor > 0 => {
+                    self.cursor -= 1;
+                    let bp = char_to_byte(&self.input, self.cursor);
+                    self.input.remove(bp);
                 }
                 KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-                KeyCode::Right => {
-                    if self.cursor < self.input.chars().count() {
-                        self.cursor += 1;
-                    }
+                KeyCode::Right if self.cursor < self.input.chars().count() => {
+                    self.cursor += 1;
                 }
                 KeyCode::Home => self.cursor = 0,
                 KeyCode::End => self.cursor = self.input.chars().count(),

@@ -476,11 +476,9 @@ impl Perform for ScreenState {
                 }
             }
             'm' => self.apply_sgr(params),
-            'h' | 'l' if question_mode => {
+            'h' | 'l' if question_mode && Self::param(params, 0, 0) == 1049 => {
                 // Handle alt-screen enter/leave conservatively by clearing.
-                if Self::param(params, 0, 0) == 1049 {
-                    self.clear_screen();
-                }
+                self.clear_screen();
             }
             _ => {}
         }
