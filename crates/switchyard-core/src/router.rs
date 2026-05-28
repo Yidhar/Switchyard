@@ -194,6 +194,19 @@ fn build_hyard_continuation_hint(cwd: &Path) -> Option<String> {
     build_hyard_continuation_hint_from_dir(&config.job_dir(cwd))
 }
 
+async fn build_hyard_continuation_hint_async(cwd: PathBuf) -> Option<String> {
+    // Listing HYARD manifests can touch the filesystem and, for stale-job
+    // recovery, probe OS process state. Keep it away from the async reactor and
+    // cap how long prompt decoration can delay the user's turn. If this best
+    // effort hint times out, the durable job state is still available through
+    // explicit HYARD status/result calls and the runtime DB/UI snapshot.
+    let task = tokio::task::spawn_blocking(move || build_hyard_continuation_hint(&cwd));
+    match tokio::time::timeout(std::time::Duration::from_millis(750), task).await {
+        Ok(Ok(hint)) => hint,
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
 fn build_hyard_session_hint(session_id: Uuid) -> String {
     format!(
         "HYARD live-session hint:\n\
@@ -643,7 +656,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
     let (continuation_hint, initial_hint, mut callback_receipts) = if prompt_injection
         .includes_orchestration()
     {
-        let continuation_hint = build_hyard_continuation_hint(&cwd);
+        let continuation_hint = build_hyard_continuation_hint_async(cwd.clone()).await;
         let session_hint = build_hyard_session_hint(session.session_id);
         let callback_receipts = collect_callback_receipts_for_injection(store, session.session_id)?;
         let callback_hint = build_callback_receipt_hint(&callback_receipts);
