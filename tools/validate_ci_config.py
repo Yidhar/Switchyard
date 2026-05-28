@@ -15,8 +15,16 @@ REQUIRED_SNIPPETS = (
     "python tools/validate_ci_config.py",
     "ruff format --check .",
     "ruff check .",
+    "tags:",
+    '"v*"',
     "tauri-apps/tauri-action",
     "actions/upload-artifact@v4",
+    "contents: write",
+    "Collect release assets",
+    "SHA256SUMS.txt",
+    "Publish GitHub release",
+    "gh release create",
+    "gh release upload",
 )
 
 

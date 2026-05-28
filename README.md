@@ -176,7 +176,20 @@ switchyard tui --session <session-id-or-prefix>
 
 - Ruff format/lint：检查 Python 辅助脚本和 CI 合约测试。
 - Rust format、Clippy、workspace tests。
-- Tauri Windows App 打包，产物上传为 `switchyard-windows-app` artifact。
+- Tauri Windows App 打包，产物上传为 `switchyard-windows-app` workflow artifact。
+
+发布 GitHub Release 时有两种推荐方式：
+
+1. 推送版本标签，例如：
+
+   ```bash
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+   `v*` 标签会触发 Windows App 打包，并把安装包、可执行文件和 `SHA256SUMS.txt` 上传到对应的 GitHub Release。
+
+2. 在 GitHub Actions 手动运行 `rust-windows` workflow，勾选 `publish_release`，并填写 `release_tag`。如果留空，CI 会创建一个 `app-<run_number>` 预发布标签。
 
 如果你只想从源码本地打包 App，可以在安装前端依赖后运行：
 

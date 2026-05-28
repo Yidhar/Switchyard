@@ -5,8 +5,24 @@ on:
     branches:
       - main
       - master
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish or update a GitHub Release from this build."
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "Manual release tag. Leave blank to create app-<run_number>."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   validate:
@@ -52,6 +68,8 @@ jobs:
     name: Package Windows app
     runs-on: windows-latest
     needs: validate
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -95,3 +113,94 @@ jobs:
             target/release/switchyard-gui.exe
             crates/switchyard-gui/target/release/bundle/nsis/**
             crates/switchyard-gui/target/release/switchyard-gui.exe
+
+      - name: Resolve release tag
+        id: release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true'
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } else {
+            $tag = "${{ github.event.inputs.release_tag }}"
+            if ([string]::IsNullOrWhiteSpace($tag)) {
+              $tag = "app-${{ github.run_number }}"
+            }
+          }
+
+          if ($tag -notmatch "^(v|app-)") {
+            throw "Release tag must start with 'v' or 'app-'. Got: $tag"
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Collect release assets
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+
+          $patterns = @(
+            "target/release/bundle/nsis/*.exe",
+            "target/release/bundle/nsis/*.msi",
+            "target/release/bundle/nsis/*.zip",
+            "target/release/switchyard-gui.exe",
+            "crates/switchyard-gui/target/release/bundle/nsis/*.exe",
+            "crates/switchyard-gui/target/release/bundle/nsis/*.msi",
+            "crates/switchyard-gui/target/release/bundle/nsis/*.zip",
+            "crates/switchyard-gui/target/release/switchyard-gui.exe"
+          )
+
+          $files = @()
+          foreach ($pattern in $patterns) {
+            $files += Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue
+          }
+          $files = $files | Sort-Object -Property FullName -Unique
+
+          if (-not $files) {
+            throw "No release assets found after Tauri build."
+          }
+
+          foreach ($file in $files) {
+            Copy-Item -Path $file.FullName -Destination (Join-Path "release-assets" $file.Name) -Force
+          }
+
+          Push-Location release-assets
+          Get-ChildItem -File | ForEach-Object {
+            $hash = Get-FileHash -Algorithm SHA256 -Path $_.FullName
+            "{0}  {1}" -f $hash.Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content -Path SHA256SUMS.txt -Encoding utf8
+          Pop-Location
+
+          Get-ChildItem -Path release-assets -File | Format-Table Name, Length
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $title = "Switchyard $env:RELEASE_TAG"
+          $notes = @"
+          Switchyard desktop App build for $env:RELEASE_TAG.
+
+          Recommended entry point: download and run the Windows desktop App. CLI and TUI remain available for advanced terminal workflows.
+          "@
+          $notes | Set-Content -Path release-notes.md -Encoding utf8
+
+          $assetPaths = Get-ChildItem -Path release-assets -File | ForEach-Object { $_.FullName }
+          if (-not $assetPaths) {
+            throw "No release assets to upload."
+          }
+
+          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null) {
+            gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --title $title --notes-file release-notes.md
+            gh release upload $env:RELEASE_TAG @assetPaths --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            if ($env:RELEASE_TAG.StartsWith("app-")) {
+              gh release create $env:RELEASE_TAG @assetPaths --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $title --notes-file release-notes.md --prerelease
+            } else {
+              gh release create $env:RELEASE_TAG @assetPaths --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $title --notes-file release-notes.md
+            }
+          }
