@@ -68,7 +68,7 @@ async fn full_turn_lifecycle_failure() {
     store.save_session(&session).unwrap();
 
     let provider = FakeProvider::failure("internal error");
-    let output = run_turn(
+    let err = run_turn(
         &mut store,
         &mut session,
         &provider,
@@ -76,14 +76,15 @@ async fn full_turn_lifecycle_failure() {
         PathBuf::from("."),
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(err.to_string().contains("internal error"));
 
     let turns = store.list_turns(session.session_id).unwrap();
     let final_turn = turns.last().unwrap();
     assert_eq!(final_turn.status, TurnStatus::Failed);
     assert_eq!(final_turn.error_message.as_deref(), Some("internal error"));
 
-    let events = store.list_events(output.turn_id).unwrap();
+    let events = store.list_events(final_turn.turn_id).unwrap();
     assert_eq!(events.len(), 2);
     assert_eq!(events[1].event_type, EventType::TurnFailed);
 }
