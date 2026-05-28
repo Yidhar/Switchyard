@@ -361,7 +361,7 @@ async fn run_subprocess_streaming_until_pipe(
                 Err(e) => Err(SubprocessError::ProcessFailed(format!("wait: {e}"))),
             }
         }
-        _ = tokio::time::sleep(timeout) => {
+        _ = tokio::time::sleep(timeout), if config.timeout_secs > 0 => {
             terminate_child(&mut child).await;
             Err(SubprocessError::Timeout(config.timeout_secs))
         }
@@ -594,7 +594,7 @@ async fn try_run_subprocess_streaming_until_pty(
 
     let exit_result = tokio::select! {
         result = wait_pty_exit_code(&mut child) => result,
-        _ = tokio::time::sleep(timeout) => {
+        _ = tokio::time::sleep(timeout), if config.timeout_secs > 0 => {
             terminate_pty_child(&mut child).await?;
             Err(SubprocessError::Timeout(config.timeout_secs))
         }
@@ -799,25 +799,22 @@ async fn collect_output(
     stderr_task: tokio::task::JoinHandle<Option<String>>,
     timeout_secs: u64,
 ) -> Result<SubprocessOutput, SubprocessError> {
-    let timeout = tokio::time::Duration::from_secs(timeout_secs);
-    let read_result = tokio::time::timeout(timeout, async {
-        let mut full_stdout = Vec::new();
-        if let Some(stdout) = child.stdout.take() {
-            let mut reader = stdout;
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(read) => full_stdout.extend_from_slice(&buf[..read]),
-                    Err(_) => break,
-                }
-            }
-        }
-        String::from_utf8_lossy(&full_stdout).into_owned()
-    })
-    .await;
+    if timeout_secs == 0 {
+        let full_stdout = read_child_stdout(&mut child).await;
+        let stderr = stderr_task.await.ok().flatten();
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| SubprocessError::ProcessFailed(format!("wait failed: {e}")))?;
+        return Ok(SubprocessOutput {
+            stdout: full_stdout,
+            stderr,
+            exit_code: status.code(),
+        });
+    }
 
-    match read_result {
+    let timeout = tokio::time::Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(timeout, read_child_stdout(&mut child)).await {
         Ok(full_stdout) => {
             let stderr = stderr_task.await.ok().flatten();
             let status = child
@@ -838,9 +835,91 @@ async fn collect_output(
     }
 }
 
+async fn read_child_stdout(child: &mut tokio::process::Child) -> String {
+    let mut full_stdout = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = stdout;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(read) => full_stdout.extend_from_slice(&buf[..read]),
+                Err(_) => break,
+            }
+        }
+    }
+    String::from_utf8_lossy(&full_stdout).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn current_test_binary_list_command() -> (String, Vec<String>) {
+        (
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            vec!["--list".to_string()],
+        )
+    }
+
+    #[tokio::test]
+    async fn run_subprocess_timeout_zero_waits_for_process() {
+        let (command, args) = current_test_binary_list_command();
+        let config = SubprocessConfig {
+            command: &command,
+            args: &args,
+            stdin_data: None,
+            timeout_secs: 0,
+            cwd: None,
+            pty_registry_key: None,
+            prefer_pty: false,
+            env: None,
+        };
+
+        let output = run_subprocess(&config).await.unwrap();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert!(
+            output
+                .stdout
+                .contains("run_subprocess_timeout_zero_waits_for_process")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_subprocess_streaming_timeout_zero_waits_for_process() {
+        let (command, args) = current_test_binary_list_command();
+        let config = SubprocessConfig {
+            command: &command,
+            args: &args,
+            stdin_data: None,
+            timeout_secs: 0,
+            cwd: None,
+            pty_registry_key: None,
+            prefer_pty: false,
+            env: None,
+        };
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(32);
+
+        let output = run_subprocess_streaming(&config, &line_tx, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert!(
+            output
+                .stdout
+                .contains("run_subprocess_streaming_timeout_zero_waits_for_process")
+        );
+        let mut streamed = String::new();
+        while let Ok(line) = line_rx.try_recv() {
+            streamed.push_str(&line.text);
+        }
+        assert!(streamed.contains("run_subprocess_streaming_timeout_zero_waits_for_process"));
+    }
 
     #[test]
     fn rewrite_windows_npm_wrapper_expands_to_node_and_js_entry() {

@@ -9,7 +9,7 @@ default_peers = [
 [providers.codex]
 command = "codex"
 args = []
-timeout_secs = 900
+timeout_secs = 0
 backend = "codex"
 
 [providers.codex.env]
@@ -17,7 +17,7 @@ backend = "codex"
 [providers.antigravity]
 command = "agy"
 args = []
-timeout_secs = 900
+timeout_secs = 0
 backend = "antigravity"
 
 [providers.antigravity.env]
@@ -25,7 +25,7 @@ backend = "antigravity"
 [providers.gemini]
 command = "gemini"
 args = []
-timeout_secs = 900
+timeout_secs = 0
 backend = "gemini"
 
 [providers.gemini.env]
@@ -33,7 +33,7 @@ backend = "gemini"
 [providers.claude]
 command = "claude"
 args = []
-timeout_secs = 900
+timeout_secs = 0
 backend = "claude"
 
 [providers.claude.env]

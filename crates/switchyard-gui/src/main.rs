@@ -2289,7 +2289,7 @@ async fn load_config(
                         command: command.to_string(),
                         args,
                         env: std::collections::HashMap::new(),
-                        timeout_secs: 900,
+                        timeout_secs: 0,
                         backend: Some(name.to_string()),
                     },
                 );
@@ -3106,12 +3106,7 @@ async fn run_turn(
     // another session's pending file edits.
     file_watcher.start_turn_for(session.session_id);
 
-    let mut policy = execution_policy_from_config_with_overrides(&config, &cwd, sandbox_mode, &[]);
-    if policy.timeout_secs == 0 {
-        if let Some(provider_config) = config.providers.get(&provider) {
-            policy.timeout_secs = provider_config.timeout_secs;
-        }
-    }
+    let policy = execution_policy_from_config_with_overrides(&config, &cwd, sandbox_mode, &[]);
     let output = run_routed_turn_observable_with_policy_attachments_and_prompt_injection(
         &mut store,
         &mut session,

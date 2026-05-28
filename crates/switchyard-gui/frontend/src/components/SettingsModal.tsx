@@ -126,7 +126,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {Object.keys(config.providers || {}).includes(settingsTab) && (() => {
               const pName = settingsTab;
-              const prov = config.providers[pName] || { command: '', args: [], env: {}, timeout_secs: 900, backend: null };
+              const prov = config.providers[pName] || { command: '', args: [], env: {}, timeout_secs: 0, backend: null };
               return (
                 <>
                   <div className="settings-form-group">
@@ -166,12 +166,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
 
                   <div className="settings-form-group">
-                    <label>Execution Timeout (seconds)</label>
+                    <label>Execution Timeout (seconds; 0 = no hard timeout)</label>
                     <input 
                       type="number" 
                       className="settings-input"
+                      min={0}
                       value={prov.timeout_secs}
-                      onChange={(e) => onProviderFieldChange(pName, 'timeout_secs', parseInt(e.target.value) || 900)}
+                      onChange={(e) => {
+                        const parsed = Number.parseInt(e.target.value, 10);
+                        onProviderFieldChange(
+                          pName,
+                          'timeout_secs',
+                          Number.isFinite(parsed) && parsed >= 0 ? parsed : 0,
+                        );
+                      }}
                     />
                   </div>
 

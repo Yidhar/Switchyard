@@ -94,7 +94,8 @@ pub enum EffectiveSandboxMode {
 
 impl Default for ExecutionPolicy {
     /// Conservative defaults: no write access, no allowed paths, current
-    /// directory as cwd, 0 timeout (meaning "use the provider's default").
+    /// directory as cwd, 0 timeout (meaning "use the provider's default";
+    /// provider defaults may also be 0, which disables hard timeouts).
     /// Hook handlers and live-instance drain tasks should treat this as
     /// "deny everything risky" — operations that need write access or a
     /// specific allowed path must be opted in by the caller.

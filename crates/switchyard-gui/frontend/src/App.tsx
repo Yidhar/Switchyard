@@ -4570,7 +4570,7 @@ function App() {
         command: defaultCommand,
         args: defaultArgs,
         env: {},
-        timeout_secs: 900,
+        timeout_secs: 0,
         backend: trimmedBackend,
       };
       return {

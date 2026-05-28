@@ -131,6 +131,7 @@ pub fn compose_prompt(input: &switchyard_provider_api::TurnInput) -> String {
 /// Resolve the effective timeout for one provider turn.
 ///
 /// `policy_timeout_secs == 0` means "use the provider's configured default".
+/// A returned value of `0` means "no hard timeout".
 pub fn effective_timeout_secs(provider_default_timeout_secs: u64, policy_timeout_secs: u64) -> u64 {
     if policy_timeout_secs == 0 {
         provider_default_timeout_secs
@@ -183,6 +184,7 @@ mod tests {
 
     #[test]
     fn effective_timeout_uses_provider_default_when_policy_is_zero() {
+        assert_eq!(effective_timeout_secs(0, 0), 0);
         assert_eq!(effective_timeout_secs(300, 0), 300);
         assert_eq!(effective_timeout_secs(900, 0), 900);
     }

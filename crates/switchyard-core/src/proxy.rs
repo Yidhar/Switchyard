@@ -94,7 +94,9 @@ impl Provider for PersistentProviderProxy {
             let mut cancelled_by_user = false;
             let provider_name = self.provider_name.clone();
             let timeout_secs = policy.timeout_secs;
-            let turn_timeout = tokio::time::sleep(Duration::from_secs(timeout_secs.max(1)));
+            let timeout_duration = persistent_turn_hard_timeout(timeout_secs);
+            let turn_timeout =
+                tokio::time::sleep(timeout_duration.unwrap_or_else(|| Duration::from_secs(1)));
             tokio::pin!(turn_timeout);
 
             loop {
@@ -104,7 +106,7 @@ impl Provider for PersistentProviderProxy {
                         cancelled_by_user = true;
                         break;
                     }
-                    _ = &mut turn_timeout, if timeout_secs > 0 => {
+                    _ = &mut turn_timeout, if timeout_duration.is_some() => {
                         failed = true;
                         timed_out = true;
                         break;
@@ -185,6 +187,10 @@ impl Provider for PersistentProviderProxy {
     fn as_persistent(&self) -> Option<&dyn PersistentProvider> {
         self.inner.as_persistent()
     }
+}
+
+fn persistent_turn_hard_timeout(timeout_secs: u64) -> Option<Duration> {
+    (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs))
 }
 
 fn normalize_activity_kind(value: &str) -> String {
@@ -615,8 +621,18 @@ fn accumulate_response_text_from_event_with_hint(
 
 #[cfg(test)]
 mod tests {
-    use super::accumulate_response_text_from_event;
+    use super::{accumulate_response_text_from_event, persistent_turn_hard_timeout};
     use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn persistent_turn_timeout_zero_disables_hard_timeout() {
+        assert_eq!(persistent_turn_hard_timeout(0), None);
+        assert_eq!(
+            persistent_turn_hard_timeout(900),
+            Some(Duration::from_secs(900))
+        );
+    }
 
     #[test]
     fn accumulates_plain_text_deltas() {

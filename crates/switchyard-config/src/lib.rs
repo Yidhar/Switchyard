@@ -114,6 +114,8 @@ pub struct ProviderConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Provider turn hard timeout in seconds. `0` disables the hard timeout;
+    /// callers should use cancellation/heartbeat supervision for long tasks.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     #[serde(default)]
@@ -121,7 +123,10 @@ pub struct ProviderConfig {
 }
 
 fn default_timeout() -> u64 {
-    900
+    // 0 means "no provider turn hard timeout". Long-running agent work is
+    // supervised by cancellation/heartbeat paths instead of a fixed wall-clock
+    // kill switch.
+    0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,11 +334,6 @@ impl SwitchyardConfig {
             if provider.command.is_empty() {
                 issues.push(format!("providers.{name}.command is empty"));
             }
-            if provider.timeout_secs == 0 {
-                issues.push(format!(
-                    "providers.{name}.timeout_secs is 0 (instant timeout)"
-                ));
-            }
         }
 
         issues
@@ -459,7 +459,7 @@ show_artifacts = false
         assert_eq!(cfg.core.default_peers, vec!["codex", "gemini"]);
         assert_eq!(cfg.providers["claude"].command, "claude");
         assert_eq!(cfg.providers["claude"].timeout_secs, 120);
-        assert_eq!(cfg.providers["codex"].timeout_secs, 900); // default
+        assert_eq!(cfg.providers["codex"].timeout_secs, 0); // default: no hard timeout
         assert_eq!(cfg.sandbox.mode, SandboxMode::ReadOnly);
         assert_eq!(
             cfg.sandbox.allowed_paths,
@@ -637,15 +637,18 @@ command = ""
     }
 
     #[test]
-    fn validate_zero_timeout() {
+    fn validate_zero_timeout_is_unlimited() {
         let toml = r#"
+[core]
+default_provider = "fast"
+
 [providers.fast]
 command = "codex"
 timeout_secs = 0
 "#;
         let cfg = SwitchyardConfig::parse_toml(toml).unwrap();
         let issues = cfg.validate();
-        assert!(issues.iter().any(|i| i.contains("timeout_secs is 0")));
+        assert!(issues.is_empty());
     }
 
     #[test]
