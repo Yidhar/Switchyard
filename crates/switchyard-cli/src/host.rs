@@ -270,6 +270,21 @@ fn runtime_ipc_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn publish_runtime_events_on_fresh_runtime(
+    endpoint: String,
+    events: Vec<RuntimeEventRecord>,
+) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(std::io::Error::other)?;
+    runtime.block_on(async move {
+        publish_runtime_events_with_timeout(&endpoint, events, DEFAULT_RUNTIME_IPC_PUBLISH_TIMEOUT)
+            .await
+    })
+}
+
 fn publish_runtime_events_best_effort(endpoint: &str, events: Vec<RuntimeEventRecord>) {
     if endpoint.trim().is_empty() || events.is_empty() {
         return;
@@ -277,29 +292,44 @@ fn publish_runtime_events_best_effort(endpoint: &str, events: Vec<RuntimeEventRe
 
     let endpoint = endpoint.to_string();
     let debug = runtime_ipc_debug_enabled();
-    let publish = async move {
-        publish_runtime_events_with_timeout(&endpoint, events, DEFAULT_RUNTIME_IPC_PUBLISH_TIMEOUT)
-            .await
-    };
 
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(publish)),
-        Err(_) => {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .enable_time()
-                .build()
+    let result = if tokio::runtime::Handle::try_current().is_ok() {
+        // Do not use `block_in_place` here: CLI host commands are also exercised
+        // by current-thread Tokio test/runtime contexts, where `block_in_place`
+        // panics. A short-lived dedicated runtime keeps IPC best-effort and
+        // bounded without nesting a runtime on the active reactor thread.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("switchyard-runtime-ipc-publish".to_string())
+            .spawn(move || {
+                let _ = tx.send(publish_runtime_events_on_fresh_runtime(endpoint, events));
+            }) {
+            Ok(_) => match rx
+                .recv_timeout(DEFAULT_RUNTIME_IPC_PUBLISH_TIMEOUT + Duration::from_millis(250))
             {
-                Ok(runtime) => runtime,
-                Err(err) => {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if debug {
-                        eprintln!("[hyard] runtime IPC publish runtime init failed: {err}");
+                        eprintln!("[hyard] runtime IPC publish skipped: timed out");
                     }
                     return;
                 }
-            };
-            runtime.block_on(publish)
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if debug {
+                        eprintln!("[hyard] runtime IPC publish skipped: worker exited");
+                    }
+                    return;
+                }
+            },
+            Err(err) => {
+                if debug {
+                    eprintln!("[hyard] runtime IPC publish thread init failed: {err}");
+                }
+                return;
+            }
         }
+    } else {
+        publish_runtime_events_on_fresh_runtime(endpoint, events)
     };
 
     if debug && let Err(err) = result {
