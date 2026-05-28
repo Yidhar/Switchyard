@@ -1,14 +1,23 @@
 use std::fmt;
 use std::fs;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchyard_provider_api::{ExecutionTelemetry, HyardJobObservation};
 use switchyard_text::{prefix_chars, preview_trimmed};
 use uuid::Uuid;
+
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
 
 const PREVIEW_MAX_CHARS: usize = 400;
 const WORKER_LOG_TAIL_BYTES: usize = 8 * 1024;
@@ -312,7 +321,7 @@ impl HostJobStore {
         let path = self.job_path(job.job_id);
         let data = serde_json::to_vec_pretty(job)
             .map_err(|e| io::Error::other(format!("serialize job: {e}")))?;
-        fs::write(path, data)
+        write_file_replace(&path, &data)
     }
 
     pub fn load(&self, job_id: Uuid) -> io::Result<Option<HostJobState>> {
@@ -342,6 +351,67 @@ impl HostJobStore {
     }
 }
 
+fn write_file_replace(path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("job.json");
+    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::now_v7()));
+
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok::<(), io::Error>(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    if let Err(err) = replace_file(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    sync_parent_dir(parent)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let ok = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn sync_parent_dir(_parent: &Path) -> io::Result<()> {
+    // MoveFileExW with MOVEFILE_WRITE_THROUGH flushes the replacement on Windows.
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_dir(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
 pub fn load_job_with_refresh(
     job_store: &HostJobStore,
     job_id: Uuid,
@@ -357,58 +427,66 @@ pub fn refresh_orphaned_job_state_with<F>(
 where
     F: Fn(u32) -> bool,
 {
-    let Some(job) = job_store.load(job_id)? else {
+    let Some(mut job) = job_store.load(job_id)? else {
         return Ok(None);
     };
 
-    if job.status.is_terminal() {
-        return Ok(Some(job));
+    if reconcile_host_job_state(job_store, &mut job, &is_process_alive) {
+        job_store.save(&job)?;
     }
 
-    if job.pid.is_none() {
-        if should_reconcile_pidless_subprocess_job(job.worker_mode, job.updated_at) {
-            let message = build_missing_worker_pid_message(
-                &job_store.worker_stderr_path(job_id),
-                &job_store.worker_stdout_path(job_id),
-                job.status,
-            );
-            let updated = job_store.update(job_id, |job| {
-                if !job.status.is_terminal() {
-                    job.status = HostJobStatus::Failed;
-                    job.completed_at = Some(Utc::now());
-                    job.error = Some(message.clone());
-                    job.last_event = Some("worker_missing".to_string());
-                }
-            })?;
-            return Ok(Some(updated));
+    Ok(Some(job))
+}
+
+fn reconcile_host_job_state<F>(
+    job_store: &HostJobStore,
+    job: &mut HostJobState,
+    is_process_alive: &F,
+) -> bool
+where
+    F: Fn(u32) -> bool,
+{
+    if job.status.is_terminal() {
+        return false;
+    }
+
+    let Some(pid) = job.pid else {
+        if !should_reconcile_pidless_subprocess_job(job.worker_mode, job.updated_at) {
+            return false;
         }
 
-        return Ok(Some(job));
-    }
+        let now = Utc::now();
+        let message = build_missing_worker_pid_message(
+            &job_store.worker_stderr_path(job.job_id),
+            &job_store.worker_stdout_path(job.job_id),
+            job.status,
+        );
+        job.status = HostJobStatus::Failed;
+        job.completed_at = Some(now);
+        job.updated_at = now;
+        job.error = Some(message);
+        job.last_event = Some("worker_missing".to_string());
+        return true;
+    };
 
-    let pid = job.pid.unwrap_or_default();
     if is_process_alive(pid) {
-        return Ok(Some(job));
+        return false;
     }
 
+    let now = Utc::now();
     let message = build_dead_worker_pid_message(
         pid,
         job.status,
-        &job_store.worker_stderr_path(job_id),
-        &job_store.worker_stdout_path(job_id),
+        &job_store.worker_stderr_path(job.job_id),
+        &job_store.worker_stdout_path(job.job_id),
     );
-
-    let updated = job_store.update(job_id, |job| {
-        if !job.status.is_terminal() {
-            job.status = HostJobStatus::Failed;
-            job.completed_at = Some(Utc::now());
-            job.pid = None;
-            job.error = Some(message.clone());
-            job.last_event = Some("worker_missing".to_string());
-        }
-    })?;
-
-    Ok(Some(updated))
+    job.status = HostJobStatus::Failed;
+    job.completed_at = Some(now);
+    job.updated_at = now;
+    job.pid = None;
+    job.error = Some(message);
+    job.last_event = Some("worker_missing".to_string());
+    true
 }
 
 pub fn list_job_summaries(job_dir: &Path, max_jobs: usize) -> Vec<HostJobSummary> {
@@ -446,6 +524,9 @@ where
         };
 
         let recovered = reconcile_raw_orphaned_job(&path, &mut raw, &is_process_alive).is_some();
+        if recovered {
+            persist_reconciled_full_manifest(&path, &content, &is_process_alive);
+        }
         let summary = HostJobSummary {
             job_id: raw.job_id,
             provider: raw.provider,
@@ -476,6 +557,22 @@ where
     });
     jobs.truncate(max_jobs);
     jobs
+}
+
+fn persist_reconciled_full_manifest<F>(path: &Path, content: &str, is_process_alive: &F)
+where
+    F: Fn(u32) -> bool,
+{
+    let Ok(mut job) = serde_json::from_str::<HostJobState>(content) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let store = HostJobStore::new(parent.to_path_buf());
+    if reconcile_host_job_state(&store, &mut job, is_process_alive) {
+        let _ = store.save(&job);
+    }
 }
 
 fn reconcile_raw_orphaned_job<F>(
@@ -592,6 +689,10 @@ fn append_log_tail(message: &mut String, stderr_path: &Path, stdout_path: &Path)
 }
 
 pub fn is_process_alive(pid: u32) -> bool {
+    probe_process_alive(pid).unwrap_or(false)
+}
+
+pub fn probe_process_alive(pid: u32) -> io::Result<bool> {
     #[cfg(windows)]
     {
         let filter = format!("PID eq {pid}");
@@ -600,18 +701,19 @@ pub fn is_process_alive(pid: u32) -> bool {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .output();
+            .output()?;
 
-        output
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| {
-                let text = String::from_utf8_lossy(&out.stdout);
-                text.lines().any(|line| {
-                    line.contains(&format!("\"{pid}\"")) || line.contains(&pid.to_string())
-                })
-            })
-            .unwrap_or(true)
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "tasklist exited with status {}",
+                output.status
+            )));
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(text
+            .lines()
+            .any(|line| line.contains(&format!("\"{pid}\""))))
     }
 
     #[cfg(not(windows))]
@@ -621,9 +723,9 @@ pub fn is_process_alive(pid: u32) -> bool {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()?;
 
-        status.map(|status| status.success()).unwrap_or(true)
+        Ok(status.success())
     }
 }
 
@@ -722,11 +824,16 @@ mod tests {
         job.wait_timeout_count = 1;
         store.save(&job).unwrap();
 
-        let summaries = list_job_summaries(dir.path(), 8);
+        let summaries = list_job_summaries_with(dir.path(), 8, |_| false);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].status, "failed");
         assert_eq!(summaries[0].source, HostJobSource::Recovered);
         assert!(summaries[0].error.is_some());
+
+        let persisted = store.load(job.job_id).unwrap().unwrap();
+        assert_eq!(persisted.status, HostJobStatus::Failed);
+        assert_eq!(persisted.pid, None);
+        assert_eq!(persisted.last_event.as_deref(), Some("worker_missing"));
     }
 
     #[test]
@@ -746,6 +853,8 @@ mod tests {
         assert_eq!(summaries[0].source, HostJobSource::Recovered);
 
         let loaded = store.load(job.job_id).unwrap().unwrap();
+        assert_eq!(loaded.status, HostJobStatus::Failed);
+        assert_eq!(loaded.last_event.as_deref(), Some("worker_missing"));
         assert_eq!(loaded.task, "important task");
         assert_eq!(loaded.cwd, PathBuf::from("E:/repo"));
         assert_eq!(loaded.provider, "claude");
@@ -801,5 +910,9 @@ mod tests {
                 .as_deref()
                 .is_some_and(|msg| msg.contains("never recorded"))
         );
+
+        let persisted = store.load(job.job_id).unwrap().unwrap();
+        assert_eq!(persisted.status, HostJobStatus::Failed);
+        assert_eq!(persisted.last_event.as_deref(), Some("worker_missing"));
     }
 }

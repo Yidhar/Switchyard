@@ -2644,8 +2644,8 @@ fn build_job_callback_entry(job: &HostJobState) -> Option<InboxEntry> {
     Some(entry)
 }
 
-fn emit_job_callback_receipt_if_needed(
-    store: &mut StoreHandle,
+fn emit_job_callback_receipt_if_needed<S: SessionInboxRepository>(
+    store: &mut S,
     job_store: &HostJobStore,
     job: &HostJobState,
 ) -> Result<(), String> {
@@ -2653,7 +2653,25 @@ fn emit_job_callback_receipt_if_needed(
         return Ok(());
     }
 
-    let Some(entry) = build_job_callback_entry(job) else {
+    let persisted_callback_state = job_store.load(job.job_id).map_err(|err| {
+        format!(
+            "load callback receipt state for job '{}': {err}",
+            job.job_id
+        )
+    })?;
+    if persisted_callback_state
+        .as_ref()
+        .and_then(|persisted| persisted.callback_emitted_at)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let reserved_callback_inbox_id = persisted_callback_state
+        .as_ref()
+        .and_then(|persisted| persisted.callback_inbox_id)
+        .or(job.callback_inbox_id);
+
+    let Some(mut entry) = build_job_callback_entry(job) else {
         if job.session_id.is_none() {
             eprintln!(
                 "[hyard] WARNING: job '{}' reached terminal state '{}' without session_id; callback receipt dropped",
@@ -2662,6 +2680,20 @@ fn emit_job_callback_receipt_if_needed(
         }
         return Ok(());
     };
+
+    entry.entry_id = reserved_callback_inbox_id.unwrap_or(entry.entry_id);
+    if reserved_callback_inbox_id.is_none() {
+        job_store
+            .update(job.job_id, |persisted| {
+                persisted.callback_inbox_id = Some(entry.entry_id);
+            })
+            .map_err(|err| {
+                format!(
+                    "reserve callback receipt id for job '{}': {err}",
+                    job.job_id
+                )
+            })?;
+    }
 
     store.save_inbox_entry(&entry).map_err(|err| {
         format!(
@@ -2672,7 +2704,7 @@ fn emit_job_callback_receipt_if_needed(
 
     job_store
         .update(job.job_id, |persisted| {
-            persisted.callback_inbox_id = Some(entry.entry_id);
+            persisted.callback_inbox_id.get_or_insert(entry.entry_id);
             persisted.callback_emitted_at = Some(Utc::now());
         })
         .map_err(|err| {
@@ -2921,6 +2953,9 @@ fn apply_runtime_event(job: &mut HostJobState, event: &RuntimeEvent) {
             ..
         } => {
             job.turn_id = Some(*turn_id);
+            job.status = HostJobStatus::Failed;
+            job.completed_at.get_or_insert_with(Utc::now);
+            job.result_ready = false;
             job.last_event = Some(format!("turn_failed:{provider}"));
             if !error.trim().is_empty() {
                 job.error = Some(error.clone());
@@ -3242,6 +3277,41 @@ I have analyzed the current command surface.\n\
     }
 
     #[test]
+    fn callback_receipt_retry_reuses_reserved_inbox_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_store = HostJobStore::new(dir.path().to_path_buf());
+        let session_id = Uuid::now_v7();
+        let mut job = HostJobState::new("claude", "task", PathBuf::from("."));
+        job.session_id = Some(session_id);
+        job.status = HostJobStatus::Completed;
+        job.result_ready = true;
+        job.result_summary = Some("done".to_string());
+        job_store.save(&job).unwrap();
+
+        let mut failing_store = FailingInboxStore {
+            fail_on_save_number: Some(1),
+            ..FailingInboxStore::default()
+        };
+        let error = emit_job_callback_receipt_if_needed(&mut failing_store, &job_store, &job)
+            .expect_err("first save should fail after reserving callback id");
+        assert!(error.contains("save callback receipt"));
+
+        let reserved = job_store.load(job.job_id).unwrap().unwrap();
+        let reserved_id = reserved.callback_inbox_id.expect("reserved callback id");
+        assert!(reserved.callback_emitted_at.is_none());
+
+        let mut retry_store = FailingInboxStore::default();
+        emit_job_callback_receipt_if_needed(&mut retry_store, &job_store, &job)
+            .expect("retry should upsert the same callback id");
+
+        assert_eq!(retry_store.entries.len(), 1);
+        assert_eq!(retry_store.entries[0].entry_id, reserved_id);
+        let emitted = job_store.load(job.job_id).unwrap().unwrap();
+        assert_eq!(emitted.callback_inbox_id, Some(reserved_id));
+        assert!(emitted.callback_emitted_at.is_some());
+    }
+
+    #[test]
     fn inbox_entry_json_includes_delivery_mode() {
         let session_id = Uuid::now_v7();
         let mut entry = InboxEntry::background_job_receipt(session_id, "claude", "done", "message");
@@ -3297,6 +3367,30 @@ I have analyzed the current command surface.\n\
             job.last_output_preview.as_deref(),
             Some("Meaningful progress update")
         );
+    }
+
+    #[test]
+    fn apply_runtime_event_turn_failed_marks_job_terminal() {
+        let turn_id = Uuid::now_v7();
+        let mut job = HostJobState::new("claude", "task", PathBuf::from("."));
+        job.status = HostJobStatus::Running;
+
+        apply_runtime_event(
+            &mut job,
+            &RuntimeEvent::TurnFailed {
+                session_id: Uuid::now_v7(),
+                turn_id,
+                provider: "claude".to_string(),
+                error: "provider crashed".to_string(),
+            },
+        );
+
+        assert_eq!(job.status, HostJobStatus::Failed);
+        assert_eq!(job.turn_id, Some(turn_id));
+        assert_eq!(job.last_event.as_deref(), Some("turn_failed:claude"));
+        assert_eq!(job.error.as_deref(), Some("provider crashed"));
+        assert!(job.completed_at.is_some());
+        assert!(!job.result_ready);
     }
 
     #[test]
