@@ -197,7 +197,7 @@ async fn plain_turn_failure_emits_turn_failed() {
     let catalog = PeerCatalog::new();
     let (tx, mut rx) = mpsc::channel::<RuntimeEvent>(64);
 
-    let _output = run_routed_turn_observable(
+    let err = match run_routed_turn_observable(
         &mut store,
         &mut session,
         &provider,
@@ -211,7 +211,11 @@ async fn plain_turn_failure_emits_turn_failed() {
         CancellationToken::new(),
     )
     .await
-    .unwrap();
+    {
+        Ok(_) => panic!("router should surface the failed turn as an error"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("boom"));
 
     drop(tx);
     let events = drain_events(&mut rx).await;
@@ -364,7 +368,7 @@ async fn callback_receipts_are_rolled_back_to_unread_when_finalization_fails() {
     let catalog = make_catalog("reviewer");
     let (tx, _rx) = mpsc::channel::<RuntimeEvent>(64);
 
-    let output = run_routed_turn_observable(
+    let err = match run_routed_turn_observable(
         &mut store,
         &mut session,
         &core,
@@ -384,8 +388,11 @@ async fn callback_receipts_are_rolled_back_to_unread_when_finalization_fails() {
         CancellationToken::new(),
     )
     .await
-    .expect("router should surface the failed turn without consuming callback receipts");
-    assert!(output.delegated);
+    {
+        Ok(_) => panic!("router should surface the failed turn as an error"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("finalization failed"));
 
     let inbox = store.list_inbox_entries(session.session_id).unwrap();
     assert_eq!(inbox.len(), 1);
