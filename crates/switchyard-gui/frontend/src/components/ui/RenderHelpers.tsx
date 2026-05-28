@@ -855,6 +855,21 @@ function asString(value: any): string | undefined {
   return typeof value === 'string' ? value : String(value);
 }
 
+function normalizedOptionalString(value: any): string | undefined {
+  const text = asString(value)?.trim();
+  return text ? text : undefined;
+}
+
+function hyardJobForTurn(hyardJobs: Record<string, any> | undefined, turnId: string): any | undefined {
+  if (!hyardJobs) return undefined;
+  const legacyDirect = hyardJobs[turnId];
+  if (legacyDirect) return legacyDirect;
+  return Object.values(hyardJobs).find((job) => {
+    const jobTurnId = normalizedOptionalString(job?.turn_id ?? job?.turnId);
+    return jobTurnId === turnId;
+  });
+}
+
 function decodeBase64Text(value: any): string | undefined {
   const encoded = asString(value)?.trim();
   if (!encoded) return undefined;
@@ -1954,8 +1969,9 @@ function collectTurnExecutionState(
 
   let combinedTerminal = cleanRuntimeTerminalLines([...dbTerminalLines, ...(realtimeLines || [])]);
 
-  if (hyardJobs && hyardJobs[turnId]) {
-    const job = hyardJobs[turnId];
+  const hyardJob = hyardJobForTurn(hyardJobs, turnId);
+  if (hyardJob) {
+    const job = hyardJob;
     if (job.last_output_preview && combinedTerminal.length === 0) {
       combinedTerminal = cleanRuntimeTerminalLines(String(job.last_output_preview).split('\n'));
     }

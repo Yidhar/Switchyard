@@ -1465,6 +1465,23 @@ function eventHasRenderableArtifact(event: any): boolean {
   return true;
 }
 
+function normalizedOptionalString(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+function indexHyardJobsByTurnId(hyardJobs?: Record<string, any>): Map<string, any> {
+  const byTurnId = new Map<string, any>();
+  if (!hyardJobs) return byTurnId;
+  Object.values(hyardJobs).forEach((job) => {
+    const turnId = normalizedOptionalString(job?.turn_id ?? job?.turnId);
+    if (!turnId) return;
+    byTurnId.set(turnId, job);
+  });
+  return byTurnId;
+}
+
 export const ChatArea: React.FC<ChatAreaProps> = ({
   selectedSession,
   isGenerating,
@@ -1588,6 +1605,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return grouped;
   }, [delegateTurnsByParent, turns]);
 
+  const hyardJobsByTurnId = useMemo(() => indexHyardJobsByTurnId(hyardJobs), [hyardJobs]);
+
   const scopedRenderOptions = useMemo<RenderTurnEventsOptions>(() => ({
     eventsAlreadyScoped: true,
     turnsAlreadyScoped: true,
@@ -1605,20 +1624,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     for (const turnId of delegateTurnsByParent.keys()) {
       ids.add(turnId);
     }
-    if (hyardJobs) {
-      for (const turnId of Object.keys(hyardJobs)) {
-        ids.add(turnId);
-      }
+    for (const turnId of hyardJobsByTurnId.keys()) {
+      ids.add(turnId);
     }
     return ids;
-  }, [delegateTurnsByParent, eventActivityTurnIds, hyardJobs]);
+  }, [delegateTurnsByParent, eventActivityTurnIds, hyardJobsByTurnId]);
 
   const hasRenderableActivityForTurn = useCallback((turnId?: string | null) => {
     if (!turnId) return false;
     if (historyRenderableActivityTurnIds.has(turnId)) return true;
     if ((realtimeTerminalLines[turnId]?.length ?? 0) > 0) return true;
-    return Boolean(hyardJobs?.[turnId]);
-  }, [historyRenderableActivityTurnIds, hyardJobs, realtimeTerminalLines]);
+    return hyardJobsByTurnId.has(turnId);
+  }, [historyRenderableActivityTurnIds, hyardJobsByTurnId, realtimeTerminalLines]);
   const activeCoreEvents = activeCoreTurnId ? (eventsByTurnId.get(activeCoreTurnId) ?? EMPTY_EVENT_LIST) : EMPTY_EVENT_LIST;
   const activeCoreRelatedTurns = activeCoreTurnId ? (relatedTurnsByTurnId.get(activeCoreTurnId) ?? EMPTY_TURN_LIST) : EMPTY_TURN_LIST;
   const activePeerEvents = activePeerTurnId ? (eventsByTurnId.get(activePeerTurnId) ?? EMPTY_EVENT_LIST) : EMPTY_EVENT_LIST;
@@ -2365,7 +2382,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           turnEvents={turnEvents}
                           relatedTurns={relatedTurns}
                           realtimeLines={realtimeTerminalLines[t.turn_id]}
-                          hyardJob={t.turn_id ? hyardJobs?.[t.turn_id] : undefined}
+                          hyardJob={t.turn_id ? hyardJobsByTurnId.get(t.turn_id) : undefined}
                           renderMessageBody={renderMessageBody}
                           renderTurnEvents={renderTurnEvents}
                           scopedRenderOptions={scopedRenderOptions}

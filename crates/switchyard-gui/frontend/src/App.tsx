@@ -602,6 +602,37 @@ function countActiveHyardJobs(jobs: Record<string, any>): number {
   return count;
 }
 
+function hyardJobRecordFromRuntimeEvent(data: any): any | null {
+  const source = data?.job;
+  const jobId = normalizedString(source?.job_id ?? source?.id);
+  if (!source || !jobId) return null;
+
+  const record: Record<string, any> = {
+    ...source,
+    job_id: jobId,
+  };
+  const observedAt = normalizedString(data?.observed_at ?? source?.observed_at);
+  const turnId = normalizedString(data?.turn_id ?? source?.turn_id);
+  const sessionId = normalizedString(data?.session_id ?? source?.session_id);
+  const sourceProvider = normalizedString(data?.source_provider ?? source?.source_provider);
+  if (observedAt) record.observed_at = observedAt;
+  if (turnId) record.turn_id = turnId;
+  if (sessionId) record.session_id = sessionId;
+  if (sourceProvider) record.source_provider = sourceProvider;
+  return record;
+}
+
+function upsertHyardJobRecord(jobs: Record<string, any>, record: any | null): Record<string, any> {
+  if (!record?.job_id) return jobs;
+  return {
+    ...jobs,
+    [record.job_id]: {
+      ...(jobs[record.job_id] ?? {}),
+      ...record,
+    },
+  };
+}
+
 function runtimeItemType(payload: any): string {
   const item = runtimePayloadItem(payload);
   const raw = firstRuntimeIdentity(
@@ -2942,21 +2973,14 @@ function App() {
               return next;
             case 'HyardJobObserved':
               if (turnId) rememberRuntimeTurnSession(turnId, sessionId);
-              if (data.job?.job_id) {
-                const job = {
-                  ...data.job,
-                  observed_at: data.observed_at,
-                };
+              {
+                const job = hyardJobRecordFromRuntimeEvent(data);
+                if (!job) return next;
                 return {
                   ...next,
-                  hyardJobs: {
-                    ...next.hyardJobs,
-                    [data.job.job_id]: job,
-                    ...(turnId ? { [turnId]: job } : {}),
-                  },
+                  hyardJobs: upsertHyardJobRecord(next.hyardJobs, job),
                 };
               }
-              return next;
             case 'CoreOutputCompleted':
               return sessionUiSnapshotWithRuntimePhase(
                 sessionUiSnapshotEnsureTerminal({
@@ -3289,18 +3313,13 @@ function App() {
             break;
 
           case 'HyardJobObserved':
-            setHyardJobs((prev) => {
-              const job = {
-                ...data.job,
-                observed_at: data.observed_at,
-              };
-              return {
-                ...prev,
-                [data.job.job_id]: job,
-                ...(data.turn_id ? { [data.turn_id]: job } : {}),
-              };
-            });
-            enqueueLog(now, 'sys', `[HYARD] Observed background job ${data.job.job_id} (${data.job.provider}) status: ${data.job.status}`);
+            {
+              const job = hyardJobRecordFromRuntimeEvent(data);
+              setHyardJobs((prev) => upsertHyardJobRecord(prev, job));
+              if (job?.job_id) {
+                enqueueLog(now, 'sys', `[HYARD] Observed background job ${job.job_id} (${job.provider}) status: ${job.status}`);
+              }
+            }
             scheduleRefreshTurns();
             break;
 

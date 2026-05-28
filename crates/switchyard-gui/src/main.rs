@@ -355,6 +355,7 @@ fn runtime_event_bridge_brief(event: &RuntimeEvent) -> String {
 const RUNTIME_EVENT_BATCH_MAX_EVENTS: usize = 64;
 const RUNTIME_EVENT_BATCH_FLUSH_MS: u64 = 16;
 const RUNTIME_EVENT_TERMINAL_MERGE_MAX_BYTES: usize = 96 * 1024;
+const RUNTIME_EVENT_BRIDGE_BUFFER: usize = 4096;
 
 #[derive(Default)]
 struct RuntimeEventBatcher {
@@ -524,6 +525,52 @@ fn emit_runtime_event_batch(
         return false;
     }
     true
+}
+
+fn spawn_runtime_event_bridge(
+    app: tauri::AppHandle,
+    bridge_debug: bool,
+) -> tokio::sync::mpsc::Sender<RuntimeEvent> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(RUNTIME_EVENT_BRIDGE_BUFFER);
+
+    tokio::spawn(async move {
+        let mut batcher = RuntimeEventBatcher::default();
+        let mut flush_interval =
+            tokio::time::interval(Duration::from_millis(RUNTIME_EVENT_BATCH_FLUSH_MS));
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    if bridge_debug {
+                        eprintln!(
+                            "[switchyard runtime bridge] queue {}",
+                            runtime_event_bridge_brief(&event)
+                        );
+                    }
+                    let should_flush = runtime_event_should_flush_immediately(&event);
+                    batcher.push(event);
+                    if (should_flush || batcher.len() >= RUNTIME_EVENT_BATCH_MAX_EVENTS)
+                        && !emit_runtime_event_batch(&app, &mut batcher, bridge_debug)
+                    {
+                        break;
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    if !emit_runtime_event_batch(&app, &mut batcher, bridge_debug) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let _ = emit_runtime_event_batch(&app, &mut batcher, bridge_debug);
+    });
+
+    tx
 }
 
 fn runtime_worker_state_coalesce_key(event: &RuntimeEvent) -> Option<String> {
@@ -719,6 +766,9 @@ fn runtime_event_should_flush_immediately(event: &RuntimeEvent) -> bool {
         | RuntimeEvent::CoreTurnStarted { .. }
         | RuntimeEvent::PeerTurnStarted { .. }
         | RuntimeEvent::FinalizationStarted { .. }
+        | RuntimeEvent::HyardJobObserved { .. }
+        | RuntimeEvent::WorkerSpawned { .. }
+        | RuntimeEvent::WorkerStateChanged { .. }
         | RuntimeEvent::WorkerRetrying { .. }
         | RuntimeEvent::WorkerTerminated { .. } => true,
         _ => false,
@@ -2930,14 +2980,15 @@ async fn run_turn(
     }
 
     let provider = provider.unwrap_or_else(|| session.active_core.clone());
-    let _ = app.emit(
-        "runtime_event",
-        switchyard_core::RuntimeEvent::TurnPreparing {
-            session_id: session.session_id,
-            provider: provider.clone(),
-            phase: "resolving provider and warming persistent instance".to_string(),
-        },
-    );
+    let bridge_debug = env_flag_enabled("SWITCHYARD_DEBUG_RUNTIME_BRIDGE");
+    let tx = spawn_runtime_event_bridge(app.clone(), bridge_debug);
+    tx.send(switchyard_core::RuntimeEvent::TurnPreparing {
+        session_id: session.session_id,
+        provider: provider.clone(),
+        phase: "resolving provider and warming persistent instance".to_string(),
+    })
+    .await
+    .ok();
 
     let provider_impl = registry
         .create(&provider, config.providers.get(&provider))
@@ -3005,17 +3056,16 @@ async fn run_turn(
                 // status card without polling. Worker peers get their own
                 // events via the supervisor; the Core spawns here outside
                 // the supervisor path.
-                let _ = app.emit(
-                    "runtime_event",
-                    switchyard_core::RuntimeEvent::WorkerSpawned {
-                        session_id: session.session_id,
-                        instance_id,
-                        provider: provider_name,
-                        label: None,
-                        kind: "core".to_string(),
-                        spawned_at: spawned_at.to_rfc3339(),
-                    },
-                );
+                tx.send(switchyard_core::RuntimeEvent::WorkerSpawned {
+                    session_id: session.session_id,
+                    instance_id,
+                    provider: provider_name,
+                    label: None,
+                    kind: "core".to_string(),
+                    spawned_at: spawned_at.to_rfc3339(),
+                })
+                .await
+                .ok();
             }
         }
     }
@@ -3028,64 +3078,19 @@ async fn run_turn(
         Some(registry_dyn.clone()),
     );
 
-    let _ = app.emit(
-        "runtime_event",
-        switchyard_core::RuntimeEvent::TurnPreparing {
-            session_id: session.session_id,
-            provider: provider.clone(),
-            phase: "probing peer catalog and opening runtime bridge".to_string(),
-        },
-    );
+    tx.send(switchyard_core::RuntimeEvent::TurnPreparing {
+        session_id: session.session_id,
+        provider: provider.clone(),
+        phase: "probing peer catalog and opening runtime bridge".to_string(),
+    })
+    .await
+    .ok();
 
     let peer_catalog = build_peer_catalog_probed(&provider, &registry, &config.providers).await;
     // Artifacts live next to the workspace's store so they move together
     // when the user copies the workspace dir or wipes it.
     let artifact_dir = data_dir.join("artifacts");
     let _ = std::fs::create_dir_all(&artifact_dir);
-
-    // Runtime events can burst heavily during streaming/tool execution. Keep a
-    // generous bridge buffer so Tauri's emit loop can absorb short frontend or
-    // renderer stalls without making text/tool/HYARD updates appear to vanish.
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
-    let app_clone = app.clone();
-    let bridge_debug = env_flag_enabled("SWITCHYARD_DEBUG_RUNTIME_BRIDGE");
-
-    tokio::spawn(async move {
-        let mut batcher = RuntimeEventBatcher::default();
-        let mut flush_interval =
-            tokio::time::interval(Duration::from_millis(RUNTIME_EVENT_BATCH_FLUSH_MS));
-        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                event = rx.recv() => {
-                    let Some(event) = event else {
-                        break;
-                    };
-                    if bridge_debug {
-                        eprintln!(
-                            "[switchyard runtime bridge] queue {}",
-                            runtime_event_bridge_brief(&event)
-                        );
-                    }
-                    let should_flush = runtime_event_should_flush_immediately(&event);
-                    batcher.push(event);
-                    if (should_flush || batcher.len() >= RUNTIME_EVENT_BATCH_MAX_EVENTS)
-                        && !emit_runtime_event_batch(&app_clone, &mut batcher, bridge_debug)
-                    {
-                        break;
-                    }
-                }
-                _ = flush_interval.tick() => {
-                    if !emit_runtime_event_batch(&app_clone, &mut batcher, bridge_debug) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let _ = emit_runtime_event_batch(&app_clone, &mut batcher, bridge_debug);
-    });
 
     let cancel = CancellationToken::new();
     {

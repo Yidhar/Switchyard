@@ -24,6 +24,7 @@ use crate::turn_runner::TurnOutput;
 
 const MAX_ROUTER_LOOPS: usize = 3;
 const MAX_CONTINUATION_HINT_JOBS: usize = 3;
+const ROUTER_RUNTIME_OBSERVER_BUFFER: usize = 1024;
 
 /// Controls whether Switchyard injects orchestration instructions into the
 /// provider-facing prompt for this routed turn.
@@ -37,6 +38,84 @@ pub enum RouterPromptInjection {
     /// attachments. No Switchyard debug/delegation/HYARD boilerplate is added
     /// to the model prompt.
     Clean,
+}
+
+fn spawn_runtime_event_forwarder(
+    tx: &tokio::sync::mpsc::Sender<crate::runtime_events::RuntimeEvent>,
+) -> tokio::sync::mpsc::Sender<crate::runtime_events::RuntimeEvent> {
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(ROUTER_RUNTIME_OBSERVER_BUFFER);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        while let Some(evt) = live_rx.recv().await {
+            if tx.send(evt).await.is_err() {
+                break;
+            }
+        }
+    });
+    live_tx
+}
+
+fn try_forward_observed_runtime_event(
+    live_tx: &tokio::sync::mpsc::Sender<crate::runtime_events::RuntimeEvent>,
+    event: crate::runtime_events::RuntimeEvent,
+) {
+    match live_tx.try_send(event) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+            if runtime_observer_event_should_preserve_on_overflow(&event) {
+                let live_tx = live_tx.clone();
+                tokio::spawn(async move {
+                    let _ = live_tx.send(event).await;
+                });
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
+fn runtime_observer_event_should_preserve_on_overflow(
+    event: &crate::runtime_events::RuntimeEvent,
+) -> bool {
+    match event {
+        crate::runtime_events::RuntimeEvent::PeerTerminalOutput { .. } => false,
+        crate::runtime_events::RuntimeEvent::PeerItemUpdated { payload, .. } => {
+            runtime_observer_payload_is_control_event(payload.as_ref())
+        }
+        _ => true,
+    }
+}
+
+fn runtime_observer_payload_is_control_event(payload: Option<&serde_json::Value>) -> bool {
+    fn has_control_token(text: &str) -> bool {
+        let text = text.to_ascii_lowercase();
+        text.contains("approval")
+            || text.contains("permission")
+            || text.contains("confirm")
+            || text.contains("server_request")
+    }
+
+    fn scan(value: &serde_json::Value, depth: usize, visited: &mut usize) -> bool {
+        if depth > 8 || *visited > 256 {
+            return false;
+        }
+        *visited += 1;
+        match value {
+            serde_json::Value::String(text) => has_control_token(text),
+            serde_json::Value::Array(items) => {
+                items.iter().any(|item| scan(item, depth + 1, visited))
+            }
+            serde_json::Value::Object(map) => map
+                .iter()
+                .any(|(key, value)| has_control_token(key) || scan(value, depth + 1, visited)),
+            _ => false,
+        }
+    }
+
+    let Some(payload) = payload else {
+        return false;
+    };
+    let mut visited = 0;
+    scan(payload, 0, &mut visited)
 }
 
 impl RouterPromptInjection {
@@ -761,21 +840,12 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                 runtime_tx.map(|tx| {
                     let session_id = session.session_id;
                     // The peer observer is a synchronous callback invoked while
-                    // orchestrator drains provider events. Use an unbounded
-                    // in-process hop here, then await the real runtime sender in
-                    // one ordered forwarding task. This avoids silent
-                    // `try_send` drops without blocking the orchestrator thread.
-                    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<
-                        crate::runtime_events::RuntimeEvent,
-                    >();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        while let Some(evt) = live_rx.recv().await {
-                            if tx.send(evt).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
+                    // orchestrator drains provider events. Keep the callback
+                    // non-blocking, but use a bounded hop so a stalled GUI/IPC
+                    // bridge cannot grow memory without limit. High-volume
+                    // terminal/text deltas are lossy under sustained overflow;
+                    // lifecycle/HYARD/control events are preserved.
+                    let live_tx = spawn_runtime_event_forwarder(tx);
                     Box::new(move |pe: &switchyard_provider_api::ProviderEvent| {
                         let peer = pe.provider.clone();
                         let event = if let Some(execution) =
@@ -849,7 +919,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                             }
                         };
                         if let Some(evt) = event {
-                            live_tx.send(evt).ok();
+                            try_forward_observed_runtime_event(&live_tx, evt);
                         }
                     }) as Box<switchyard_orchestrator::PeerEventObserver>
                 });
@@ -861,17 +931,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
             let supervisor_observer: Option<
                 std::sync::Arc<switchyard_orchestrator::supervisor::SupervisorObserver>,
             > = runtime_tx.map(|tx| {
-                let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<
-                    crate::runtime_events::RuntimeEvent,
-                >();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    while let Some(evt) = live_rx.recv().await {
-                        if tx.send(evt).await.is_err() {
-                            break;
-                        }
-                    }
-                });
+                let live_tx = spawn_runtime_event_forwarder(tx);
                 std::sync::Arc::new(
                     move |event: switchyard_orchestrator::supervisor::SupervisorLifecycleEvent| {
                         let runtime_event = match event {
@@ -930,7 +990,7 @@ pub async fn run_routed_turn_observable_with_policy_attachments_and_prompt_injec
                                 reason,
                             },
                         };
-                        let _ = live_tx.send(runtime_event);
+                        try_forward_observed_runtime_event(&live_tx, runtime_event);
                     },
                 )
                     as std::sync::Arc<
