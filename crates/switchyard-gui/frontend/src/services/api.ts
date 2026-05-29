@@ -21,6 +21,10 @@ export const listProviderStatus = (): Promise<ProviderStatus[]> => {
   return invoke<ProviderStatus[]>('list_provider_status');
 };
 
+export const listProviderStatusQuick = (): Promise<ProviderStatus[]> => {
+  return invoke<ProviderStatus[]>('list_provider_status_quick');
+};
+
 export const loadConfig = (): Promise<SwitchyardConfig> => {
   return invoke<SwitchyardConfig>('load_config');
 };

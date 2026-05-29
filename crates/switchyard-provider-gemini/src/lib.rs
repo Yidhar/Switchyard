@@ -13,7 +13,9 @@ use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use switchyard_provider_api::*;
-use switchyard_provider_subprocess::{effective_timeout_secs, resolve_command};
+use switchyard_provider_subprocess::{
+    effective_timeout_secs, resolve_command, suppress_windows_console_for_tokio_command,
+};
 
 pub struct GeminiProvider {
     pub original_command: String,
@@ -148,6 +150,7 @@ impl PersistentProvider for GeminiProvider {
             &effective_args,
         );
         let mut cmd = tokio::process::Command::new(&plan.command);
+        suppress_windows_console_for_tokio_command(&mut cmd);
         cmd.args(&plan.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

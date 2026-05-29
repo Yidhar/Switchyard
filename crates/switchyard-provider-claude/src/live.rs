@@ -26,6 +26,9 @@ use uuid::Uuid;
 use switchyard_provider_api::{
     ContextBundle, EventType, LiveInstance, ProviderError, ProviderEvent,
 };
+use switchyard_provider_subprocess::{
+    build_subprocess_invocation_plan, suppress_windows_console_for_tokio_command,
+};
 
 use crate::stream_json::extract_delta_text;
 
@@ -93,8 +96,10 @@ impl ClaudeLiveInstance {
         ];
         args.extend_from_slice(extra_args);
 
-        let mut cmd = Command::new(command);
-        cmd.args(&args)
+        let plan = build_subprocess_invocation_plan(command, command, &args);
+        let mut cmd = Command::new(&plan.command);
+        suppress_windows_console_for_tokio_command(&mut cmd);
+        cmd.args(&plan.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -221,6 +221,41 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn install_gui_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let mut message = format!(
+            "[{}] Switchyard GUI panic: {info}\n",
+            chrono::Utc::now().to_rfc3339()
+        );
+        if let Some(location) = info.location() {
+            message.push_str(&format!(
+                "location: {}:{}:{}\n",
+                location.file(),
+                location.line(),
+                location.column()
+            ));
+        }
+
+        eprintln!("{message}");
+
+        let log_path = default_index_path()
+            .parent()
+            .map(|dir| dir.join("logs").join("gui-crash.log"))
+            .unwrap_or_else(|| PathBuf::from("gui-crash.log"));
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{message}");
+        }
+    }));
+}
+
 fn runtime_payload_debug_kind(payload: Option<&serde_json::Value>) -> String {
     let Some(payload) = payload else {
         return "-".to_string();
@@ -1145,8 +1180,24 @@ impl WorkspaceState {
     /// explicitly opens a folder/workspace.
     fn load() -> Result<Self, String> {
         let index_path = default_index_path();
-        let mut index = WorkspaceIndex::load(&index_path)
-            .map_err(|e| format!("failed to load workspace index: {e}"))?;
+        let mut index = match WorkspaceIndex::load(&index_path) {
+            Ok(index) => index,
+            Err(e) => {
+                eprintln!(
+                    "failed to load workspace index at {}: {e}; starting with an empty workspace list",
+                    index_path.display()
+                );
+                backup_unreadable_workspace_index(&index_path, &e.to_string());
+                let fallback = WorkspaceIndex::default();
+                if let Err(save_err) = fallback.save(&index_path) {
+                    eprintln!(
+                        "failed to replace unreadable workspace index at {}: {save_err}",
+                        index_path.display()
+                    );
+                }
+                fallback
+            }
+        };
         // Do not restore the last/default workspace on GUI startup.
         //
         // `WorkspaceIndex.current` is still useful while the process is
@@ -1157,9 +1208,9 @@ impl WorkspaceState {
         // For the VS Code-like no-folder startup flow, keep the recent
         // workspace list intact and only clear the startup selection.
         if clear_startup_workspace_selection(&mut index) {
-            index
-                .save(&index_path)
-                .map_err(|e| format!("failed to clear startup workspace pointer: {e}"))?;
+            if let Err(e) = index.save(&index_path) {
+                eprintln!("failed to clear startup workspace pointer: {e}");
+            }
         }
         Ok(Self {
             index: StdMutex::new(index),
@@ -1257,6 +1308,24 @@ fn clear_startup_workspace_selection(index: &mut WorkspaceIndex) -> bool {
     }
     index.current = None;
     true
+}
+
+fn backup_unreadable_workspace_index(index_path: &Path, reason: &str) {
+    if !index_path.exists() {
+        return;
+    }
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let backup_path = index_path.with_file_name(format!("workspaces.corrupt-{timestamp}.json"));
+    match std::fs::copy(index_path, &backup_path) {
+        Ok(_) => eprintln!(
+            "backed up unreadable workspace index to {} ({reason})",
+            backup_path.display()
+        ),
+        Err(e) => eprintln!(
+            "failed to back up unreadable workspace index {}: {e} ({reason})",
+            index_path.display()
+        ),
+    }
 }
 
 /// Open the canonical store for a given workspace. The store path is
@@ -2607,6 +2676,7 @@ struct ProviderStatus {
     is_default_core: bool,
     is_default_peer: bool,
     roles: Vec<String>,
+    probed: bool,
     available: bool,
     version: Option<String>,
     capabilities: Vec<String>,
@@ -2630,8 +2700,22 @@ fn default_role_names(name: &str) -> Vec<String> {
 }
 
 #[tauri::command]
+async fn list_provider_status_quick(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+) -> Result<Vec<ProviderStatus>, String> {
+    collect_provider_statuses(&workspace_state, false).await
+}
+
+#[tauri::command]
 async fn list_provider_status(
     workspace_state: tauri::State<'_, WorkspaceState>,
+) -> Result<Vec<ProviderStatus>, String> {
+    collect_provider_statuses(&workspace_state, true).await
+}
+
+async fn collect_provider_statuses(
+    workspace_state: &WorkspaceState,
+    run_probe: bool,
 ) -> Result<Vec<ProviderStatus>, String> {
     // Probe resolution honours the current workspace's `primary_root` when
     // a workspace is open, so project-local `./switchyard.toml` is picked up.
@@ -2684,6 +2768,7 @@ async fn list_provider_status(
             is_default_core: config.core.default_provider == name,
             is_default_peer: config.core.default_peers.iter().any(|peer| peer == &name),
             roles: default_role_names(&name),
+            probed: false,
             available: false,
             version: None,
             capabilities: Vec::new(),
@@ -2709,6 +2794,13 @@ async fn list_provider_status(
             continue;
         }
 
+        if !run_probe {
+            issues.push("probe deferred; click Refresh to check CLI availability".to_string());
+            status.issues = issues;
+            statuses.push(status);
+            continue;
+        }
+
         let Some(provider) = registry.create(&name, provider_config) else {
             issues.push("provider factory returned no instance".to_string());
             status.issues = issues;
@@ -2717,6 +2809,7 @@ async fn list_provider_status(
             continue;
         };
 
+        status.probed = true;
         match provider.probe().await {
             Ok(probe) => {
                 status.available = probe.available;
@@ -4540,6 +4633,8 @@ async fn app_window_new(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 fn main() {
+    install_gui_panic_hook();
+
     let workspace_state = WorkspaceState::load().expect("failed to initialise workspace state");
 
     // Stand up the workspace file watcher before the Tauri runtime
@@ -4579,6 +4674,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             load_config,
             save_config,
+            list_provider_status_quick,
             list_provider_status,
             list_sessions,
             create_session,

@@ -4245,6 +4245,18 @@ function App() {
     }
   };
 
+  const loadProviderStatusSnapshot = async () => {
+    setProviderStatusError(null);
+    try {
+      const statuses = await invoke<ProviderStatus[]>('list_provider_status_quick');
+      setProviderStatuses(statuses);
+    } catch (e) {
+      const message = String(e);
+      setProviderStatusError(message);
+      console.error('Failed to load provider status snapshot:', e);
+    }
+  };
+
   const loadAppConfig = async () => {
     try {
       const cfg = await invoke<SwitchyardConfig>('load_config');
@@ -4252,7 +4264,7 @@ function App() {
       if (cfg && cfg.core && cfg.core.default_provider) {
         setNewSessionProvider(cfg.core.default_provider);
       }
-      refreshProviderStatuses();
+      void loadProviderStatusSnapshot();
     } catch (e) {
       console.error(e);
     }

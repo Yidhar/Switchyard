@@ -40,6 +40,9 @@ use switchyard_provider_api::{
     ContextBundle, EffectiveSandboxMode, EventType, ExecutionPolicy, LiveInstance, ProviderError,
     ProviderEvent, TurnInput,
 };
+use switchyard_provider_subprocess::{
+    build_subprocess_invocation_plan, suppress_windows_console_for_tokio_command,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -218,8 +221,10 @@ impl CodexAppServerInstance {
         let mut args: Vec<String> = vec!["app-server".to_string()];
         args.extend_from_slice(extra_args);
 
-        let mut cmd = Command::new(command);
-        cmd.args(&args)
+        let plan = build_subprocess_invocation_plan(command, command, &args);
+        let mut cmd = Command::new(&plan.command);
+        suppress_windows_console_for_tokio_command(&mut cmd);
+        cmd.args(&plan.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

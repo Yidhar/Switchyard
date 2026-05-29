@@ -22,4 +22,5 @@ pub use runner::{
     StreamingOutputLine, SubprocessConfig, SubprocessError, SubprocessInvocationPlan,
     SubprocessOutput, build_subprocess_invocation_plan, resize_registered_pty, run_subprocess,
     run_subprocess_streaming, run_subprocess_streaming_until,
+    suppress_windows_console_for_std_command, suppress_windows_console_for_tokio_command,
 };

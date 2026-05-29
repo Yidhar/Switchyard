@@ -26,6 +26,21 @@ use std::process::Command;
 
 use serde::Serialize;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn suppress_windows_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
 /// A two-character porcelain v1 status code split into staged + worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,6 +247,7 @@ pub fn init(primary_root: &Path) -> Result<(), String> {
 /// for UI display.
 fn run(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("git");
+    suppress_windows_console(&mut cmd);
     cmd.arg("-C").arg(cwd);
     for a in args {
         cmd.arg(a);

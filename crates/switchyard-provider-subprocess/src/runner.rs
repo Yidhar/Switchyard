@@ -59,6 +59,40 @@ pub struct StreamingOutputLine {
 
 type SharedMasterPty = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Prevent helper CLIs spawned by the GUI process from flashing their own
+/// console windows on Windows.
+///
+/// The packaged Tauri app is a `windows_subsystem = "windows"` binary, but
+/// child console-subsystem executables such as `node.exe`, `git.exe`, or
+/// `taskkill.exe` can still allocate a visible console unless we opt out on
+/// every non-interactive spawn.
+pub fn suppress_windows_console_for_tokio_command(command: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
+/// Std-process variant of [`suppress_windows_console_for_tokio_command`].
+pub fn suppress_windows_console_for_std_command(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
 fn log_debug_stdio(direction: &str, command: &str, line: &str) {
     if std::env::var("SWITCHYARD_DEBUG_STDIO").unwrap_or_default() == "1" {
         let path = if std::path::Path::new(".switchyard").is_dir() {
@@ -314,7 +348,9 @@ async fn run_subprocess_streaming_until_pipe(
 
         #[cfg(windows)]
         if let Some(pid) = pid {
-            let _ = tokio::process::Command::new("taskkill")
+            let mut taskkill = tokio::process::Command::new("taskkill");
+            suppress_windows_console_for_tokio_command(&mut taskkill);
+            let _ = taskkill
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -534,7 +570,9 @@ async fn try_run_subprocess_streaming_until_pty(
 
         #[cfg(windows)]
         if let Some(pid) = pid {
-            let _ = tokio::process::Command::new("taskkill")
+            let mut taskkill = tokio::process::Command::new("taskkill");
+            suppress_windows_console_for_tokio_command(&mut taskkill);
+            let _ = taskkill
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -650,6 +688,7 @@ async fn spawn_and_setup(
     let args = plan.args.as_slice();
 
     let mut cmd = tokio::process::Command::new(command);
+    suppress_windows_console_for_tokio_command(&mut cmd);
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

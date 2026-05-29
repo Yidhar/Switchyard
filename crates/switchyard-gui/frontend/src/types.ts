@@ -123,6 +123,7 @@ export interface ProviderStatus {
   is_default_core: boolean;
   is_default_peer: boolean;
   roles: string[];
+  probed: boolean;
   available: boolean;
   version: string | null;
   capabilities: string[];

@@ -274,6 +274,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
     (sessionCore !== (selectedSession.active_core || '') ||
       sessionModel !== (selectedSession.model || '') ||
       sessionThinkingLevel !== (selectedSession.thinking_level || ''));
+  const providerProbeCheckedAt = providerStatuses.find((status) => status.probed)?.checked_at;
 
   const handleSaveSessionRuntime = async () => {
     if (!selectedSession || !sessionCore || runtimeSaving) return;
@@ -890,9 +891,11 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                     <div>
                       <div className="provider-health-title" style={{ fontWeight: 'bold', fontSize: '12px' }}>Provider Health</div>
                       <div className="provider-health-subtitle" style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
-                        {providerStatuses[0]?.checked_at
-                          ? `Last probe ${new Date(providerStatuses[0].checked_at).toLocaleTimeString()}`
-                          : 'CLI capability and HYARD surface probe'}
+                        {providerProbeCheckedAt
+                          ? `Last probe ${new Date(providerProbeCheckedAt).toLocaleTimeString()}`
+                          : providerStatuses.length > 0
+                            ? 'Provider config loaded; click refresh to probe CLIs'
+                            : 'CLI capability and HYARD surface probe'}
                       </div>
                     </div>
                     <button
@@ -922,11 +925,12 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
 
                   {providerStatuses.length === 0 && !providerStatusError ? (
                     <div className="provider-health-empty" style={{ fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' }}>
-                      {providerStatusLoading ? 'Probing providers...' : 'No provider probe data yet.'}
+                      {providerStatusLoading ? 'Probing providers...' : 'No provider data yet.'}
                     </div>
                   ) : (
                     <div className="provider-health-list" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                       {providerStatuses.map((status) => {
+                        const probed = status.probed !== false;
                         const surfaceReady = Boolean(
                           status.host_surface?.installed &&
                           status.host_surface?.configured &&
@@ -937,11 +941,17 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                           : 'built-in provider fallback';
                         const visibleCapabilities = status.capabilities.slice(0, 2);
                         const hiddenCapabilityCount = Math.max(0, status.capabilities.length - visibleCapabilities.length);
+                        const statusBadgeClass = !probed
+                          ? 'status-pending'
+                          : status.available
+                            ? 'status-completed'
+                            : 'status-failed';
+                        const statusLabel = !probed ? 'unchecked' : status.available ? 'ready' : 'offline';
 
                         return (
                           <div 
                             key={status.provider_id} 
-                            className={`provider-card ${status.available ? 'provider-online' : 'provider-offline'}`}
+                            className={`provider-card ${probed && status.available ? 'provider-online' : 'provider-offline'}`}
                             style={{
                               padding: '8px 10px',
                               borderRadius: '4px',
@@ -955,8 +965,8 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                                 {status.is_default_core && <span className="provider-chip chip-core" style={{ fontSize: '9px', padding: '1px 4px', borderRadius: '3px', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-primary)' }}>core</span>}
                                 {status.is_default_peer && <span className="provider-chip chip-peer" style={{ fontSize: '9px', padding: '1px 4px', borderRadius: '3px', background: 'rgba(245, 158, 11, 0.1)', color: 'var(--color-warning)' }}>peer</span>}
                               </div>
-                              <span className={`status-badge ${status.available ? 'status-completed' : 'status-failed'}`} style={{ fontSize: '9px' }}>
-                                {status.available ? 'ready' : 'offline'}
+                              <span className={`status-badge ${statusBadgeClass}`} style={{ fontSize: '9px' }}>
+                                {statusLabel}
                               </span>
                             </div>
 
@@ -966,7 +976,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
 
                             <div className="provider-meta-row" style={{ display: 'flex', gap: '8px', fontSize: '10px', color: 'var(--text-muted)', marginBottom: '4px' }}>
                               <span>{status.backend || 'auto'}</span>
-                              <span>{status.version || 'v?'}</span>
+                              <span>{probed ? (status.version || 'v?') : 'not probed'}</span>
                             </div>
 
                             <div className="provider-chip-row" style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>

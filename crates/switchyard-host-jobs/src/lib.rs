@@ -23,6 +23,21 @@ const PREVIEW_MAX_CHARS: usize = 400;
 const WORKER_LOG_TAIL_BYTES: usize = 8 * 1024;
 const SUBPROCESS_BOOT_STALE_SECS: i64 = 15;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn suppress_windows_console(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostJobStatus {
@@ -696,7 +711,9 @@ pub fn probe_process_alive(pid: u32) -> io::Result<bool> {
     #[cfg(windows)]
     {
         let filter = format!("PID eq {pid}");
-        let output = std::process::Command::new("tasklist")
+        let mut command = std::process::Command::new("tasklist");
+        suppress_windows_console(&mut command);
+        let output = command
             .args(["/FI", &filter, "/FO", "CSV", "/NH"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
