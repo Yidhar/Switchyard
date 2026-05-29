@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     ArtifactStore, EventLog, SessionCatalog, SessionEventRepository, SessionInboxRepository,
-    SessionRepository, StoreError, TurnRepository,
+    SessionRepository, StoreError, TurnPage, TurnRepository,
 };
 use switchyard_session::{Artifact, Event, InboxEntry, Session, Turn};
 
@@ -385,6 +385,67 @@ impl TurnRepository for SqliteStore {
         Ok(collapse_turns(turns))
     }
 
+    fn list_turns_page(
+        &self,
+        session_id: Uuid,
+        before_sequence: Option<i64>,
+        limit: usize,
+    ) -> Result<TurnPage, StoreError> {
+        let limit = limit.max(1);
+        let query_limit = limit.saturating_add(1) as i64;
+        let session_id = session_id.to_string();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            WITH canonical AS (
+                SELECT
+                    turn_id,
+                    MIN(sequence_id) AS first_sequence_id,
+                    MAX(sequence_id) AS latest_sequence_id
+                FROM turns_log
+                WHERE session_id = ?1
+                GROUP BY turn_id
+            ),
+            page AS (
+                SELECT first_sequence_id, latest_sequence_id
+                FROM canonical
+                WHERE (?2 IS NULL OR first_sequence_id < ?2)
+                ORDER BY first_sequence_id DESC
+                LIMIT ?3
+            )
+            SELECT page.first_sequence_id, turns_log.data
+            FROM page
+            JOIN turns_log ON turns_log.sequence_id = page.latest_sequence_id
+            ORDER BY page.first_sequence_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![session_id, before_sequence, query_limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut entries = Vec::<(i64, Turn)>::new();
+        for row in rows {
+            let (first_sequence_id, json) = row?;
+            entries.push((first_sequence_id, serde_json::from_str::<Turn>(&json)?));
+        }
+
+        let has_more_before = entries.len() > limit;
+        if has_more_before {
+            // The CTE reads newest-first with one extra row to detect whether
+            // an older page exists. After re-sorting chronologically the extra
+            // row is the first/oldest entry, so remove it from the visible page.
+            entries.remove(0);
+        }
+
+        let before_sequence = entries.first().map(|(sequence, _)| *sequence);
+        let turns = entries.into_iter().map(|(_, turn)| turn).collect();
+        Ok(TurnPage {
+            turns,
+            has_more_before,
+            before_sequence,
+        })
+    }
+
     fn delete_turn_tail(&mut self, turn_id: Uuid) -> Result<(), StoreError> {
         // Look up the smallest sequence_id for this turn (in case the row was
         // appended more than once across edits) plus its session. The
@@ -742,6 +803,56 @@ mod tests {
         assert_eq!(turns[0].turn_id, turn_id);
         assert_eq!(turns[0].status, TurnStatus::Completed);
         assert_eq!(turns[0].provider_response.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn list_turns_page_returns_tail_and_older_pages_with_latest_turn_data() {
+        let (path, _dir) = temp_db_path();
+        let mut store = SqliteStore::new(path).unwrap();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let mut turns = Vec::new();
+        for index in 0..5 {
+            let turn = Turn::new(
+                session.session_id,
+                "codex",
+                TurnRole::Core,
+                format!("message {index}"),
+            );
+            store.append_turn(&turn).unwrap();
+            turns.push(turn);
+        }
+
+        let mut updated_second = turns[1].clone();
+        updated_second.status = TurnStatus::Completed;
+        updated_second.provider_response = Some("updated".to_string());
+        store.append_turn(&updated_second).unwrap();
+
+        let tail = store.list_turns_page(session.session_id, None, 2).unwrap();
+        assert!(tail.has_more_before);
+        assert_eq!(
+            tail.turns
+                .iter()
+                .map(|turn| turn.user_message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message 3", "message 4"]
+        );
+        assert!(tail.before_sequence.is_some());
+
+        let older = store
+            .list_turns_page(session.session_id, tail.before_sequence, 3)
+            .unwrap();
+        assert!(!older.has_more_before);
+        assert_eq!(
+            older
+                .turns
+                .iter()
+                .map(|turn| turn.user_message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message 0", "message 1", "message 2"]
+        );
+        assert_eq!(older.turns[1].provider_response.as_deref(), Some("updated"));
     }
 
     #[test]

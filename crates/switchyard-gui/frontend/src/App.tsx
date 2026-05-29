@@ -69,11 +69,29 @@ const TURN_ATTACHMENTS_STORAGE_KEY = 'switchyard.turnAttachments.v1';
 const TEMP_USER_TURN_ID_PREFIX = 'temp-user-';
 const NEW_SESSION_PIPELINE_ID = '__switchyard_new_session__';
 const CACHED_SESSION_TURN_REFRESH_IDLE_TIMEOUT_MS = 700;
+const SESSION_TURN_PAGE_SIZE = 160;
+const SESSION_TURN_PAGE_REFRESH_MAX = 640;
+const SESSION_EVENT_FULL_LOAD_LIMIT = 1000;
+const SESSION_EVENT_INCREMENTAL_LIMIT = 500;
 
 interface RuntimeSnapshot {
   max_event_id?: number;
   host_jobs?: any[];
   events?: any[];
+}
+
+interface SessionTurnsPage {
+  turns: Turn[];
+  has_more_before?: boolean;
+  before_sequence?: number | null;
+}
+
+type SessionHistoryLoadingPhase = 'recent' | 'activity' | 'older' | 'refresh';
+
+interface SessionHistoryLoadingState {
+  sessionId: string | null;
+  phase: SessionHistoryLoadingPhase | null;
+  error: string | null;
 }
 
 interface RuntimeEventRecord {
@@ -130,6 +148,9 @@ interface SessionUiSnapshot {
   runtimePreparingPhase: string | null;
   isGenerating: boolean;
   messageQueue: SendPayload[];
+  historyHasMoreBefore: boolean;
+  historyBeforeSequence: number | null;
+  historyPartial: boolean;
   loaded: boolean;
   loadedAt: number;
 }
@@ -157,6 +178,9 @@ function createEmptySessionUiSnapshot(): SessionUiSnapshot {
     runtimePreparingPhase: null,
     isGenerating: false,
     messageQueue: [],
+    historyHasMoreBefore: false,
+    historyBeforeSequence: null,
+    historyPartial: false,
     loaded: false,
     loadedAt: 0,
   };
@@ -805,6 +829,31 @@ function turnListsEquivalentForUi(left: Turn[], right: Turn[]): boolean {
     }
   }
   return true;
+}
+
+function sessionTurnPageBeforeSequence(page: SessionTurnsPage): number | null {
+  const value = Number(page.before_sequence);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function mergePagedTurnsPreservingLoadedPrefix(previousTurns: Turn[], freshTurns: Turn[]): Turn[] {
+  if (previousTurns.length === 0) return freshTurns;
+  if (freshTurns.length === 0) return previousTurns;
+  const freshIds = new Set(freshTurns.map((turn) => turn.turn_id));
+  const retainedPrefix = previousTurns.filter((turn) => !freshIds.has(turn.turn_id));
+  const mergedFreshTurns = mergeFreshTurnsPreservingKnownResponses(previousTurns, freshTurns);
+  const combined = [...retainedPrefix, ...mergedFreshTurns];
+  return turnListsEquivalentForUi(previousTurns, combined) ? previousTurns : combined;
+}
+
+function prependOlderTurnPage(currentTurns: Turn[], olderTurns: Turn[]): Turn[] {
+  if (olderTurns.length === 0) return currentTurns;
+  if (currentTurns.length === 0) return olderTurns;
+  const currentIds = new Set(currentTurns.map((turn) => turn.turn_id));
+  const uniqueOlderTurns = olderTurns.filter((turn) => !currentIds.has(turn.turn_id));
+  if (uniqueOlderTurns.length === 0) return currentTurns;
+  const combined = [...uniqueOlderTurns, ...currentTurns];
+  return turnListsEquivalentForUi(currentTurns, combined) ? currentTurns : combined;
 }
 
 function shallowObjectEquivalent(
@@ -1840,12 +1889,45 @@ function App() {
   const [runtimeDispatchStartedAt, setRuntimeDispatchStartedAt] = useState<number | null>(null);
   const [runtimePreparingPhase, setRuntimePreparingPhase] = useState<string | null>(null);
   const runtimeDispatchStartedAtRef = useRef<number | null>(null);
+  const [historyHasMoreBefore, setHistoryHasMoreBefore] = useState(false);
+  const [historyBeforeSequence, setHistoryBeforeSequence] = useState<number | null>(null);
+  const [historyPartial, setHistoryPartial] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState<SessionHistoryLoadingState>({
+    sessionId: null,
+    phase: null,
+    error: null,
+  });
+  const historyHasMoreBeforeRef = useRef(false);
+  const historyBeforeSequenceRef = useRef<number | null>(null);
+  const historyPartialRef = useRef(false);
+  const historyLoadingRef = useRef<SessionHistoryLoadingState>({
+    sessionId: null,
+    phase: null,
+    error: null,
+  });
+  const olderHistoryLoadGenerationRef = useRef(0);
   const sessionUiSnapshotsRef = useRef<Record<string, SessionUiSnapshot>>({});
   const sessionDataRefreshGenerationRef = useRef<Record<string, number>>({});
   const runtimeTurnSessionIdRef = useRef<Record<string, RuntimeTurnSessionCacheEntry>>({});
   const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [providerStatusLoading, setProviderStatusLoading] = useState(false);
   const [providerStatusError, setProviderStatusError] = useState<string | null>(null);
+
+  useEffect(() => {
+    historyHasMoreBeforeRef.current = historyHasMoreBefore;
+  }, [historyHasMoreBefore]);
+
+  useEffect(() => {
+    historyBeforeSequenceRef.current = historyBeforeSequence;
+  }, [historyBeforeSequence]);
+
+  useEffect(() => {
+    historyPartialRef.current = historyPartial;
+  }, [historyPartial]);
+
+  useEffect(() => {
+    historyLoadingRef.current = historyLoading;
+  }, [historyLoading]);
 
   // Settings State
   const [config, setConfig] = useState<SwitchyardConfig | null>(null);
@@ -2649,6 +2731,9 @@ function App() {
       runtimePreparingPhase,
       isGenerating,
       messageQueue: messageQueueRef.current,
+      historyHasMoreBefore,
+      historyBeforeSequence,
+      historyPartial,
       loaded: options?.loaded ?? previous?.loaded ?? true,
       loadedAt: Date.now(),
     };
@@ -2700,6 +2785,9 @@ function App() {
       messageQueueRef.current = next.messageQueue;
       setMessageQueue(next.messageQueue);
       setIsGenerating(next.isGenerating);
+      setHistoryHasMoreBefore(next.historyHasMoreBefore);
+      setHistoryBeforeSequence(next.historyBeforeSequence);
+      setHistoryPartial(next.historyPartial);
       replaceRealtimeTerminalSnapshot(next);
     });
   };
@@ -2708,6 +2796,10 @@ function App() {
     const sessionId = selectedSessionRef.current?.session_id;
     if (!sessionId) return;
     const terminal = materializeRealtimeTerminalSnapshot();
+    const isColdHistoryHydrating =
+      historyLoadingRef.current.sessionId === sessionId &&
+      historyLoadingRef.current.phase !== null &&
+      turns.length === 0;
     patchSessionUiSnapshot(sessionId, {
       turns,
       sessionEvents,
@@ -2730,7 +2822,10 @@ function App() {
       runtimePreparingPhase,
       isGenerating,
       messageQueue,
-      loaded: true,
+      historyHasMoreBefore,
+      historyBeforeSequence,
+      historyPartial,
+      loaded: !isColdHistoryHydrating,
     });
   }, [
     turns,
@@ -2753,6 +2848,9 @@ function App() {
     runtimePreparingPhase,
     isGenerating,
     messageQueue,
+    historyHasMoreBefore,
+    historyBeforeSequence,
+    historyPartial,
   ]);
 
   const updateSessionEventsCursor = (sessionId: string, events: any[]) => {
@@ -2784,9 +2882,11 @@ function App() {
 
   const fetchSessionEventsForMerge = async (sessionId: string, mode: 'full' | 'incremental' = 'incremental') => {
     const afterTimestamp = mode === 'incremental' ? sessionEventsCursorRef.current[sessionId] : undefined;
+    const limit = mode === 'full' ? SESSION_EVENT_FULL_LOAD_LIMIT : SESSION_EVENT_INCREMENTAL_LIMIT;
     const eventList = await invoke<any[]>('get_session_events', {
       sessionId,
       ...(afterTimestamp ? { afterTimestamp } : {}),
+      limit,
     });
     updateSessionEventsCursor(sessionId, eventList);
     return eventList;
@@ -2830,7 +2930,27 @@ function App() {
         if (runtimeDebug) console.debug('[runtime_event] refreshTurns', { session_id: sessionId || null });
         if (!session || !sessionId) return;
         try {
-          const turnList = await invoke<Turn[]>('get_session_turns', { sessionId });
+          const cachedSnapshotBeforeRefresh = sessionUiSnapshotsRef.current[sessionId] ?? createEmptySessionUiSnapshot();
+          const snapshotBeforeRefresh = {
+            ...cachedSnapshotBeforeRefresh,
+            turns: turnsRef.current,
+            historyHasMoreBefore: historyHasMoreBeforeRef.current || cachedSnapshotBeforeRefresh.historyHasMoreBefore,
+            historyBeforeSequence: historyBeforeSequenceRef.current ?? cachedSnapshotBeforeRefresh.historyBeforeSequence,
+            historyPartial: historyPartialRef.current || cachedSnapshotBeforeRefresh.historyPartial,
+          };
+          const shouldUsePagedRefresh = snapshotBeforeRefresh.historyPartial || snapshotBeforeRefresh.historyHasMoreBefore;
+          const turnPage = shouldUsePagedRefresh
+            ? await invoke<SessionTurnsPage>('get_session_turns_page', {
+                sessionId,
+                limit: Math.min(
+                  SESSION_TURN_PAGE_REFRESH_MAX,
+                  Math.max(SESSION_TURN_PAGE_SIZE, snapshotBeforeRefresh.turns.length + SESSION_TURN_PAGE_SIZE),
+                ),
+              })
+            : null;
+          const turnList = turnPage
+            ? (turnPage.turns ?? [])
+            : await invoke<Turn[]>('get_session_turns', { sessionId });
           if (!active || selectedSessionRef.current?.session_id !== sessionId) return;
           if (runtimeDebug) console.debug('[runtime_event] turns loaded', { session_id: sessionId, count: turnList.length });
           const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
@@ -2839,7 +2959,54 @@ function App() {
           // Treat DB data as authoritative for ordering/status, but never let a
           // transient empty provider_response erase a final answer already seen
           // by the UI.
-          commitTurns((prev) => mergeFreshTurnsPreservingKnownResponses(prev, turnListWithFinalResponses));
+          commitTurns((prev) => (
+            turnPage
+              ? mergePagedTurnsPreservingLoadedPrefix(prev, turnListWithFinalResponses)
+              : mergeFreshTurnsPreservingKnownResponses(prev, turnListWithFinalResponses)
+          ));
+          patchSessionUiSnapshot(sessionId, (previous) => {
+            const mergedTurns = turnPage
+              ? mergePagedTurnsPreservingLoadedPrefix(previous.turns, turnListWithFinalResponses)
+              : mergeFreshTurnsPreservingKnownResponses(previous.turns, turnListWithFinalResponses);
+            const pageBeforeSequence = turnPage ? sessionTurnPageBeforeSequence(turnPage) : null;
+            const pageTouchesOldestLoaded =
+              Boolean(turnPage) &&
+              mergedTurns.length > 0 &&
+              turnListWithFinalResponses.length > 0 &&
+              mergedTurns[0]?.turn_id === turnListWithFinalResponses[0]?.turn_id;
+            return {
+              ...previous,
+              turns: turnListsEquivalentForUi(previous.turns, mergedTurns) ? previous.turns : mergedTurns,
+              historyHasMoreBefore: turnPage
+                ? (pageTouchesOldestLoaded ? Boolean(turnPage.has_more_before) : previous.historyHasMoreBefore)
+                : false,
+              historyBeforeSequence: turnPage
+                ? (pageTouchesOldestLoaded ? pageBeforeSequence : previous.historyBeforeSequence)
+                : null,
+              historyPartial: turnPage
+                ? (pageTouchesOldestLoaded ? Boolean(turnPage.has_more_before) : previous.historyPartial)
+                : false,
+              loaded: true,
+              loadedAt: Date.now(),
+            };
+          });
+          if (turnPage) {
+            const pageBeforeSequence = sessionTurnPageBeforeSequence(turnPage);
+            const currentTurns = turnsRef.current;
+            const pageTouchesOldestLoaded =
+              currentTurns.length > 0 &&
+              turnListWithFinalResponses.length > 0 &&
+              currentTurns[0]?.turn_id === turnListWithFinalResponses[0]?.turn_id;
+            if (pageTouchesOldestLoaded) {
+              setHistoryHasMoreBefore(Boolean(turnPage.has_more_before));
+              setHistoryBeforeSequence(pageBeforeSequence);
+              setHistoryPartial(Boolean(turnPage.has_more_before));
+            }
+          } else {
+            setHistoryHasMoreBefore(false);
+            setHistoryBeforeSequence(null);
+            setHistoryPartial(false);
+          }
           const eventList = await fetchSessionEventsForMerge(sessionId, 'incremental');
           if (!active || selectedSessionRef.current?.session_id !== sessionId) return;
           // DB writes can lag a live runtime event by a few milliseconds. Merge
@@ -4007,6 +4174,10 @@ function App() {
     setRuntimeTurnStartedAt({});
     setRuntimeTurnPhaseChangedAt({});
     clearRuntimeDispatch();
+    setHistoryHasMoreBefore(false);
+    setHistoryBeforeSequence(null);
+    setHistoryPartial(false);
+    setHistoryLoading({ sessionId: null, phase: null, error: null });
     setCanvasTabs([]);
     setActiveCanvasTabId(null);
     preparingSessionIdsRef.current.clear();
@@ -4055,29 +4226,30 @@ function App() {
 
     try {
       if (options.mode === 'full') {
-        const [turnList, runtimeSnapshot, eventList] = await Promise.all([
-          invoke<Turn[]>('get_session_turns', { sessionId }),
-          fetchRuntimeSnapshot(sessionId, 'full'),
-          fetchSessionEventsForMerge(sessionId, 'full'),
-        ]);
+        setHistoryLoading({ sessionId, phase: 'recent', error: null });
+        const turnPage = await invoke<SessionTurnsPage>('get_session_turns_page', {
+          sessionId,
+          limit: SESSION_TURN_PAGE_SIZE,
+        });
         if (!isLatestRefresh()) return;
 
-        const runtimeHyardJobs = hyardJobsFromRuntimeSnapshot(runtimeSnapshot);
-        const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
+        const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnPage.turns ?? []);
         reconcileTurnAttachmentBindings(sessionId, turnListWithFinalResponses);
-        const mergedEvents = mergeSessionEventLists([], eventList);
         const snapshotBeforeMerge = sessionUiSnapshotsRef.current[sessionId] ?? createEmptySessionUiSnapshot();
         const mergedTurns = mergeFreshTurnsPreservingKnownResponses(
           snapshotBeforeMerge.turns,
           turnListWithFinalResponses,
         );
+        const hasMoreBefore = Boolean(turnPage.has_more_before);
+        const beforeSequence = sessionTurnPageBeforeSequence(turnPage);
 
         patchSessionUiSnapshot(sessionId, {
           turns: turnListsEquivalentForUi(snapshotBeforeMerge.turns, mergedTurns)
             ? snapshotBeforeMerge.turns
             : mergedTurns,
-          hyardJobs: runtimeHyardJobs,
-          sessionEvents: mergedEvents,
+          historyHasMoreBefore: hasMoreBefore,
+          historyBeforeSequence: beforeSequence,
+          historyPartial: hasMoreBefore,
           loaded: true,
         });
 
@@ -4087,8 +4259,36 @@ function App() {
             const nextTurns = mergeFreshTurnsPreservingKnownResponses(prev, turnListWithFinalResponses);
             return turnListsEquivalentForUi(prev, nextTurns) ? prev : nextTurns;
           });
+          setHistoryHasMoreBefore(hasMoreBefore);
+          setHistoryBeforeSequence(beforeSequence);
+          setHistoryPartial(hasMoreBefore);
+        });
+
+        await deferUntilNextPaint();
+        if (!isLatestRefresh()) return;
+        if (selectedSessionRef.current?.session_id === sessionId) {
+          setHistoryLoading({ sessionId, phase: 'activity', error: null });
+        }
+
+        const [runtimeSnapshot, eventList] = await Promise.all([
+          fetchRuntimeSnapshot(sessionId, 'full'),
+          fetchSessionEventsForMerge(sessionId, 'full'),
+        ]);
+        if (!isLatestRefresh()) return;
+
+        const runtimeHyardJobs = hyardJobsFromRuntimeSnapshot(runtimeSnapshot);
+        const mergedEvents = mergeSessionEventLists([], eventList);
+        patchSessionUiSnapshot(sessionId, {
+          hyardJobs: runtimeHyardJobs,
+          sessionEvents: mergedEvents,
+          loaded: true,
+        });
+
+        if (selectedSessionRef.current?.session_id !== sessionId) return;
+        unstable_batchedUpdates(() => {
           setHyardJobs(runtimeHyardJobs);
           setSessionEvents(mergedEvents);
+          setHistoryLoading({ sessionId: null, phase: null, error: null });
         });
         return;
       }
@@ -4133,28 +4333,156 @@ function App() {
       }
       if (!isLatestRefresh()) return;
 
-      const turnList = await invoke<Turn[]>('get_session_turns', { sessionId });
+      const snapshotBeforeTurnRefresh = sessionUiSnapshotsRef.current[sessionId] ?? createEmptySessionUiSnapshot();
+      const shouldUsePagedTurnRefresh = snapshotBeforeTurnRefresh.historyPartial || snapshotBeforeTurnRefresh.historyHasMoreBefore;
+      const turnPage = shouldUsePagedTurnRefresh
+        ? await invoke<SessionTurnsPage>('get_session_turns_page', {
+            sessionId,
+            limit: Math.min(
+              SESSION_TURN_PAGE_REFRESH_MAX,
+              Math.max(SESSION_TURN_PAGE_SIZE, snapshotBeforeTurnRefresh.turns.length + SESSION_TURN_PAGE_SIZE),
+            ),
+          })
+        : null;
+      const turnList = turnPage
+        ? (turnPage.turns ?? [])
+        : await invoke<Turn[]>('get_session_turns', { sessionId });
       if (!isLatestRefresh()) return;
 
       const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
       reconcileTurnAttachmentBindings(sessionId, turnListWithFinalResponses);
       patchSessionUiSnapshot(sessionId, (previous) => {
-        const mergedTurns = mergeFreshTurnsPreservingKnownResponses(previous.turns, turnListWithFinalResponses);
+        const mergedTurns = turnPage
+          ? mergePagedTurnsPreservingLoadedPrefix(previous.turns, turnListWithFinalResponses)
+          : mergeFreshTurnsPreservingKnownResponses(previous.turns, turnListWithFinalResponses);
+        const pageBeforeSequence = turnPage ? sessionTurnPageBeforeSequence(turnPage) : null;
+        const pageTouchesOldestLoaded =
+          Boolean(turnPage) &&
+          mergedTurns.length > 0 &&
+          turnListWithFinalResponses.length > 0 &&
+          mergedTurns[0]?.turn_id === turnListWithFinalResponses[0]?.turn_id;
         return {
           ...previous,
           turns: turnListsEquivalentForUi(previous.turns, mergedTurns) ? previous.turns : mergedTurns,
+          historyHasMoreBefore: turnPage
+            ? (pageTouchesOldestLoaded ? Boolean(turnPage.has_more_before) : previous.historyHasMoreBefore)
+            : false,
+          historyBeforeSequence: turnPage
+            ? (pageTouchesOldestLoaded ? pageBeforeSequence : previous.historyBeforeSequence)
+            : null,
+          historyPartial: turnPage
+            ? (pageTouchesOldestLoaded ? Boolean(turnPage.has_more_before) : previous.historyPartial)
+            : false,
           loaded: true,
           loadedAt: Date.now(),
         };
       });
 
       if (selectedSessionRef.current?.session_id !== sessionId) return;
-      commitTurns((prev) => {
-        const mergedTurns = mergeFreshTurnsPreservingKnownResponses(prev, turnListWithFinalResponses);
-        return turnListsEquivalentForUi(prev, mergedTurns) ? prev : mergedTurns;
+      unstable_batchedUpdates(() => {
+        commitTurns((prev) => {
+          const mergedTurns = turnPage
+            ? mergePagedTurnsPreservingLoadedPrefix(prev, turnListWithFinalResponses)
+            : mergeFreshTurnsPreservingKnownResponses(prev, turnListWithFinalResponses);
+          return turnListsEquivalentForUi(prev, mergedTurns) ? prev : mergedTurns;
+        });
+        if (turnPage) {
+          const pageBeforeSequence = sessionTurnPageBeforeSequence(turnPage);
+          const currentTurns = turnsRef.current;
+          const pageTouchesOldestLoaded =
+            currentTurns.length > 0 &&
+            turnListWithFinalResponses.length > 0 &&
+            currentTurns[0]?.turn_id === turnListWithFinalResponses[0]?.turn_id;
+          if (pageTouchesOldestLoaded) {
+            setHistoryHasMoreBefore(Boolean(turnPage.has_more_before));
+            setHistoryBeforeSequence(pageBeforeSequence);
+            setHistoryPartial(Boolean(turnPage.has_more_before));
+          }
+        } else {
+          setHistoryHasMoreBefore(false);
+          setHistoryBeforeSequence(null);
+          setHistoryPartial(false);
+        }
       });
     } catch (e) {
       console.error('Failed to refresh selected session data:', e);
+      if (selectedSessionRef.current?.session_id === sessionId) {
+        setHistoryLoading({
+          sessionId,
+          phase: null,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+  };
+
+  const handleLoadOlderHistory = async () => {
+    const session = selectedSessionRef.current;
+    const sessionId = session?.session_id;
+    const beforeSequence = historyBeforeSequenceRef.current;
+    if (!sessionId || !beforeSequence) return;
+    if (
+      historyLoadingRef.current.sessionId === sessionId &&
+      historyLoadingRef.current.phase === 'older'
+    ) {
+      return;
+    }
+
+    const loadGeneration = olderHistoryLoadGenerationRef.current + 1;
+    olderHistoryLoadGenerationRef.current = loadGeneration;
+    setHistoryLoading({ sessionId, phase: 'older', error: null });
+
+    try {
+      const turnPage = await invoke<SessionTurnsPage>('get_session_turns_page', {
+        sessionId,
+        beforeSequence,
+        limit: SESSION_TURN_PAGE_SIZE,
+      });
+      if (
+        olderHistoryLoadGenerationRef.current !== loadGeneration ||
+        selectedSessionRef.current?.session_id !== sessionId
+      ) {
+        return;
+      }
+
+      const olderTurns = applyRememberedFinalTurnResponses(turnPage.turns ?? []);
+      reconcileTurnAttachmentBindings(sessionId, olderTurns);
+      const hasMoreBefore = Boolean(turnPage.has_more_before);
+      const nextBeforeSequence = sessionTurnPageBeforeSequence(turnPage);
+
+      patchSessionUiSnapshot(sessionId, (previous) => {
+        const mergedTurns = prependOlderTurnPage(previous.turns, olderTurns);
+        return {
+          ...previous,
+          turns: turnListsEquivalentForUi(previous.turns, mergedTurns) ? previous.turns : mergedTurns,
+          historyHasMoreBefore: hasMoreBefore,
+          historyBeforeSequence: nextBeforeSequence,
+          historyPartial: hasMoreBefore,
+          loaded: true,
+          loadedAt: Date.now(),
+        };
+      });
+
+      if (selectedSessionRef.current?.session_id !== sessionId) return;
+      unstable_batchedUpdates(() => {
+        commitTurns((prev) => {
+          const mergedTurns = prependOlderTurnPage(prev, olderTurns);
+          return turnListsEquivalentForUi(prev, mergedTurns) ? prev : mergedTurns;
+        });
+        setHistoryHasMoreBefore(hasMoreBefore);
+        setHistoryBeforeSequence(nextBeforeSequence);
+        setHistoryPartial(hasMoreBefore);
+        setHistoryLoading({ sessionId: null, phase: null, error: null });
+      });
+    } catch (e) {
+      console.error('Failed to load older history:', e);
+      if (selectedSessionRef.current?.session_id === sessionId) {
+        setHistoryLoading({
+          sessionId,
+          phase: null,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
     }
   };
 
@@ -4194,6 +4522,9 @@ function App() {
     const cachedSnapshot = sessionUiSnapshotsRef.current[sessionId];
     const hasLoadedSnapshot = Boolean(cachedSnapshot?.loaded);
 
+    setHistoryLoading(hasLoadedSnapshot
+      ? { sessionId: null, phase: null, error: null }
+      : { sessionId, phase: 'recent', error: null });
     activateSessionShell(session);
 
     if (hasLoadedSnapshot) {
@@ -4468,7 +4799,29 @@ function App() {
     } finally {
       // Reload turns database state
       try {
-        const updatedTurns = await invoke<Turn[]>('get_session_turns', { sessionId: sessionForSend.session_id });
+        const cachedTargetSnapshot = sessionUiSnapshotsRef.current[sessionForSend.session_id] ?? createEmptySessionUiSnapshot();
+        const targetSnapshot = selectedSessionRef.current?.session_id === sessionForSend.session_id
+          ? {
+              ...cachedTargetSnapshot,
+              turns: turnsRef.current,
+              historyHasMoreBefore: historyHasMoreBeforeRef.current || cachedTargetSnapshot.historyHasMoreBefore,
+              historyBeforeSequence: historyBeforeSequenceRef.current ?? cachedTargetSnapshot.historyBeforeSequence,
+              historyPartial: historyPartialRef.current || cachedTargetSnapshot.historyPartial,
+            }
+          : cachedTargetSnapshot;
+        const shouldUsePagedRefresh = targetSnapshot.historyPartial || targetSnapshot.historyHasMoreBefore;
+        const turnPage = shouldUsePagedRefresh
+          ? await invoke<SessionTurnsPage>('get_session_turns_page', {
+              sessionId: sessionForSend.session_id,
+              limit: Math.min(
+                SESSION_TURN_PAGE_REFRESH_MAX,
+                Math.max(SESSION_TURN_PAGE_SIZE, targetSnapshot.turns.length + SESSION_TURN_PAGE_SIZE),
+              ),
+            })
+          : null;
+        const updatedTurns = turnPage
+          ? (turnPage.turns ?? [])
+          : await invoke<Turn[]>('get_session_turns', { sessionId: sessionForSend.session_id });
         let nextTurns = applyRememberedFinalTurnResponses(updatedTurns);
         const returnedResponse = fallbackResponseForUserMessage(runTurnResponse, message);
         if (returnedResponse !== null) {
@@ -4486,14 +4839,54 @@ function App() {
         }
         reconcileTurnAttachmentBindings(sessionForSend.session_id, nextTurns);
         if (selectedSessionRef.current?.session_id === sessionForSend.session_id) {
-          commitTurns((prev) => mergeFreshTurnsPreservingKnownResponses(prev, nextTurns));
+          commitTurns((prev) => (
+            turnPage
+              ? mergePagedTurnsPreservingLoadedPrefix(prev, nextTurns)
+              : mergeFreshTurnsPreservingKnownResponses(prev, nextTurns)
+          ));
+          if (turnPage) {
+            const currentTurns = turnsRef.current;
+            const pageTouchesOldestLoaded =
+              currentTurns.length > 0 &&
+              nextTurns.length > 0 &&
+              currentTurns[0]?.turn_id === nextTurns[0]?.turn_id;
+            if (pageTouchesOldestLoaded) {
+              setHistoryHasMoreBefore(Boolean(turnPage.has_more_before));
+              setHistoryBeforeSequence(sessionTurnPageBeforeSequence(turnPage));
+              setHistoryPartial(Boolean(turnPage.has_more_before));
+            }
+          } else {
+            setHistoryHasMoreBefore(false);
+            setHistoryBeforeSequence(null);
+            setHistoryPartial(false);
+          }
         } else {
-          patchSessionUiSnapshot(sessionForSend.session_id, (previous) => ({
-            ...previous,
-            turns: mergeFreshTurnsPreservingKnownResponses(previous.turns, nextTurns),
-            loaded: true,
-            loadedAt: Date.now(),
-          }));
+          patchSessionUiSnapshot(sessionForSend.session_id, (previous) => {
+            const mergedTurns = turnPage
+              ? mergePagedTurnsPreservingLoadedPrefix(previous.turns, nextTurns)
+              : mergeFreshTurnsPreservingKnownResponses(previous.turns, nextTurns);
+            const pageBeforeSequence = turnPage ? sessionTurnPageBeforeSequence(turnPage) : null;
+            const pageTouchesOldestLoaded =
+              Boolean(turnPage) &&
+              mergedTurns.length > 0 &&
+              nextTurns.length > 0 &&
+              mergedTurns[0]?.turn_id === nextTurns[0]?.turn_id;
+            return {
+              ...previous,
+              turns: turnListsEquivalentForUi(previous.turns, mergedTurns) ? previous.turns : mergedTurns,
+              historyHasMoreBefore: turnPage
+                ? (pageTouchesOldestLoaded ? Boolean(turnPage.has_more_before) : previous.historyHasMoreBefore)
+                : false,
+              historyBeforeSequence: turnPage
+                ? (pageTouchesOldestLoaded ? pageBeforeSequence : previous.historyBeforeSequence)
+                : null,
+              historyPartial: turnPage
+                ? (pageTouchesOldestLoaded ? Boolean(turnPage.has_more_before) : previous.historyPartial)
+                : false,
+              loaded: true,
+              loadedAt: Date.now(),
+            };
+          });
         }
       } catch (e) {
         console.error('Error reloading turns after dispatch:', e);
@@ -5244,6 +5637,10 @@ function App() {
     }
   };
 
+  const visibleHistoryLoading = selectedSession && historyLoading.sessionId === selectedSession.session_id
+    ? historyLoading
+    : { sessionId: null, phase: null, error: null };
+
   return (
     <div
       ref={appContainerRef}
@@ -5414,6 +5811,13 @@ function App() {
                 onEditAndResend={handleEditAndResend}
                 onRetryLastUserTurn={handleRetryLastUserTurn}
                 onOpenFile={openFileInCanvas}
+                isHistoryLoading={Boolean(visibleHistoryLoading.phase)}
+                historyLoadingPhase={visibleHistoryLoading.phase}
+                historyLoadingError={visibleHistoryLoading.error}
+                historyPartial={historyPartial}
+                historyHasMoreBefore={historyHasMoreBefore}
+                onLoadOlderHistory={handleLoadOlderHistory}
+                isLoadingOlderHistory={visibleHistoryLoading.phase === 'older'}
               />
             ) : (
               <WelcomeWorkspace

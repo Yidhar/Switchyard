@@ -4,6 +4,7 @@ pub mod sqlite;
 pub mod workspace_index;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use switchyard_session::{Artifact, Event, InboxEntry, Session, Turn};
 use uuid::Uuid;
 
@@ -31,6 +32,12 @@ pub trait SessionRepository {
 pub trait TurnRepository {
     fn append_turn(&mut self, turn: &Turn) -> Result<(), StoreError>;
     fn list_turns(&self, session_id: Uuid) -> Result<Vec<Turn>, StoreError>;
+    fn list_turns_page(
+        &self,
+        session_id: Uuid,
+        before_sequence: Option<i64>,
+        limit: usize,
+    ) -> Result<TurnPage, StoreError>;
 
     /// Delete the turn identified by `turn_id` together with every later turn
     /// in the same session and all events / artifacts attached to those turns.
@@ -41,6 +48,17 @@ pub trait TurnRepository {
     /// No-op when `turn_id` is unknown. Implementations must be transactional
     /// — partial rewinds (turns gone but events left dangling) are not allowed.
     fn delete_turn_tail(&mut self, turn_id: Uuid) -> Result<(), StoreError>;
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnPage {
+    pub turns: Vec<Turn>,
+    /// True when another page exists before `before_sequence`.
+    pub has_more_before: bool,
+    /// Cursor for the next older page. Pass this value back as
+    /// `before_sequence` to load turns that physically appeared before the
+    /// first turn in this page.
+    pub before_sequence: Option<i64>,
 }
 
 pub trait EventLog {
@@ -184,6 +202,18 @@ impl TurnRepository for StoreHandle {
         match self {
             Self::Jsonl(store) => store.list_turns(session_id),
             Self::Sqlite(store) => store.list_turns(session_id),
+        }
+    }
+
+    fn list_turns_page(
+        &self,
+        session_id: Uuid,
+        before_sequence: Option<i64>,
+        limit: usize,
+    ) -> Result<TurnPage, StoreError> {
+        match self {
+            Self::Jsonl(store) => store.list_turns_page(session_id, before_sequence, limit),
+            Self::Sqlite(store) => store.list_turns_page(session_id, before_sequence, limit),
         }
     }
 

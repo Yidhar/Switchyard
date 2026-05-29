@@ -36,7 +36,7 @@ use switchyard_runtime::{RuntimeDb, RuntimeIpcMessage, RuntimeIpcRequest, Runtim
 use switchyard_session::{Artifact, Event, Session, Turn, Workspace};
 use switchyard_store::{
     ArtifactStore, SessionCatalog, SessionEventRepository, SessionRepository, StoreBackend,
-    StoreHandle, TurnRepository, WorkspaceIndex, default_index_path, workspace_data_dir,
+    StoreHandle, TurnPage, TurnRepository, WorkspaceIndex, default_index_path, workspace_data_dir,
 };
 
 /// Tauri-managed state holding the in-memory copy of `workspaces.json`.
@@ -2977,11 +2977,38 @@ async fn get_session_turns(
     workspace_state: tauri::State<'_, WorkspaceState>,
     session_id: String,
 ) -> Result<Vec<Turn>, String> {
-    let (_ws, store, _data_dir, _config) = open_current_store(&workspace_state)?;
     let session_uuid =
         uuid::Uuid::parse_str(&session_id).map_err(|e| format!("invalid session ID: {}", e))?;
-    let turns = store.list_turns(session_uuid).map_err(|e| e.to_string())?;
-    Ok(turns)
+    let ws = workspace_state.current()?;
+    let config = SwitchyardConfig::resolve(&ws.primary_root).unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (store, _data_dir) = open_workspace_store(&ws, &config)?;
+        store.list_turns(session_uuid).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("failed to join session turns loader: {e}"))?
+}
+
+#[tauri::command]
+async fn get_session_turns_page(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    session_id: String,
+    before_sequence: Option<i64>,
+    limit: Option<usize>,
+) -> Result<TurnPage, String> {
+    let session_uuid =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("invalid session ID: {}", e))?;
+    let ws = workspace_state.current()?;
+    let config = SwitchyardConfig::resolve(&ws.primary_root).unwrap_or_default();
+    let limit = limit.unwrap_or(160).clamp(1, 1_000);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (store, _data_dir) = open_workspace_store(&ws, &config)?;
+        store
+            .list_turns_page(session_uuid, before_sequence, limit)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("failed to join session turns page loader: {e}"))?
 }
 
 #[tauri::command]
@@ -2991,9 +3018,10 @@ async fn get_session_events(
     after_timestamp: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<Event>, String> {
-    let (_ws, store, _data_dir, _config) = open_current_store(&workspace_state)?;
     let session_uuid =
         uuid::Uuid::parse_str(&session_id).map_err(|e| format!("invalid session ID: {}", e))?;
+    let ws = workspace_state.current()?;
+    let config = SwitchyardConfig::resolve(&ws.primary_root).unwrap_or_default();
     let after_timestamp = after_timestamp
         .as_deref()
         .map(str::trim)
@@ -3007,13 +3035,18 @@ async fn get_session_events(
     let limit = limit
         .filter(|value| *value > 0)
         .map(|value| value.min(10_000));
-    let events = store
-        .list_session_events_since(session_uuid, after_timestamp, limit)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|event| !switchyard_provider_api::is_empty_reasoning_payload(&event.payload))
-        .collect();
-    Ok(events)
+    tauri::async_runtime::spawn_blocking(move || {
+        let (store, _data_dir) = open_workspace_store(&ws, &config)?;
+        let events = store
+            .list_session_events_since(session_uuid, after_timestamp, limit)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|event| !switchyard_provider_api::is_empty_reasoning_payload(&event.payload))
+            .collect();
+        Ok(events)
+    })
+    .await
+    .map_err(|e| format!("failed to join session events loader: {e}"))?
 }
 
 #[tauri::command]
@@ -4679,6 +4712,7 @@ fn main() {
             list_sessions,
             create_session,
             get_session_turns,
+            get_session_turns_page,
             get_session_events,
             get_runtime_snapshot,
             save_clipboard_attachment,

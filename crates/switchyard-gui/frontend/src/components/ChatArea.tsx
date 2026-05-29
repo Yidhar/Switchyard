@@ -70,6 +70,13 @@ interface ChatAreaProps {
   /// an inline file-path code span inside a chat message (the RenderHelpers
   /// turn that on when the text looks like a path).
   onOpenFile: (path: string) => void;
+  isHistoryLoading?: boolean;
+  historyLoadingPhase?: string | null;
+  historyLoadingError?: string | null;
+  historyPartial?: boolean;
+  historyHasMoreBefore?: boolean;
+  onLoadOlderHistory?: () => void | Promise<void>;
+  isLoadingOlderHistory?: boolean;
 }
 
 const SANDBOX_OPTIONS: Array<{
@@ -1585,6 +1592,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onEditAndResend,
   onRetryLastUserTurn,
   onOpenFile,
+  isHistoryLoading = false,
+  historyLoadingPhase = null,
+  historyLoadingError = null,
+  historyPartial = false,
+  historyHasMoreBefore = false,
+  onLoadOlderHistory,
+  isLoadingOlderHistory = false,
 }) => {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesContentRef = useRef<HTMLDivElement>(null);
@@ -1740,6 +1754,35 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     !activeCoreText &&
     !activeCoreTurnId &&
     !activePeerName;
+  const historyLoadingLabel = historyLoadingPhase === 'activity'
+    ? '正在加载运行记录和工具活动…'
+    : historyLoadingPhase === 'older'
+      ? '正在加载更早的消息…'
+      : historyLoadingPhase === 'refresh'
+        ? '正在刷新会话历史…'
+        : '正在加载最近的会话消息…';
+  const showHistoryLoadingEmptyState = Boolean(
+    selectedSession &&
+    turns.length === 0 &&
+    !showRuntimeDispatchPanel &&
+    !showActiveCorePanel &&
+    !showActivePeerPanel &&
+    (isHistoryLoading || historyLoadingError),
+  );
+  const showHistoryStatusStrip = Boolean(
+    selectedSession &&
+    turns.length > 0 &&
+    (
+      historyHasMoreBefore ||
+      historyPartial ||
+      isHistoryLoading ||
+      historyLoadingError
+    ),
+  );
+  const handleLoadOlderHistoryClick = useCallback(() => {
+    if (!onLoadOlderHistory || isLoadingOlderHistory) return;
+    void onLoadOlderHistory();
+  }, [isLoadingOlderHistory, onLoadOlderHistory]);
 
   const endVirtualScrollSeek = useCallback(() => {
     if (scrollSeekIdleTimerRef.current !== null) {
@@ -2406,7 +2449,23 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         style={{ flex: 1, overflowY: 'auto', padding: '12px', overflowAnchor: 'none' }}
       >
         <div ref={messagesContentRef} style={{ minHeight: '100%', display: 'flex', flexDirection: 'column', gap: '14px', overflowAnchor: 'none' }}>
-          {turns.length === 0 &&
+          {showHistoryLoadingEmptyState ? (
+            <div className="empty-chat history-loading-empty">
+              <RefreshCw
+                size={32}
+                className={isHistoryLoading ? 'spin' : undefined}
+                style={{ color: historyLoadingError ? '#f87171' : 'var(--color-primary)' }}
+              />
+              <div>
+                <h3>{historyLoadingError ? 'Conversation history did not load' : 'Loading conversation history…'}</h3>
+                <p style={{ fontSize: '13px', marginTop: '6px', maxWidth: 460 }}>
+                  {historyLoadingError
+                    ? `无法加载这个会话的历史记录：${historyLoadingError}`
+                    : historyLoadingLabel}
+                </p>
+              </div>
+            </div>
+          ) : turns.length === 0 &&
           !showRuntimeDispatchPanel &&
           !showActiveCorePanel &&
           !showActivePeerPanel ? (
@@ -2421,6 +2480,46 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
           ) : (
             <>
+              {showHistoryStatusStrip && (
+                <div className="history-load-strip">
+                  <div className="history-load-strip-copy">
+                    {isHistoryLoading && (
+                      <span className="history-load-inline-status">
+                        <RefreshCw className="spin" size={13} />
+                        {historyLoadingLabel}
+                      </span>
+                    )}
+                    {!isHistoryLoading && historyPartial && (
+                      <span>已优先载入最近消息，可按需继续加载更早历史。</span>
+                    )}
+                    {historyLoadingError && (
+                      <span className="history-load-error">
+                        历史刷新失败：{historyLoadingError}
+                      </span>
+                    )}
+                  </div>
+                  {(historyHasMoreBefore || historyPartial) && onLoadOlderHistory && (
+                    <button
+                      type="button"
+                      className="history-load-more-button"
+                      onClick={handleLoadOlderHistoryClick}
+                      disabled={isLoadingOlderHistory}
+                    >
+                      {isLoadingOlderHistory ? (
+                        <>
+                          <RefreshCw className="spin" size={13} />
+                          加载中…
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown size={14} />
+                          加载更早消息
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
+              )}
               {virtualHistoryTurns.length > 0 && (
                 <div
                   style={{

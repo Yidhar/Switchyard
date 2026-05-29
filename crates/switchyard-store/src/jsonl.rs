@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     ArtifactStore, EventLog, SessionCatalog, SessionEventRepository, SessionInboxRepository,
-    SessionRepository, StoreError, TurnRepository,
+    SessionRepository, StoreError, TurnPage, TurnRepository,
 };
 use switchyard_session::{Artifact, Event, InboxEntry, Session, Turn};
 
@@ -196,6 +196,63 @@ impl TurnRepository for JsonlStore {
         let path = self.session_dir(session_id).join("turns.jsonl");
         let raw: Vec<Turn> = read_jsonl(&path)?;
         Ok(collapse_turns(raw))
+    }
+
+    fn list_turns_page(
+        &self,
+        session_id: Uuid,
+        before_sequence: Option<i64>,
+        limit: usize,
+    ) -> Result<TurnPage, StoreError> {
+        let limit = limit.max(1);
+        let path = self.session_dir(session_id).join("turns.jsonl");
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(TurnPage {
+                    turns: Vec::new(),
+                    has_more_before: false,
+                    before_sequence: None,
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut canonical = HashMap::<Uuid, (i64, Turn)>::new();
+        for (line_index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let turn: Turn = serde_json::from_str(&line)?;
+            let first_sequence = line_index as i64 + 1;
+            canonical
+                .entry(turn.turn_id)
+                .and_modify(|(_, existing)| *existing = turn.clone())
+                .or_insert((first_sequence, turn));
+        }
+
+        let mut entries: Vec<(i64, Turn)> = canonical
+            .into_values()
+            .filter(|(first_sequence, _)| {
+                before_sequence.is_none_or(|cursor| *first_sequence < cursor)
+            })
+            .collect();
+        entries.sort_by_key(|(first_sequence, _)| *first_sequence);
+
+        let has_more_before = entries.len() > limit;
+        if has_more_before {
+            let keep_from = entries.len() - limit;
+            entries = entries.split_off(keep_from);
+        }
+
+        let before_sequence = entries.first().map(|(sequence, _)| *sequence);
+        let turns = entries.into_iter().map(|(_, turn)| turn).collect();
+        Ok(TurnPage {
+            turns,
+            has_more_before,
+            before_sequence,
+        })
     }
 
     fn delete_turn_tail(&mut self, turn_id: Uuid) -> Result<(), StoreError> {
@@ -865,6 +922,55 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].status, TurnStatus::Completed);
         assert_eq!(turns[0].provider_response.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn list_turns_page_returns_tail_and_older_pages_with_latest_turn_data() {
+        let (mut store, _dir) = temp_store();
+        let session = Session::new("codex".to_string());
+        store.save_session(&session).unwrap();
+
+        let mut turns = Vec::new();
+        for index in 0..5 {
+            let turn = Turn::new(
+                session.session_id,
+                "codex",
+                TurnRole::Core,
+                format!("message {index}"),
+            );
+            store.append_turn(&turn).unwrap();
+            turns.push(turn);
+        }
+
+        let mut updated_second = turns[1].clone();
+        updated_second.status = TurnStatus::Completed;
+        updated_second.provider_response = Some("updated".to_string());
+        store.append_turn(&updated_second).unwrap();
+
+        let tail = store.list_turns_page(session.session_id, None, 2).unwrap();
+        assert!(tail.has_more_before);
+        assert_eq!(
+            tail.turns
+                .iter()
+                .map(|turn| turn.user_message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message 3", "message 4"]
+        );
+        assert!(tail.before_sequence.is_some());
+
+        let older = store
+            .list_turns_page(session.session_id, tail.before_sequence, 3)
+            .unwrap();
+        assert!(!older.has_more_before);
+        assert_eq!(
+            older
+                .turns
+                .iter()
+                .map(|turn| turn.user_message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message 0", "message 1", "message 2"]
+        );
+        assert_eq!(older.turns[1].provider_response.as_deref(), Some("updated"));
     }
 
     #[test]
