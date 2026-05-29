@@ -115,6 +115,8 @@ const VIRTUAL_SCROLL_SEEK_IDLE_MS = 120;
 const VIRTUAL_SCROLL_SEEK_MIN_DELTA_PX = 420;
 const VIRTUAL_SCROLL_SEEK_VELOCITY_PX_PER_MS = 2.2;
 const VIRTUAL_ROW_MEASURE_EPSILON_PX = 2;
+const MAX_VIRTUAL_ROW_HEIGHT_SESSIONS = 8;
+const MAX_SESSION_DERIVED_CACHE_ENTRIES = 8;
 const USER_SCROLL_INTERACTION_IDLE_MS = 260;
 const SCROLL_BOTTOM_PIN_THRESHOLD_PX = 128;
 const EMPTY_EVENT_LIST: any[] = [];
@@ -122,6 +124,27 @@ const EMPTY_TURN_LIST: Turn[] = [];
 
 function scrollClockNow(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+function virtualSessionKey(sessionId: string | null): string {
+  return sessionId ?? 'new-session';
+}
+
+function virtualRowSessionKey(rowKey: string): string {
+  const separatorIndex = rowKey.indexOf(':');
+  return separatorIndex >= 0 ? rowKey.slice(0, separatorIndex) : rowKey;
+}
+
+function touchSessionCacheEntry<T>(cache: Map<string, T>, sessionKey: string, value: T): void {
+  if (cache.has(sessionKey)) {
+    cache.delete(sessionKey);
+  }
+  cache.set(sessionKey, value);
+  while (cache.size > MAX_SESSION_DERIVED_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
+  }
 }
 
 function sandboxOptionFor(mode: SandboxMode) {
@@ -714,6 +737,21 @@ interface CachedGroupedSessionEvents extends GroupedSessionEvents {
   sourceEvents: any[];
 }
 
+interface TurnIndexes {
+  lastUserTurnId: string | null;
+  delegateTurnsByParent: Map<string, Turn[]>;
+  relatedTurnsByTurnId: Map<string, Turn[]>;
+}
+
+interface CachedTurnIndexes extends TurnIndexes {
+  sourceTurns: Turn[];
+}
+
+interface CachedHyardJobIndex {
+  sourceJobs?: ChatAreaProps['hyardJobs'];
+  jobsByTurnId: ReturnType<typeof indexHyardJobsByTurnId>;
+}
+
 function shallowArrayEqual<T>(left: readonly T[] | undefined, right: readonly T[]): boolean {
   if (!left || left.length !== right.length) return false;
   for (let i = 0; i < right.length; i += 1) {
@@ -728,6 +766,42 @@ function setShallowEqual<T>(left: ReadonlySet<T>, right: ReadonlySet<T>): boolea
     if (!left.has(value)) return false;
   }
   return true;
+}
+
+function buildTurnIndexes(turns: Turn[]): TurnIndexes {
+  const delegateTurnsByParent = new Map<string, Turn[]>();
+  for (const turn of turns) {
+    const parentId = turn.delegated_by;
+    if (!parentId) continue;
+    const existing = delegateTurnsByParent.get(parentId);
+    if (existing) {
+      existing.push(turn);
+    } else {
+      delegateTurnsByParent.set(parentId, [turn]);
+    }
+  }
+
+  const relatedTurnsByTurnId = new Map<string, Turn[]>();
+  for (const turn of turns) {
+    if (!turn.turn_id) continue;
+    const delegates = delegateTurnsByParent.get(turn.turn_id);
+    relatedTurnsByTurnId.set(turn.turn_id, delegates?.length ? [turn, ...delegates] : [turn]);
+  }
+
+  let lastUserTurnId: string | null = null;
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const turn = turns[i];
+    if (turn.origin === 'user' && !turn.user_message.includes('<<<SWITCHYARD_JSON_BEGIN>>>')) {
+      lastUserTurnId = turn.turn_id || null;
+      break;
+    }
+  }
+
+  return {
+    lastUserTurnId,
+    delegateTurnsByParent,
+    relatedTurnsByTurnId,
+  };
 }
 
 function eventTurnId(event: any): string {
@@ -1525,8 +1599,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const suppressScrollSeekUntilRef = useRef(0);
   const userPinnedToBottomRef = useRef(true);
   const userScrollInteractionUntilRef = useRef(0);
-  const groupedSessionEventsCacheRef = useRef<CachedGroupedSessionEvents | null>(null);
+  const groupedSessionEventsCacheRef = useRef<Map<string, CachedGroupedSessionEvents>>(new Map());
+  const turnIndexesCacheRef = useRef<Map<string, CachedTurnIndexes>>(new Map());
+  const hyardJobIndexCacheRef = useRef<Map<string, CachedHyardJobIndex>>(new Map());
   const virtualRowHeightsRef = useRef<Map<string, number>>(new Map());
+  const virtualRowHeightSessionTouchedAtRef = useRef<Map<string, number>>(new Map());
   const virtualRowLayoutRef = useRef<Map<string, Pick<VirtualTurnMetric, 'start' | 'size'>>>(new Map());
   const settleScrollTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const settleAutoScrollUntilRef = useRef<number>(0);
@@ -1554,58 +1631,54 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const [editingDraft, setEditingDraft] = useState<string>('');
   const [previewAttachment, setPreviewAttachment] = useState<InputAttachment | null>(null);
   const currentSessionId = selectedSession?.session_id ?? null;
+  const sessionCacheKey = virtualSessionKey(currentSessionId);
 
-  // Id of the most recent "real" user-origin turn (excludes the structured
-  // system-feedback turns the orchestrator stamps with origin=user but a JSON
-  // sentinel payload). Used to gate the edit/retry affordance — only the
-  // tail user turn gets the buttons because deleting older ones would also
-  // discard everything that came after.
-  const lastUserTurnId = useMemo(() => {
-    for (let i = turns.length - 1; i >= 0; i--) {
-      const t = turns[i];
-      if (t.origin === 'user' && !t.user_message.includes('<<<SWITCHYARD_JSON_BEGIN>>>')) {
-        return t.turn_id || null;
-      }
+  const {
+    lastUserTurnId,
+    delegateTurnsByParent,
+    relatedTurnsByTurnId,
+  } = useMemo(() => {
+    const previous = turnIndexesCacheRef.current.get(sessionCacheKey);
+    if (previous?.sourceTurns === turns) {
+      touchSessionCacheEntry(turnIndexesCacheRef.current, sessionCacheKey, previous);
+      return previous;
     }
-    return null;
-  }, [turns]);
+
+    const next = {
+      sourceTurns: turns,
+      ...buildTurnIndexes(turns),
+    };
+    touchSessionCacheEntry(turnIndexesCacheRef.current, sessionCacheKey, next);
+    return next;
+  }, [sessionCacheKey, turns]);
 
   const { eventsByTurnId, eventActivityTurnIds } = useMemo(() => {
-    const grouped = deriveGroupedSessionEvents(sessionEvents, groupedSessionEventsCacheRef.current);
-    groupedSessionEventsCacheRef.current = {
+    const grouped = deriveGroupedSessionEvents(
+      sessionEvents,
+      groupedSessionEventsCacheRef.current.get(sessionCacheKey) ?? null,
+    );
+    const next = {
       sourceEvents: sessionEvents,
       eventsByTurnId: grouped.eventsByTurnId,
       eventActivityTurnIds: grouped.eventActivityTurnIds,
     };
-    return grouped;
-  }, [sessionEvents]);
+    touchSessionCacheEntry(groupedSessionEventsCacheRef.current, sessionCacheKey, next);
+    return next;
+  }, [sessionCacheKey, sessionEvents]);
 
-  const delegateTurnsByParent = useMemo(() => {
-    const grouped = new Map<string, Turn[]>();
-    for (const turn of turns) {
-      const parentId = turn.delegated_by;
-      if (!parentId) continue;
-      const existing = grouped.get(parentId);
-      if (existing) {
-        existing.push(turn);
-      } else {
-        grouped.set(parentId, [turn]);
-      }
+  const hyardJobsByTurnId = useMemo(() => {
+    const previous = hyardJobIndexCacheRef.current.get(sessionCacheKey);
+    if (previous && previous.sourceJobs === hyardJobs) {
+      touchSessionCacheEntry(hyardJobIndexCacheRef.current, sessionCacheKey, previous);
+      return previous.jobsByTurnId;
     }
-    return grouped;
-  }, [turns]);
-
-  const relatedTurnsByTurnId = useMemo(() => {
-    const grouped = new Map<string, Turn[]>();
-    for (const turn of turns) {
-      if (!turn.turn_id) continue;
-      const delegates = delegateTurnsByParent.get(turn.turn_id);
-      grouped.set(turn.turn_id, delegates?.length ? [turn, ...delegates] : [turn]);
-    }
-    return grouped;
-  }, [delegateTurnsByParent, turns]);
-
-  const hyardJobsByTurnId = useMemo(() => indexHyardJobsByTurnId(hyardJobs), [hyardJobs]);
+    const jobsByTurnId = indexHyardJobsByTurnId(hyardJobs);
+    touchSessionCacheEntry(hyardJobIndexCacheRef.current, sessionCacheKey, {
+      sourceJobs: hyardJobs,
+      jobsByTurnId,
+    });
+    return jobsByTurnId;
+  }, [hyardJobs, sessionCacheKey]);
 
   const scopedRenderOptions = useMemo<RenderTurnEventsOptions>(() => ({
     eventsAlreadyScoped: true,
@@ -1794,7 +1867,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   }, [scheduleVirtualViewportRead, updateScrollPinState]);
 
   const virtualHistoryTurns = useMemo<VirtualTurnEntry[]>(() => {
-    const sessionKey = currentSessionId ?? 'new-session';
     const entries: VirtualTurnEntry[] = [];
     turns.forEach((turn, originalIndex) => {
       if (turn.origin === 'delegate') return;
@@ -1809,13 +1881,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             : true;
       if (!shouldRender) return;
       entries.push({
-        key: `${sessionKey}:${turn.turn_id || `${turn.origin}-${originalIndex}`}`,
+        key: `${sessionCacheKey}:${turn.turn_id || `${turn.origin}-${originalIndex}`}`,
         turn,
         originalIndex,
       });
     });
     return entries;
-  }, [currentSessionId, historyRenderableActivityTurnIds, turns]);
+  }, [historyRenderableActivityTurnIds, sessionCacheKey, turns]);
 
   const virtualMetrics = useMemo(() => {
     const metrics: VirtualTurnMetric[] = [];
@@ -2097,7 +2169,28 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     };
   }, []);
   useEffect(() => {
-    virtualRowHeightsRef.current.clear();
+    const sessionKey = virtualSessionKey(currentSessionId);
+    virtualRowHeightSessionTouchedAtRef.current.set(sessionKey, Date.now());
+    if (virtualRowHeightSessionTouchedAtRef.current.size > MAX_VIRTUAL_ROW_HEIGHT_SESSIONS) {
+      const sessionsByAge = Array.from(virtualRowHeightSessionTouchedAtRef.current.entries())
+        .sort((a, b) => a[1] - b[1]);
+      const staleSessionKeys = new Set(
+        sessionsByAge
+          .slice(0, Math.max(0, sessionsByAge.length - MAX_VIRTUAL_ROW_HEIGHT_SESSIONS))
+          .map(([key]) => key),
+      );
+      staleSessionKeys.delete(sessionKey);
+      if (staleSessionKeys.size > 0) {
+        for (const staleSessionKey of staleSessionKeys) {
+          virtualRowHeightSessionTouchedAtRef.current.delete(staleSessionKey);
+        }
+        for (const key of virtualRowHeightsRef.current.keys()) {
+          if (staleSessionKeys.has(virtualRowSessionKey(key))) {
+            virtualRowHeightsRef.current.delete(key);
+          }
+        }
+      }
+    }
     virtualRowLayoutRef.current.clear();
     lastVirtualScrollSampleRef.current = null;
     suppressScrollSeekUntilRef.current = 0;
@@ -2122,9 +2215,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   }, [currentSessionId, readVirtualViewport]);
   useEffect(() => {
     const validKeys = new Set(virtualHistoryTurns.map((entry) => entry.key));
+    const sessionKey = virtualSessionKey(currentSessionId);
     let removedAny = false;
     for (const key of virtualRowHeightsRef.current.keys()) {
-      if (!validKeys.has(key)) {
+      if (virtualRowSessionKey(key) === sessionKey && !validKeys.has(key)) {
         virtualRowHeightsRef.current.delete(key);
         removedAny = true;
       }
@@ -2132,7 +2226,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     if (removedAny) {
       setVirtualMeasureVersion((version) => version + 1);
     }
-  }, [virtualHistoryTurns]);
+  }, [currentSessionId, virtualHistoryTurns]);
   useLayoutEffect(() => {
     const next = new Map<string, Pick<VirtualTurnMetric, 'start' | 'size'>>();
     for (const metric of virtualMetrics.metrics) {

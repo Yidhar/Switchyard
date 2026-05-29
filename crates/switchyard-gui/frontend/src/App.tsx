@@ -68,6 +68,7 @@ const DEFAULT_SANDBOX_MODE: SandboxMode = 'workspace-write';
 const TURN_ATTACHMENTS_STORAGE_KEY = 'switchyard.turnAttachments.v1';
 const TEMP_USER_TURN_ID_PREFIX = 'temp-user-';
 const NEW_SESSION_PIPELINE_ID = '__switchyard_new_session__';
+const CACHED_SESSION_TURN_REFRESH_IDLE_TIMEOUT_MS = 700;
 
 interface RuntimeSnapshot {
   max_event_id?: number;
@@ -749,6 +750,93 @@ function upsertHyardJobRecord(jobs: Record<string, any>, record: any | null): Re
       ...record,
     },
   };
+}
+
+function deferUntilNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+      resolve();
+      return;
+    }
+    window.requestAnimationFrame(() => window.setTimeout(resolve, 0));
+  });
+}
+
+function deferUntilBrowserIdle(
+  timeoutMs = CACHED_SESSION_TURN_REFRESH_IDLE_TIMEOUT_MS,
+): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined') {
+      resolve();
+      return;
+    }
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+    };
+    if (typeof idleWindow.requestIdleCallback === 'function') {
+      idleWindow.requestIdleCallback(() => resolve(), { timeout: timeoutMs });
+      return;
+    }
+    window.setTimeout(resolve, Math.min(120, timeoutMs));
+  });
+}
+
+function turnListsEquivalentForUi(left: Turn[], right: Turn[]): boolean {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (
+      a.turn_id !== b.turn_id ||
+      a.session_id !== b.session_id ||
+      a.origin !== b.origin ||
+      a.provider !== b.provider ||
+      a.role !== b.role ||
+      a.user_message !== b.user_message ||
+      a.provider_response !== b.provider_response ||
+      a.error_message !== b.error_message ||
+      a.status !== b.status ||
+      a.started_at !== b.started_at ||
+      a.completed_at !== b.completed_at ||
+      a.delegated_by !== b.delegated_by
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function shallowObjectEquivalent(
+  left: Record<string, unknown> | null | undefined,
+  right: Record<string, unknown> | null | undefined,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && left[key] === right[key]);
+}
+
+function mergeHyardJobRecords(
+  existing: Record<string, Record<string, unknown>>,
+  incoming: Record<string, Record<string, unknown>>,
+): Record<string, Record<string, unknown>> {
+  const incomingEntries = Object.entries(incoming);
+  if (incomingEntries.length === 0) return existing;
+
+  let changed = false;
+  const next: Record<string, Record<string, unknown>> = { ...existing };
+  for (const [jobId, record] of incomingEntries) {
+    const current = existing[jobId];
+    const merged = current ? { ...current, ...record } : record;
+    if (!shallowObjectEquivalent(current, merged)) {
+      next[jobId] = merged;
+      changed = true;
+    }
+  }
+  return changed ? next : existing;
 }
 
 function runtimeItemType(payload: any): string {
@@ -1753,6 +1841,7 @@ function App() {
   const [runtimePreparingPhase, setRuntimePreparingPhase] = useState<string | null>(null);
   const runtimeDispatchStartedAtRef = useRef<number | null>(null);
   const sessionUiSnapshotsRef = useRef<Record<string, SessionUiSnapshot>>({});
+  const sessionDataRefreshGenerationRef = useRef<Record<string, number>>({});
   const runtimeTurnSessionIdRef = useRef<Record<string, RuntimeTurnSessionCacheEntry>>({});
   const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [providerStatusLoading, setProviderStatusLoading] = useState(false);
@@ -2589,28 +2678,30 @@ function App() {
 
   const applySessionUiSnapshot = (snapshot?: SessionUiSnapshot) => {
     const next = snapshot ?? createEmptySessionUiSnapshot();
-    commitTurns(next.turns);
-    setSessionEvents(next.sessionEvents);
-    setSessionWorkers(next.sessionWorkers);
-    setActiveCoreText(next.activeCoreText);
-    setActivePeerText(next.activePeerText);
-    setActivePeerName(next.activePeerName);
-    setActiveNodes(next.activeNodes);
-    setActiveTurnIds(next.activeTurnIds);
-    setActiveCoreTurnId(next.activeCoreTurnId);
-    setActivePeerTurnId(next.activePeerTurnId);
-    setSelectedAgentTurnId(next.selectedAgentTurnId);
-    setHyardJobs(next.hyardJobs);
-    setRuntimeTurnPhases(next.runtimeTurnPhases);
-    setRuntimeTurnStartedAt(next.runtimeTurnStartedAt);
-    setRuntimeTurnPhaseChangedAt(next.runtimeTurnPhaseChangedAt);
-    runtimeDispatchStartedAtRef.current = next.runtimeDispatchStartedAt;
-    setRuntimeDispatchStartedAt(next.runtimeDispatchStartedAt);
-    setRuntimePreparingPhase(next.runtimePreparingPhase);
-    messageQueueRef.current = next.messageQueue;
-    setMessageQueue(next.messageQueue);
-    setIsGenerating(next.isGenerating);
-    replaceRealtimeTerminalSnapshot(next);
+    unstable_batchedUpdates(() => {
+      commitTurns(next.turns);
+      setSessionEvents(next.sessionEvents);
+      setSessionWorkers(next.sessionWorkers);
+      setActiveCoreText(next.activeCoreText);
+      setActivePeerText(next.activePeerText);
+      setActivePeerName(next.activePeerName);
+      setActiveNodes(next.activeNodes);
+      setActiveTurnIds(next.activeTurnIds);
+      setActiveCoreTurnId(next.activeCoreTurnId);
+      setActivePeerTurnId(next.activePeerTurnId);
+      setSelectedAgentTurnId(next.selectedAgentTurnId);
+      setHyardJobs(next.hyardJobs);
+      setRuntimeTurnPhases(next.runtimeTurnPhases);
+      setRuntimeTurnStartedAt(next.runtimeTurnStartedAt);
+      setRuntimeTurnPhaseChangedAt(next.runtimeTurnPhaseChangedAt);
+      runtimeDispatchStartedAtRef.current = next.runtimeDispatchStartedAt;
+      setRuntimeDispatchStartedAt(next.runtimeDispatchStartedAt);
+      setRuntimePreparingPhase(next.runtimePreparingPhase);
+      messageQueueRef.current = next.messageQueue;
+      setMessageQueue(next.messageQueue);
+      setIsGenerating(next.isGenerating);
+      replaceRealtimeTerminalSnapshot(next);
+    });
   };
 
   useEffect(() => {
@@ -2672,6 +2763,23 @@ function App() {
         [sessionId]: nextCursor,
       };
     }
+  };
+
+  const seedSessionEventCursorFromSnapshot = (
+    sessionId: string,
+    snapshot?: SessionUiSnapshot,
+  ) => {
+    if (!snapshot?.sessionEvents?.length || sessionEventsCursorRef.current[sessionId]) return;
+    const persistedEvents = snapshot.sessionEvents.filter((event) => {
+      const eventId = event?.event_id;
+      return typeof eventId !== 'string' || !eventId.startsWith('live:');
+    });
+    const nextCursor = maxSessionEventTimestamp(persistedEvents);
+    if (!nextCursor) return;
+    sessionEventsCursorRef.current = {
+      ...sessionEventsCursorRef.current,
+      [sessionId]: nextCursor,
+    };
   };
 
   const fetchSessionEventsForMerge = async (sessionId: string, mode: 'full' | 'incremental' = 'incremental') => {
@@ -3876,6 +3984,7 @@ function App() {
     sessionEventsCursorRef.current = {};
     runtimeSnapshotCursorRef.current = {};
     sessionUiSnapshotsRef.current = {};
+    sessionDataRefreshGenerationRef.current = {};
     runtimeTurnSessionIdRef.current = {};
     pendingAttachmentBindingsRef.current = [];
     activeAttachmentBindingIdRef.current = null;
@@ -3920,6 +4029,135 @@ function App() {
     applySessionUiSnapshot(sessionUiSnapshotsRef.current[session.session_id]);
   };
 
+  const beginSessionDataRefresh = (sessionId: string): number => {
+    const refreshGeneration = (sessionDataRefreshGenerationRef.current[sessionId] ?? 0) + 1;
+    sessionDataRefreshGenerationRef.current = {
+      ...sessionDataRefreshGenerationRef.current,
+      [sessionId]: refreshGeneration,
+    };
+    return refreshGeneration;
+  };
+
+  const isLatestSessionDataRefresh = (sessionId: string, refreshGeneration: number): boolean => (
+    sessionDataRefreshGenerationRef.current[sessionId] === refreshGeneration
+  );
+
+  const refreshSessionDataForSelection = async (
+    session: Session,
+    options: {
+      mode: 'full' | 'incremental';
+      refreshGeneration: number;
+      deferTurnRefresh: boolean;
+    },
+  ) => {
+    const sessionId = session.session_id;
+    const isLatestRefresh = () => isLatestSessionDataRefresh(sessionId, options.refreshGeneration);
+
+    try {
+      if (options.mode === 'full') {
+        const [turnList, runtimeSnapshot, eventList] = await Promise.all([
+          invoke<Turn[]>('get_session_turns', { sessionId }),
+          fetchRuntimeSnapshot(sessionId, 'full'),
+          fetchSessionEventsForMerge(sessionId, 'full'),
+        ]);
+        if (!isLatestRefresh()) return;
+
+        const runtimeHyardJobs = hyardJobsFromRuntimeSnapshot(runtimeSnapshot);
+        const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
+        reconcileTurnAttachmentBindings(sessionId, turnListWithFinalResponses);
+        const mergedEvents = mergeSessionEventLists([], eventList);
+        const snapshotBeforeMerge = sessionUiSnapshotsRef.current[sessionId] ?? createEmptySessionUiSnapshot();
+        const mergedTurns = mergeFreshTurnsPreservingKnownResponses(
+          snapshotBeforeMerge.turns,
+          turnListWithFinalResponses,
+        );
+
+        patchSessionUiSnapshot(sessionId, {
+          turns: turnListsEquivalentForUi(snapshotBeforeMerge.turns, mergedTurns)
+            ? snapshotBeforeMerge.turns
+            : mergedTurns,
+          hyardJobs: runtimeHyardJobs,
+          sessionEvents: mergedEvents,
+          loaded: true,
+        });
+
+        if (selectedSessionRef.current?.session_id !== sessionId) return;
+        unstable_batchedUpdates(() => {
+          commitTurns((prev) => {
+            const nextTurns = mergeFreshTurnsPreservingKnownResponses(prev, turnListWithFinalResponses);
+            return turnListsEquivalentForUi(prev, nextTurns) ? prev : nextTurns;
+          });
+          setHyardJobs(runtimeHyardJobs);
+          setSessionEvents(mergedEvents);
+        });
+        return;
+      }
+
+      // Cached sessions already have enough state to paint instantly. Refresh
+      // light, cursor-based data after the shell has painted, then postpone the
+      // expensive full turns read/deserialization until the browser is idle so
+      // toggling between two long transcripts does not block input.
+      await deferUntilNextPaint();
+      if (!isLatestRefresh()) return;
+
+      const [runtimeSnapshot, eventList] = await Promise.all([
+        fetchRuntimeSnapshot(sessionId, 'incremental'),
+        fetchSessionEventsForMerge(sessionId, 'incremental'),
+      ]);
+      if (!isLatestRefresh()) return;
+
+      const runtimeHyardJobs = hyardJobsFromRuntimeSnapshot(runtimeSnapshot);
+      const snapshotBeforeMerge = sessionUiSnapshotsRef.current[sessionId] ?? createEmptySessionUiSnapshot();
+      const mergedEvents = mergeSessionEventLists(snapshotBeforeMerge.sessionEvents, eventList);
+      const mergedHyardJobs = mergeHyardJobRecords(snapshotBeforeMerge.hyardJobs, runtimeHyardJobs);
+
+      patchSessionUiSnapshot(sessionId, {
+        sessionEvents: mergedEvents,
+        hyardJobs: mergedHyardJobs,
+        loaded: true,
+      });
+
+      if (selectedSessionRef.current?.session_id === sessionId) {
+        unstable_batchedUpdates(() => {
+          if (eventList.length > 0) {
+            setSessionEvents((prev) => mergeSessionEventLists(prev, eventList));
+          }
+          if (Object.keys(runtimeHyardJobs).length > 0) {
+            setHyardJobs((prev) => mergeHyardJobRecords(prev, runtimeHyardJobs));
+          }
+        });
+      }
+
+      if (options.deferTurnRefresh) {
+        await deferUntilBrowserIdle();
+      }
+      if (!isLatestRefresh()) return;
+
+      const turnList = await invoke<Turn[]>('get_session_turns', { sessionId });
+      if (!isLatestRefresh()) return;
+
+      const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
+      reconcileTurnAttachmentBindings(sessionId, turnListWithFinalResponses);
+      patchSessionUiSnapshot(sessionId, (previous) => {
+        const mergedTurns = mergeFreshTurnsPreservingKnownResponses(previous.turns, turnListWithFinalResponses);
+        return {
+          ...previous,
+          turns: turnListsEquivalentForUi(previous.turns, mergedTurns) ? previous.turns : mergedTurns,
+          loaded: true,
+          loadedAt: Date.now(),
+        };
+      });
+
+      if (selectedSessionRef.current?.session_id !== sessionId) return;
+      commitTurns((prev) => {
+        const mergedTurns = mergeFreshTurnsPreservingKnownResponses(prev, turnListWithFinalResponses);
+        return turnListsEquivalentForUi(prev, mergedTurns) ? prev : mergedTurns;
+      });
+    } catch (e) {
+      console.error('Failed to refresh selected session data:', e);
+    }
+  };
+
   const takeNextQueuedMessage = (sessionId = selectedSessionRef.current?.session_id): SendPayload | null => {
     const pending = getQueuedMessagesForSession(sessionId);
     if (pending.length === 0) return null;
@@ -3945,44 +4183,41 @@ function App() {
     }
   };
 
-  const selectSession = async (session: Session) => {
-    activateSessionShell(session);
-    sessionEventsCursorRef.current = {
-      ...sessionEventsCursorRef.current,
-      [session.session_id]: '',
-    };
-    runtimeSnapshotCursorRef.current = {
-      ...runtimeSnapshotCursorRef.current,
-      [session.session_id]: 0,
-    };
-    try {
-      const [turnList, runtimeSnapshot] = await Promise.all([
-        invoke<Turn[]>('get_session_turns', { sessionId: session.session_id }),
-        fetchRuntimeSnapshot(session.session_id, 'full'),
-      ]);
-      const runtimeHyardJobs = hyardJobsFromRuntimeSnapshot(runtimeSnapshot);
-      const turnListWithFinalResponses = applyRememberedFinalTurnResponses(turnList);
-      reconcileTurnAttachmentBindings(session.session_id, turnListWithFinalResponses);
-      patchSessionUiSnapshot(session.session_id, {
-        turns: turnListWithFinalResponses,
-        hyardJobs: runtimeHyardJobs,
-        loaded: true,
-      });
-      if (selectedSessionRef.current?.session_id === session.session_id) {
-        commitTurns(turnListWithFinalResponses);
-        setHyardJobs(runtimeHyardJobs);
-      }
-      const eventList = await fetchSessionEventsForMerge(session.session_id, 'full');
-      const mergedEvents = mergeSessionEventLists([], eventList);
-      patchSessionUiSnapshot(session.session_id, {
-        sessionEvents: mergedEvents,
-        loaded: true,
-      });
-      if (selectedSessionRef.current?.session_id !== session.session_id) return;
-      setSessionEvents(mergedEvents);
-    } catch (e) {
-      console.error(e);
+  const selectSession = (session: Session) => {
+    const sessionId = session.session_id;
+    if (selectedSessionRef.current?.session_id === sessionId) {
+      selectedSessionRef.current = session;
+      setSelectedSession(session);
+      return;
     }
+
+    const cachedSnapshot = sessionUiSnapshotsRef.current[sessionId];
+    const hasLoadedSnapshot = Boolean(cachedSnapshot?.loaded);
+
+    activateSessionShell(session);
+
+    if (hasLoadedSnapshot) {
+      seedSessionEventCursorFromSnapshot(sessionId, cachedSnapshot);
+    } else {
+      // Cold visits need an authoritative full hydration. Cached sessions keep
+      // their cursors so switching back does not accidentally turn the next
+      // refresh into another full event/runtime replay.
+      sessionEventsCursorRef.current = {
+        ...sessionEventsCursorRef.current,
+        [sessionId]: '',
+      };
+      runtimeSnapshotCursorRef.current = {
+        ...runtimeSnapshotCursorRef.current,
+        [sessionId]: 0,
+      };
+    }
+
+    const refreshGeneration = beginSessionDataRefresh(sessionId);
+    void refreshSessionDataForSelection(session, {
+      mode: hasLoadedSnapshot ? 'incremental' : 'full',
+      refreshGeneration,
+      deferTurnRefresh: hasLoadedSnapshot,
+    });
   };
 
   const createNewSession = async () => {
@@ -4570,6 +4805,10 @@ function App() {
           ...sessionEventsCursorRef.current,
           [created.session_id]: '',
         };
+        runtimeSnapshotCursorRef.current = {
+          ...runtimeSnapshotCursorRef.current,
+          [created.session_id]: 0,
+        };
         commitTurns([]);
         setSessionEvents([]);
         target = created;
@@ -4865,6 +5104,12 @@ function App() {
       const remainingCursors = { ...sessionEventsCursorRef.current };
       delete remainingCursors[sessionId];
       sessionEventsCursorRef.current = remainingCursors;
+      const remainingRuntimeCursors = { ...runtimeSnapshotCursorRef.current };
+      delete remainingRuntimeCursors[sessionId];
+      runtimeSnapshotCursorRef.current = remainingRuntimeCursors;
+      const remainingRefreshGenerations = { ...sessionDataRefreshGenerationRef.current };
+      delete remainingRefreshGenerations[sessionId];
+      sessionDataRefreshGenerationRef.current = remainingRefreshGenerations;
       const remainingSnapshots = { ...sessionUiSnapshotsRef.current };
       delete remainingSnapshots[sessionId];
       sessionUiSnapshotsRef.current = remainingSnapshots;
