@@ -102,7 +102,7 @@ struct RuntimeIpcServerState {
 
 struct RuntimeIpcServerHandle {
     endpoint: String,
-    task: tokio::task::JoinHandle<()>,
+    task: tauri::async_runtime::JoinHandle<()>,
     #[cfg(unix)]
     socket_path: PathBuf,
 }
@@ -158,7 +158,7 @@ impl RuntimeIpcServerState {
 
         let workspace_id = workspace.workspace_id;
         let endpoint_for_task = endpoint.clone();
-        let task = tokio::spawn(async move {
+        let task = tauri::async_runtime::spawn(async move {
             run_runtime_ipc_server(
                 app,
                 endpoint_for_task,
@@ -685,7 +685,7 @@ fn spawn_runtime_event_bridge(
 ) -> tokio::sync::mpsc::Sender<RuntimeEvent> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(RUNTIME_EVENT_BRIDGE_BUFFER);
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let mut batcher = RuntimeEventBatcher::default();
         let mut flush_interval =
             tokio::time::interval(Duration::from_millis(RUNTIME_EVENT_BATCH_FLUSH_MS));
@@ -756,7 +756,7 @@ async fn run_runtime_ipc_server(
             Ok(()) => {
                 let app = app.clone();
                 let runtime_db_path = runtime_db_path.clone();
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     handle_runtime_ipc_connection(server, app, runtime_db_path, bridge_debug).await;
                 });
             }
@@ -797,7 +797,7 @@ async fn run_runtime_ipc_server(
             Ok((stream, _addr)) => {
                 let app = app.clone();
                 let runtime_db_path = runtime_db_path.clone();
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     handle_runtime_ipc_connection(stream, app, runtime_db_path, bridge_debug).await;
                 });
             }
