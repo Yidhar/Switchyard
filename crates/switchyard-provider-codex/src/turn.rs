@@ -262,6 +262,67 @@ fn codex_policy_args(policy: &ExecutionPolicy) -> Vec<String> {
     args
 }
 
+pub(crate) fn codex_runtime_args(model: Option<&str>, thinking_level: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(model) = clean_option(model) {
+        // Use Codex's config override surface instead of `--model` so the
+        // same mapped args work for both `codex exec` and `codex app-server`.
+        // `app-server` intentionally does not expose a `--model` flag.
+        args.push("-c".to_string());
+        args.push(format!("model={}", toml_string_literal(model)));
+    }
+    if let Some(level) = normalize_reasoning_effort(thinking_level) {
+        // Codex exposes reasoning effort through its config layer. Keep this
+        // before user-provided extra args so an advanced user can override it
+        // explicitly in `providers.<name>.args` when needed.
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort={level}"));
+    }
+    args
+}
+
+fn toml_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                let codepoint = ch as u32;
+                if codepoint <= 0xFFFF {
+                    out.push_str(&format!("\\u{codepoint:04X}"));
+                } else {
+                    out.push_str(&format!("\\U{codepoint:08X}"));
+                }
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn clean_option(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn normalize_reasoning_effort(value: Option<&str>) -> Option<&'static str> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("minimal" | "min") => Some("minimal"),
+        Some("low" | "light") => Some("low"),
+        Some("medium" | "normal" | "standard") => Some("medium"),
+        Some("high" | "deep") => Some("high"),
+        Some("none" | "auto" | "default" | "") | None => None,
+        // Unknown labels are not forwarded; otherwise a typo in settings can
+        // make every future Codex spawn fail.
+        Some(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +347,23 @@ mod tests {
         assert_eq!(
             codex_policy_args(&danger),
             vec!["--sandbox", "danger-full-access"]
+        );
+    }
+
+    #[test]
+    fn codex_runtime_args_map_model_and_reasoning_effort() {
+        assert_eq!(
+            codex_runtime_args(Some("gpt-5-codex"), Some("high")),
+            vec![
+                "-c",
+                "model=\"gpt-5-codex\"",
+                "-c",
+                "model_reasoning_effort=high"
+            ]
+        );
+        assert_eq!(
+            codex_runtime_args(Some("  "), Some("unknown")),
+            Vec::<String>::new()
         );
     }
 

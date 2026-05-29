@@ -8,6 +8,8 @@ export interface ProviderConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  model?: string | null;
+  thinking_level?: string | null;
   timeout_secs: number;
   backend: string | null;
 }
@@ -58,6 +60,8 @@ export interface Session {
   created_at: string;
   updated_at: string;
   active_core: string;
+  model?: string | null;
+  thinking_level?: string | null;
   enabled_peers: string[];
   mode: string;
   summary: string | null;
@@ -111,6 +115,8 @@ export interface ProviderStatus {
   backend: string | null;
   command: string | null;
   args: string[];
+  model: string | null;
+  thinking_level: string | null;
   timeout_secs: number | null;
   configured: boolean;
   registered: boolean;

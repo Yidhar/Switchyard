@@ -57,6 +57,24 @@ fn gemini_policy_args(policy: &ExecutionPolicy) -> Vec<String> {
     args
 }
 
+pub(crate) fn gemini_runtime_args(
+    model: Option<&str>,
+    thinking_level: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+
+    // Gemini CLI exposes model selection. Thinking/reasoning flags have not
+    // been stable enough to synthesize safely, so advanced users can put
+    // release-specific flags in providers.<name>.args instead.
+    let _ = thinking_level;
+
+    args
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_gemini_turn(
     turn_id: Uuid,
@@ -231,6 +249,18 @@ mod tests {
                 "auto_edit",
                 "--foo"
             ]
+        );
+    }
+
+    #[test]
+    fn gemini_runtime_args_map_model_only() {
+        assert_eq!(
+            gemini_runtime_args(Some("gemini-2.5-pro"), Some("high")),
+            vec!["--model", "gemini-2.5-pro"]
+        );
+        assert_eq!(
+            gemini_runtime_args(Some(" "), Some("high")),
+            Vec::<String>::new()
         );
     }
 

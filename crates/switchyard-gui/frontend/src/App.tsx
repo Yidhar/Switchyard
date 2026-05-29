@@ -4797,14 +4797,13 @@ function App() {
 
     const defaultCommand =
       trimmedBackend === 'codex'
-        ? 'codex-cli'
+        ? 'codex'
         : trimmedBackend === 'claude'
-          ? 'claude-cli'
+          ? 'claude'
           : trimmedBackend === 'gemini'
-            ? 'gemini-cli'
+            ? 'gemini'
             : 'agy'; // antigravity ships as `agy`, not `antigravity-cli`
-    // Antigravity is one-shot and does not accept a `run` subcommand.
-    const defaultArgs = trimmedBackend === 'antigravity' ? [] : ['run'];
+    const defaultArgs: string[] = [];
 
     setConfig((prev) => {
       if (!prev) return null;
@@ -4813,6 +4812,8 @@ function App() {
         command: defaultCommand,
         args: defaultArgs,
         env: {},
+        model: null,
+        thinking_level: null,
         timeout_secs: 0,
         backend: trimmedBackend,
       };
@@ -4925,6 +4926,38 @@ function App() {
     } catch (e) {
       console.error('Failed to update session summary:', e);
       alert('Failed to update session summary: ' + e);
+    }
+  };
+
+  const handleUpdateSessionRuntime = async (
+    sessionId: string,
+    activeCore: string,
+    model: string | null,
+    thinkingLevel: string | null,
+  ) => {
+    try {
+      const updated = await invoke<Session>('update_session_runtime', {
+        sessionId,
+        activeCore,
+        model,
+        thinkingLevel,
+      });
+      setSessions((prev) =>
+        prev.map((s) => (s.session_id === sessionId ? updated : s)),
+      );
+      if (selectedSessionRef.current?.session_id === sessionId) {
+        selectedSessionRef.current = updated;
+        setSelectedSession(updated);
+        await loadSessionWorkers(sessionId);
+      }
+      addLog(
+        new Date().toLocaleTimeString(),
+        'sys',
+        `Session runtime updated: ${updated.active_core}${updated.model ? ` · ${updated.model}` : ''}`,
+      );
+    } catch (e) {
+      console.error('Failed to update session runtime:', e);
+      alert('Failed to update session runtime: ' + e);
     }
   };
 
@@ -5277,6 +5310,7 @@ function App() {
                 sessionWorkers={sessionWorkers}
                 onResetCore={handleResetCore}
                 selectedSession={selectedSession}
+                onUpdateSessionRuntime={handleUpdateSessionRuntime}
                 onUpdateSessionSummary={handleUpdateSessionSummary}
                 onUpdateSessionChecklist={handleUpdateSessionChecklist}
               />

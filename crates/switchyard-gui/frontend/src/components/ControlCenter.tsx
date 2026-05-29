@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Terminal, Users, Network, Search, ChevronLeft, RefreshCw, ClipboardList, FileText, Trash2, Edit, Power } from 'lucide-react';
 import type { Turn, TelemetryLog, ProviderStatus, Session, InstanceMetadata } from '../types';
 import { TopologyGraph } from './ui/TopologyGraph';
+import { THINKING_LEVEL_OPTIONS, providerCliMapping } from '../providerCliCapabilities';
 
 interface ChecklistItem {
   id: string;
@@ -35,6 +36,12 @@ interface ControlCenterProps {
   sessionWorkers: InstanceMetadata[];
   onResetCore: () => Promise<void>;
   selectedSession: Session | null;
+  onUpdateSessionRuntime: (
+    sessionId: string,
+    activeCore: string,
+    model: string | null,
+    thinkingLevel: string | null,
+  ) => Promise<void>;
   onUpdateSessionSummary: (sessionId: string, summary: string | null) => Promise<void>;
   onUpdateSessionChecklist: (sessionId: string, checklistJson: string) => Promise<void>;
 }
@@ -97,6 +104,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   sessionWorkers,
   onResetCore,
   selectedSession,
+  onUpdateSessionRuntime,
   onUpdateSessionSummary,
   onUpdateSessionChecklist,
 }) => {
@@ -107,11 +115,26 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   
   const [editingSummary, setEditingSummary] = useState(false);
   const [summaryText, setSummaryText] = useState('');
+  const [sessionCore, setSessionCore] = useState('');
+  const [sessionModel, setSessionModel] = useState('');
+  const [sessionThinkingLevel, setSessionThinkingLevel] = useState('');
+  const [runtimeSaving, setRuntimeSaving] = useState(false);
 
   // Sync summaryText when selectedSession changes
   useEffect(() => {
     setSummaryText(selectedSession?.summary || '');
   }, [selectedSession?.summary]);
+
+  useEffect(() => {
+    setSessionCore(selectedSession?.active_core || '');
+    setSessionModel(selectedSession?.model || '');
+    setSessionThinkingLevel(selectedSession?.thinking_level || '');
+  }, [
+    selectedSession?.session_id,
+    selectedSession?.active_core,
+    selectedSession?.model,
+    selectedSession?.thinking_level,
+  ]);
 
   const checklistItems: ChecklistItem[] = React.useMemo(() => {
     if (!selectedSession?.native_bindings?.checklist) return [];
@@ -228,6 +251,44 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
         return 'var(--color-error)';
       default:
         return 'var(--text-muted)';
+    }
+  };
+
+  const runtimeProviderNames = React.useMemo(() => {
+    const names = new Set<string>();
+    providerStatuses.forEach((status) => names.add(status.provider_id));
+    if (selectedSession?.active_core) names.add(selectedSession.active_core);
+    if (activeCore && activeCore !== 'None') names.add(activeCore);
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }, [activeCore, providerStatuses, selectedSession?.active_core]);
+
+  const selectedRuntimeProvider = providerStatuses.find(
+    (status) => status.provider_id === sessionCore,
+  );
+  const selectedRuntimeMapping = providerCliMapping(
+    sessionCore,
+    selectedRuntimeProvider?.backend,
+  );
+  const runtimeDirty =
+    !!selectedSession &&
+    (sessionCore !== (selectedSession.active_core || '') ||
+      sessionModel !== (selectedSession.model || '') ||
+      sessionThinkingLevel !== (selectedSession.thinking_level || ''));
+
+  const handleSaveSessionRuntime = async () => {
+    if (!selectedSession || !sessionCore || runtimeSaving) return;
+    setRuntimeSaving(true);
+    try {
+      await onUpdateSessionRuntime(
+        selectedSession.session_id,
+        sessionCore,
+        sessionModel.trim() || null,
+        sessionThinkingLevel || null,
+      );
+    } catch (e) {
+      alert(e);
+    } finally {
+      setRuntimeSaving(false);
     }
   };
   
@@ -1032,6 +1093,113 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
         {/* Summary Tab */}
         {activeTab === 'summary' && (
           <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', padding: '16px' }}>
+            <div
+              className="glass-panel"
+              style={{
+                padding: '12px',
+                marginBottom: '14px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '10px',
+                border: '1px solid var(--border-muted)',
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' }}>
+                    Session Runtime
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                    Per-session Core, model and thinking settings. Saving restarts this session's live Core so the next turn uses the new CLI flags.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSaveSessionRuntime}
+                  disabled={!selectedSession || !sessionCore || !runtimeDirty || runtimeSaving}
+                  className="btn-new-session"
+                  style={{
+                    padding: '5px 10px',
+                    height: 28,
+                    fontSize: 11,
+                    opacity: selectedSession && sessionCore && runtimeDirty && !runtimeSaving ? 1 : 0.5,
+                    cursor: selectedSession && sessionCore && runtimeDirty && !runtimeSaving ? 'pointer' : 'not-allowed',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {runtimeSaving ? 'Saving…' : 'Save Runtime'}
+                </button>
+              </div>
+
+              {selectedSession ? (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--text-secondary)', fontWeight: 700, textTransform: 'uppercase' }}>
+                      Core Provider
+                      <select
+                        className="settings-select"
+                        value={sessionCore}
+                        onChange={(e) => setSessionCore(e.target.value)}
+                      >
+                        {runtimeProviderNames.length === 0 && (
+                          <option value={sessionCore}>{sessionCore || 'No providers'}</option>
+                        )}
+                        {runtimeProviderNames.map((provider) => (
+                          <option key={provider} value={provider}>
+                            {provider}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--text-secondary)', fontWeight: 700, textTransform: 'uppercase' }}>
+                      Model Override
+                      <input
+                        type="text"
+                        className="settings-input settings-input-mono"
+                        value={sessionModel}
+                        placeholder={
+                          selectedRuntimeMapping.modelMapped
+                            ? 'Blank = provider default'
+                            : 'Blank = CLI default; this backend may not map model flags'
+                        }
+                        onChange={(e) => setSessionModel(e.target.value)}
+                      />
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--text-secondary)', fontWeight: 700, textTransform: 'uppercase' }}>
+                      Thinking / Reasoning
+                      <select
+                        className="settings-select"
+                        value={sessionThinkingLevel}
+                        onChange={(e) => setSessionThinkingLevel(e.target.value)}
+                      >
+                        {THINKING_LEVEL_OPTIONS.map((option) => (
+                          <option key={option.value || 'auto'} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="settings-provider-mapping-card" style={{ marginTop: 0 }}>
+                    <div className="settings-provider-mapping-title">
+                      CLI mapping: {selectedRuntimeMapping.backend || 'custom'}
+                    </div>
+                    <div>{selectedRuntimeMapping.summary}</div>
+                    <div className="settings-provider-mapping-grid">
+                      <span>Model</span>
+                      <code>{selectedRuntimeMapping.modelHint}</code>
+                      <span>Thinking</span>
+                      <code>{selectedRuntimeMapping.thinkingHint}</code>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                  Select or create a session to edit runtime settings.
+                </div>
+              )}
+            </div>
+
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
               <h3 style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)' }}>Session Summary</h3>
               {!editingSummary && selectedSession && (

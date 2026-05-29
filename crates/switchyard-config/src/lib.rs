@@ -114,6 +114,15 @@ pub struct ProviderConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Optional provider default model. Adapters map this onto the concrete
+    /// CLI only when the current backend exposes a stable model flag.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional reasoning/thinking effort. This is intentionally stored as a
+    /// string because provider CLIs use different vocabularies; adapters
+    /// normalize only the values they support.
+    #[serde(default)]
+    pub thinking_level: Option<String>,
     /// Provider turn hard timeout in seconds. `0` disables the hard timeout;
     /// callers should use cancellation/heartbeat supervision for long tasks.
     #[serde(default = "default_timeout")]
@@ -480,6 +489,8 @@ default_peers = ["codex", "gemini"]
 [providers.claude]
 command = "claude"
 args = ["-p", "--output-format", "stream-json"]
+model = "claude-sonnet-4-5"
+thinking_level = "medium"
 timeout_secs = 120
 
 [providers.codex]
@@ -505,6 +516,14 @@ show_artifacts = false
         assert_eq!(cfg.core.default_provider, "claude");
         assert_eq!(cfg.core.default_peers, vec!["codex", "gemini"]);
         assert_eq!(cfg.providers["claude"].command, "claude");
+        assert_eq!(
+            cfg.providers["claude"].model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            cfg.providers["claude"].thinking_level.as_deref(),
+            Some("medium")
+        );
         assert_eq!(cfg.providers["claude"].timeout_secs, 120);
         assert_eq!(cfg.providers["codex"].timeout_secs, 0); // default: no hard timeout
         assert_eq!(cfg.sandbox.mode, SandboxMode::ReadOnly);

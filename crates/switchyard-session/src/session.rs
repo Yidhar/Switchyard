@@ -17,6 +17,16 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub active_core: String,
+    /// Optional session-level model override for the active Core provider.
+    /// When set, GUI/backend merge it over the provider default before
+    /// spawning a provider CLI for this session.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional session-level thinking/reasoning effort override for the
+    /// active Core provider. Backend adapters only emit flags for supported
+    /// CLIs; unsupported providers keep their CLI default.
+    #[serde(default)]
+    pub thinking_level: Option<String>,
     pub enabled_peers: Vec<String>,
     pub mode: SessionMode,
     pub summary: Option<String>,
@@ -55,6 +65,8 @@ impl Session {
             created_at: now,
             updated_at: now,
             active_core,
+            model: None,
+            thinking_level: None,
             enabled_peers: Vec::new(),
             mode: SessionMode::Interactive,
             summary: None,

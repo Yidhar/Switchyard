@@ -2359,18 +2359,19 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
 
     // Register all configured providers dynamically!
     for (name, prov_cfg) in &config.providers {
+        let name_lower = name.to_ascii_lowercase();
         let backend = prov_cfg.backend.as_deref().unwrap_or_else(|| {
-            if name.contains("codex") {
+            if name_lower.contains("codex") {
                 "codex"
-            } else if name.contains("claude") {
+            } else if name_lower.contains("claude") {
                 "claude"
-            } else if name.contains("antigravity") || name.contains("agy") {
+            } else if name_lower.contains("antigravity") || name_lower.contains("agy") {
                 // Match "antigravity" / "agy" BEFORE the gemini check —
                 // Antigravity shares Gemini's config tree under `~/.gemini/`
                 // but the binary and protocol are different. Provider name
                 // disambiguates.
                 "antigravity"
-            } else if name.contains("gemini") {
+            } else if name_lower.contains("gemini") {
                 "gemini"
             } else {
                 ""
@@ -2449,7 +2450,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
         }
     }
 
-    // Always ensure the default three are registered even if not in config
+    // Always ensure the built-in provider aliases are registered even if not in config.
     if !registry.has("codex") {
         registry.register(
             "codex",
@@ -2522,12 +2523,84 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
     registry
 }
 
+fn inferred_provider_backend(name: &str) -> Option<&'static str> {
+    let name = name.to_ascii_lowercase();
+    if name.contains("codex") {
+        Some("codex")
+    } else if name.contains("claude") {
+        Some("claude")
+    } else if name.contains("antigravity") || name.contains("agy") {
+        // Match Antigravity before Gemini: `agy` stores data under the Gemini
+        // config tree, but it has a different CLI/protocol surface.
+        Some("antigravity")
+    } else if name.contains("gemini") {
+        Some("gemini")
+    } else {
+        None
+    }
+}
+
+fn default_provider_command(backend: &str) -> &str {
+    match backend {
+        "codex" => "codex",
+        "claude" => "claude",
+        "gemini" => "gemini",
+        "antigravity" => "agy",
+        other => other,
+    }
+}
+
+fn default_provider_config(provider_id: &str) -> switchyard_config::ProviderConfig {
+    let backend = inferred_provider_backend(provider_id).unwrap_or(provider_id);
+    switchyard_config::ProviderConfig {
+        command: default_provider_command(backend).to_string(),
+        args: Vec::new(),
+        env: std::collections::HashMap::new(),
+        model: None,
+        thinking_level: None,
+        timeout_secs: 0,
+        backend: Some(backend.to_string()),
+    }
+}
+
+fn normalize_optional_config_text(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
+fn apply_session_provider_overrides(
+    config: &mut SwitchyardConfig,
+    provider: &str,
+    session: &Session,
+) {
+    let model = normalize_optional_config_text(session.model.clone());
+    let thinking_level = normalize_optional_config_text(session.thinking_level.clone());
+    if model.is_none() && thinking_level.is_none() {
+        return;
+    }
+
+    let entry = config
+        .providers
+        .entry(provider.to_string())
+        .or_insert_with(|| default_provider_config(provider));
+    if let Some(model) = model {
+        entry.model = Some(model);
+    }
+    if let Some(thinking_level) = thinking_level {
+        entry.thinking_level = Some(thinking_level);
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct ProviderStatus {
     provider_id: String,
     backend: Option<String>,
     command: Option<String>,
     args: Vec<String>,
+    model: Option<String>,
+    thinking_level: Option<String>,
     timeout_secs: Option<u64>,
     configured: bool,
     registered: bool,
@@ -2593,6 +2666,8 @@ async fn list_provider_status(
         let args = provider_config
             .map(|cfg| cfg.args.clone())
             .unwrap_or_default();
+        let model = provider_config.and_then(|cfg| cfg.model.clone());
+        let thinking_level = provider_config.and_then(|cfg| cfg.thinking_level.clone());
         let timeout_secs = provider_config.map(|cfg| cfg.timeout_secs);
         let mut issues = Vec::new();
 
@@ -2601,6 +2676,8 @@ async fn list_provider_status(
             backend,
             command,
             args,
+            model,
+            thinking_level,
             timeout_secs,
             configured,
             registered,
@@ -2726,6 +2803,8 @@ async fn load_config(
                         command: command.to_string(),
                         args,
                         env: std::collections::HashMap::new(),
+                        model: None,
+                        thinking_level: None,
                         timeout_secs: 0,
                         backend: Some(name.to_string()),
                     },
@@ -3348,14 +3427,13 @@ async fn run_turn(
     image_paths: Option<Vec<String>>,
     file_paths: Option<Vec<String>>,
 ) -> Result<String, String> {
-    let (ws, mut store, data_dir, config) = open_current_store(&workspace_state)?;
+    let (ws, mut store, data_dir, base_config) = open_current_store(&workspace_state)?;
     let cwd = ws.primary_root.clone();
     let attachments = validate_turn_attachments(
         &cwd,
         image_paths.unwrap_or_default(),
         file_paths.unwrap_or_default(),
     )?;
-    let registry = build_registry(&config);
 
     let session_uuid =
         uuid::Uuid::parse_str(&session_id).map_err(|e| format!("invalid session ID: {}", e))?;
@@ -3394,6 +3472,9 @@ async fn run_turn(
     }
 
     let provider = provider.unwrap_or_else(|| session.active_core.clone());
+    let mut effective_config = base_config.clone();
+    apply_session_provider_overrides(&mut effective_config, &provider, &session);
+    let registry = build_registry(&effective_config);
     let bridge_debug = env_flag_enabled("SWITCHYARD_DEBUG_RUNTIME_BRIDGE");
     let tx = spawn_runtime_event_bridge(app.clone(), bridge_debug);
     tx.send(switchyard_core::RuntimeEvent::TurnPreparing {
@@ -3405,7 +3486,7 @@ async fn run_turn(
     .ok();
 
     let provider_impl = registry
-        .create(&provider, config.providers.get(&provider))
+        .create(&provider, effective_config.providers.get(&provider))
         .ok_or_else(|| format!("unsupported provider: {}", provider))?;
 
     // Pre-spawn/ensure core provider is persistent for this session. Try to
@@ -3415,7 +3496,7 @@ async fn run_turn(
     if let Some(persistent) = provider_impl.as_persistent()
         && !pool.has_live_instance(&provider, session.session_id)
     {
-        let mut env = config
+        let mut env = effective_config
             .providers
             .get(&provider)
             .map(|c| c.env.clone())
@@ -3501,7 +3582,8 @@ async fn run_turn(
     .await
     .ok();
 
-    let peer_catalog = build_peer_catalog_probed(&provider, &registry, &config.providers).await;
+    let peer_catalog =
+        build_peer_catalog_probed(&provider, &registry, &effective_config.providers).await;
     // Artifacts live next to the workspace's store so they move together
     // when the user copies the workspace dir or wipes it.
     let artifact_dir = data_dir.join("artifacts");
@@ -3526,13 +3608,14 @@ async fn run_turn(
     // another session's pending file edits.
     file_watcher.start_turn_for(session.session_id);
 
-    let policy = execution_policy_from_config_with_overrides(&config, &cwd, sandbox_mode, &[]);
+    let policy =
+        execution_policy_from_config_with_overrides(&effective_config, &cwd, sandbox_mode, &[]);
     let output = run_routed_turn_observable_with_policy_attachments_and_prompt_injection(
         &mut store,
         &mut session,
         &core_proxy,
         &peer_catalog,
-        &|name| registry.create(name, config.providers.get(name)),
+        &|name| registry.create(name, effective_config.providers.get(name)),
         Some(registry_dyn.clone()),
         message,
         attachments,
@@ -4300,6 +4383,83 @@ async fn rename_session(
 }
 
 #[tauri::command]
+async fn update_session_runtime(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, Arc<switchyard_core::InstancePool>>,
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    session_id: String,
+    active_core: String,
+    model: Option<String>,
+    thinking_level: Option<String>,
+) -> Result<Session, String> {
+    use switchyard_provider_api::{InstanceKind, LiveInstanceRegistry};
+
+    let active_core = active_core.trim().to_string();
+    if active_core.is_empty() {
+        return Err("active core provider cannot be empty".to_string());
+    }
+
+    let (_ws, mut store, _data_dir, _config) = open_current_store(&workspace_state)?;
+    let session_uuid =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("invalid session ID: {}", e))?;
+    let mut session = store
+        .load_session(session_uuid)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("session {} not found", session_id))?;
+
+    let model = normalize_optional_config_text(model);
+    let thinking_level = normalize_optional_config_text(thinking_level);
+    let runtime_changed = session.active_core != active_core
+        || session.model != model
+        || session.thinking_level != thinking_level;
+
+    session.active_core = active_core;
+    session.model = model;
+    session.thinking_level = thinking_level;
+    session.updated_at = chrono::Utc::now();
+
+    if runtime_changed {
+        let keys: Vec<String> = session
+            .native_bindings
+            .keys()
+            .filter(|k| k.ends_with("_resume_token"))
+            .cloned()
+            .collect();
+        for key in keys {
+            session.native_bindings.remove(&key);
+        }
+    }
+
+    store.save_session(&session).map_err(|e| e.to_string())?;
+
+    if runtime_changed {
+        let cores: Vec<switchyard_provider_api::InstanceMetadata> = pool
+            .list_session(session_uuid)
+            .into_iter()
+            .filter(|m| matches!(m.kind, InstanceKind::Core))
+            .collect();
+        for meta in cores {
+            let instance_id = meta.instance_id;
+            let provider = meta.provider.clone();
+            let label = meta.label.clone();
+            pool.terminate(instance_id);
+            let _ = app.emit(
+                "runtime_event",
+                switchyard_core::RuntimeEvent::WorkerTerminated {
+                    session_id: session_uuid,
+                    instance_id,
+                    provider,
+                    label,
+                    reason: "session_runtime_changed".to_string(),
+                },
+            );
+        }
+    }
+
+    Ok(session)
+}
+
+#[tauri::command]
 async fn update_session_summary(
     workspace_state: tauri::State<'_, WorkspaceState>,
     session_id: String,
@@ -4443,6 +4603,7 @@ fn main() {
             edit_and_resend_last_turn,
             delete_session,
             rename_session,
+            update_session_runtime,
             update_session_summary,
             update_session_checklist,
             // Window controls used by the custom VS Code-like title bar.

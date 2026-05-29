@@ -576,6 +576,107 @@ body {
   flex-shrink: 0;
 }
 
+.canvas-editor-shell {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+  contain: layout paint style;
+}
+
+.canvas-codemirror-host {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.canvas-codemirror-host > .cm-theme,
+.canvas-codemirror-host .cm-editor {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.canvas-minimap {
+  width: 76px;
+  flex: 0 0 76px;
+  position: relative;
+  overflow: hidden;
+  cursor: ns-resize;
+  border-left: 1px solid var(--border-muted);
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018), rgba(255, 255, 255, 0.035)),
+    rgba(0, 0, 0, 0.12);
+  user-select: none;
+}
+
+.canvas-minimap-lines {
+  position: absolute;
+  inset: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  justify-content: stretch;
+  gap: 0;
+  opacity: 0.84;
+  pointer-events: none;
+}
+
+.canvas-minimap-line {
+  display: block;
+  height: auto;
+  max-width: 100%;
+  min-height: 0;
+  border-radius: 2px;
+  background: rgba(148, 163, 184, 0.28);
+  flex: 1 1 0;
+}
+
+.canvas-minimap-line.is-strong {
+  background: rgba(96, 165, 250, 0.55);
+}
+
+.canvas-minimap-line.is-blank {
+  opacity: 0.28;
+  width: 6px !important;
+}
+
+.canvas-minimap-viewport {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border: 1px solid rgba(96, 165, 250, 0.62);
+  background: rgba(96, 165, 250, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.4);
+  pointer-events: none;
+}
+
+.canvas-editor-position {
+  position: absolute;
+  right: 86px;
+  bottom: 8px;
+  padding: 3px 7px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 4px;
+  background: rgba(10, 15, 24, 0.86);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.canvas-editor-shell:hover .canvas-editor-position,
+.canvas-editor-shell:focus-within .canvas-editor-position {
+  opacity: 1;
+  transform: translateY(0);
+}
+
 /* Layout/resize performance boundaries.
    Pane resizing changes real widths/heights, so it is inevitably layout-bound
    (unlike transform/opacity animations that can stay fully compositor/GPU
@@ -2558,6 +2659,53 @@ body {
 .settings-input-mono {
   font-family: var(--font-mono);
   font-size: 12px;
+}
+
+.settings-provider-mapping-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(96, 165, 250, 0.22);
+  border-radius: 6px;
+  background: rgba(59, 130, 246, 0.07);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-provider-mapping-title {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-primary);
+}
+
+.settings-provider-mapping-grid {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 6px 8px;
+  align-items: center;
+}
+
+.settings-provider-mapping-grid span {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+.settings-provider-mapping-grid code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: 3px 6px;
+  border: 1px solid var(--border-muted);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
 
 .settings-modal-footer {

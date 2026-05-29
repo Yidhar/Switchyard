@@ -1,6 +1,7 @@
 import React from 'react';
 import { X, Plus, Trash } from 'lucide-react';
 import type { SwitchyardConfig, ProviderConfig } from '../types';
+import { THINKING_LEVEL_OPTIONS, providerCliMapping } from '../providerCliCapabilities';
 
 interface SettingsModalProps {
   config: SwitchyardConfig;
@@ -126,7 +127,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {Object.keys(config.providers || {}).includes(settingsTab) && (() => {
               const pName = settingsTab;
-              const prov = config.providers[pName] || { command: '', args: [], env: {}, timeout_secs: 0, backend: null };
+              const prov = config.providers[pName] || {
+                command: '',
+                args: [],
+                env: {},
+                model: null,
+                thinking_level: null,
+                timeout_secs: 0,
+                backend: null,
+              };
+              const cliMapping = providerCliMapping(pName, prov.backend);
               return (
                 <>
                   <div className="settings-form-group">
@@ -136,9 +146,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       value={prov.backend || ''}
                       onChange={(e) => onProviderFieldChange(pName, 'backend', e.target.value || null)}
                     >
+                      <option value="">Auto / Infer from name</option>
                       <option value="codex">Codex Factory</option>
                       <option value="claude">Claude Factory</option>
                       <option value="gemini">Gemini Factory</option>
+                      <option value="antigravity">Antigravity Factory</option>
                     </select>
                   </div>
 
@@ -163,6 +175,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         onProviderFieldChange(pName, 'args', args);
                       }}
                     />
+                  </div>
+
+                  <div className="settings-provider-mapping-card">
+                    <div className="settings-provider-mapping-title">
+                      Runtime mapping for {cliMapping.backend || 'custom'}
+                    </div>
+                    <div>{cliMapping.summary}</div>
+                    <div className="settings-provider-mapping-grid">
+                      <span>Model</span>
+                      <code>{cliMapping.modelHint}</code>
+                      <span>Thinking</span>
+                      <code>{cliMapping.thinkingHint}</code>
+                    </div>
+                    <div style={{ color: 'var(--text-muted)' }}>
+                      Extra args are appended after Switchyard's mapped defaults so advanced
+                      users can still add or override CLI-version-specific flags.
+                    </div>
+                  </div>
+
+                  <div className="settings-form-group">
+                    <label>Default Model</label>
+                    <input
+                      type="text"
+                      className="settings-input settings-input-mono"
+                      value={prov.model ?? ''}
+                      placeholder={
+                        cliMapping.modelMapped
+                          ? 'e.g. gpt-5-codex, claude-sonnet-4-5, gemini-2.5-pro'
+                          : 'Stored only; this backend does not map it to a stable CLI flag'
+                      }
+                      onChange={(e) => onProviderFieldChange(pName, 'model', e.target.value || null)}
+                    />
+                  </div>
+
+                  <div className="settings-form-group">
+                    <label>Default Thinking / Reasoning Level</label>
+                    <select
+                      className="settings-select"
+                      value={prov.thinking_level ?? ''}
+                      onChange={(e) => onProviderFieldChange(pName, 'thinking_level', e.target.value || null)}
+                    >
+                      {THINKING_LEVEL_OPTIONS.map((option) => (
+                        <option key={option.value || 'auto'} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
 
                   <div className="settings-form-group">

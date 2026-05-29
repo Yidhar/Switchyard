@@ -229,6 +229,69 @@ fn claude_policy_args(policy: &ExecutionPolicy) -> Vec<String> {
     args
 }
 
+pub(crate) fn claude_runtime_args(
+    model: Option<&str>,
+    thinking_level: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(model) = clean_option(model) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(effort) = normalize_claude_effort(thinking_level) {
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
+    }
+
+    args
+}
+
+fn clean_option(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn normalize_claude_effort(value: Option<&str>) -> Option<&'static str> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("minimal" | "min" | "low" | "light") => Some("low"),
+        Some("medium" | "normal" | "standard") => Some("medium"),
+        Some("high" | "deep") => Some("high"),
+        Some("xhigh" | "x-high" | "extra-high" | "extra_high" | "very-high" | "very_high") => {
+            Some("xhigh")
+        }
+        Some("max" | "maximum") => Some("max"),
+        Some("none" | "auto" | "default" | "") | None => None,
+        // Unknown labels are not forwarded; a typo should not break every
+        // future Claude spawn. Users can still force exact release-specific
+        // flags through providers.<name>.args.
+        Some(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    #[test]
+    fn claude_runtime_args_map_model_and_effort() {
+        assert_eq!(
+            claude_runtime_args(Some("claude-sonnet-4-5"), Some("high")),
+            vec!["--model", "claude-sonnet-4-5", "--effort", "high"]
+        );
+        assert_eq!(
+            claude_runtime_args(Some(" "), Some("high")),
+            vec!["--effort", "high"]
+        );
+        assert_eq!(
+            claude_runtime_args(Some("sonnet"), Some("x-high")),
+            vec!["--model", "sonnet", "--effort", "xhigh"]
+        );
+        assert_eq!(
+            claude_runtime_args(None, Some("unknown")),
+            Vec::<String>::new()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

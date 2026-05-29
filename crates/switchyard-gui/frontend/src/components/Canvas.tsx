@@ -21,7 +21,7 @@ import {
 import CodeMirror from '@uiw/react-codemirror';
 import { oneDark } from '@codemirror/theme-one-dark';
 import type { Extension } from '@codemirror/state';
-import { EditorView } from '@codemirror/view';
+import { EditorView, type ViewUpdate } from '@codemirror/view';
 import { loadLanguageExtensionsFor } from './codeMirrorLanguages';
 
 /// Snapshot returned by the `read_file` Tauri command. Mirrors the
@@ -519,33 +519,279 @@ const CanvasBody: React.FC<{
   // file its own undo history instead of bleeding state across tabs.
   const value = tab.draft ?? tab.snapshot.content;
   return (
-    <CodeMirror
+    <CanvasEditor
       key={tab.id}
+      tabId={tab.id}
       value={value}
-      onChange={(next) => onDraftChange(tab.id, next)}
-      theme={oneDark}
-      extensions={[
-        ...languageExtensions,
-        EditorView.lineWrapping,
-      ]}
-      basicSetup={{
-        lineNumbers: true,
-        highlightActiveLine: true,
-        highlightActiveLineGutter: true,
-        bracketMatching: true,
-        closeBrackets: true,
-        autocompletion: true,
-        foldGutter: true,
-        indentOnInput: true,
-      }}
-      style={{
-        flex: 1,
-        minHeight: 0,
-        height: '100%',
-        fontSize: 13,
-      }}
-      height="100%"
+      languageExtensions={languageExtensions}
+      onDraftChange={onDraftChange}
     />
+  );
+};
+
+const MAX_MINIMAP_LINES = 1600;
+
+const vscodeEditorTheme = EditorView.theme({
+  '&': {
+    height: '100%',
+  },
+  '.cm-scroller': {
+    overflow: 'auto',
+    scrollbarColor: 'rgba(148, 163, 184, 0.58) transparent',
+    scrollbarWidth: 'thin',
+  },
+  '.cm-scroller::-webkit-scrollbar': {
+    width: '12px',
+    height: '12px',
+  },
+  '.cm-scroller::-webkit-scrollbar-track': {
+    background: 'rgba(255, 255, 255, 0.015)',
+  },
+  '.cm-scroller::-webkit-scrollbar-thumb': {
+    background: 'rgba(148, 163, 184, 0.38)',
+    borderRadius: '999px',
+    border: '3px solid rgba(0, 0, 0, 0.35)',
+  },
+  '.cm-scroller::-webkit-scrollbar-thumb:hover': {
+    background: 'rgba(148, 163, 184, 0.64)',
+  },
+  '.cm-content': {
+    fontFamily: 'var(--font-mono)',
+    minWidth: 'max-content',
+  },
+  '.cm-line': {
+    whiteSpace: 'pre',
+  },
+  '.cm-gutters': {
+    userSelect: 'none',
+  },
+});
+
+interface CanvasEditorProps {
+  tabId: string;
+  value: string;
+  languageExtensions: Extension[];
+  onDraftChange: (tabId: string, draft: string) => void;
+}
+
+const CanvasEditor: React.FC<CanvasEditorProps> = ({
+  tabId,
+  value,
+  languageExtensions,
+  onDraftChange,
+}) => {
+  const viewRef = useRef<EditorView | null>(null);
+  const scrollElementRef = useRef<HTMLElement | null>(null);
+  const scrollHandlerRef = useRef<(() => void) | null>(null);
+  const scrollRafRef = useRef<number | null>(null);
+  const minimapRef = useRef<HTMLDivElement>(null);
+  const [navState, setNavState] = useState(() => ({
+    scrollTop: 0,
+    scrollHeight: 1,
+    clientHeight: 1,
+    cursorLine: 1,
+    cursorColumn: 1,
+    lineCount: countLines(value),
+  }));
+
+  const readEditorState = useCallback((view: EditorView | null = viewRef.current) => {
+    if (!view) return;
+    const { scrollDOM } = view;
+    const head = view.state.selection.main.head;
+    const line = view.state.doc.lineAt(head);
+    const next = {
+      scrollTop: scrollDOM.scrollTop,
+      scrollHeight: Math.max(scrollDOM.scrollHeight, 1),
+      clientHeight: Math.max(scrollDOM.clientHeight, 1),
+      cursorLine: line.number,
+      cursorColumn: Math.max(1, head - line.from + 1),
+      lineCount: view.state.doc.lines,
+    };
+    setNavState((previous) => {
+      if (
+        Math.abs(previous.scrollTop - next.scrollTop) < 0.5 &&
+        previous.scrollHeight === next.scrollHeight &&
+        previous.clientHeight === next.clientHeight &&
+        previous.cursorLine === next.cursorLine &&
+        previous.cursorColumn === next.cursorColumn &&
+        previous.lineCount === next.lineCount
+      ) {
+        return previous;
+      }
+      return next;
+    });
+  }, []);
+
+  const scheduleEditorStateRead = useCallback((view: EditorView | null = viewRef.current) => {
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      readEditorState(view);
+    });
+  }, [readEditorState]);
+
+  const attachEditor = useCallback(
+    (view: EditorView) => {
+      if (scrollElementRef.current && scrollHandlerRef.current) {
+        scrollElementRef.current.removeEventListener('scroll', scrollHandlerRef.current);
+      }
+      viewRef.current = view;
+      const handleScroll = () => scheduleEditorStateRead(view);
+      scrollElementRef.current = view.scrollDOM;
+      scrollHandlerRef.current = handleScroll;
+      view.scrollDOM.addEventListener('scroll', handleScroll, { passive: true });
+      scheduleEditorStateRead(view);
+    },
+    [scheduleEditorStateRead],
+  );
+
+  useEffect(() => {
+    scheduleEditorStateRead();
+  }, [scheduleEditorStateRead, value]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollElementRef.current && scrollHandlerRef.current) {
+        scrollElementRef.current.removeEventListener('scroll', scrollHandlerRef.current);
+      }
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current);
+        scrollRafRef.current = null;
+      }
+    };
+  }, []);
+
+  const editorExtensions = useMemo(
+    () => [
+      ...languageExtensions,
+      vscodeEditorTheme,
+      EditorView.updateListener.of((update: ViewUpdate) => {
+        if (
+          update.docChanged ||
+          update.selectionSet ||
+          update.viewportChanged ||
+          update.geometryChanged
+        ) {
+          scheduleEditorStateRead(update.view);
+        }
+      }),
+    ],
+    [languageExtensions, scheduleEditorStateRead],
+  );
+
+  const minimapLines = useMemo(() => {
+    const lines = value.split(/\r\n|\r|\n/);
+    const sampleEvery = Math.max(1, Math.ceil(lines.length / MAX_MINIMAP_LINES));
+    return lines
+      .filter((_, index) => index % sampleEvery === 0)
+      .map((line, index) => {
+        const trimmed = line.trimEnd();
+        const width = Math.max(8, Math.min(66, trimmed.length * 2.4));
+        return {
+          key: `${index}-${trimmed.length}`,
+          width,
+          accent:
+            /^\s*(function|fn|class|interface|type|struct|enum|impl|export|pub|def|async)\b/.test(trimmed)
+              ? 'strong'
+              : trimmed.length === 0
+                ? 'blank'
+                : 'normal',
+        };
+      });
+  }, [value]);
+
+  const viewportHeight = Math.max(
+    8,
+    Math.min(100, (navState.clientHeight / Math.max(1, navState.scrollHeight)) * 100),
+  );
+  const viewportTop = Math.max(
+    0,
+    Math.min(
+      100 - viewportHeight,
+      (navState.scrollTop / Math.max(1, navState.scrollHeight - navState.clientHeight)) *
+        (100 - viewportHeight),
+    ),
+  );
+
+  const scrollToMinimapPointer = useCallback(
+    (clientY: number) => {
+      const minimap = minimapRef.current;
+      const view = viewRef.current;
+      if (!minimap || !view) return;
+      const rect = minimap.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientY - rect.top) / Math.max(1, rect.height)));
+      const maxScroll = Math.max(0, navState.scrollHeight - navState.clientHeight);
+      view.scrollDOM.scrollTop = ratio * maxScroll;
+      readEditorState(view);
+    },
+    [navState.clientHeight, navState.scrollHeight, readEditorState],
+  );
+
+  return (
+    <div className="canvas-editor-shell">
+      <div className="canvas-codemirror-host">
+        <CodeMirror
+          value={value}
+          onChange={(next) => onDraftChange(tabId, next)}
+          onCreateEditor={attachEditor}
+          theme={oneDark}
+          extensions={editorExtensions}
+          basicSetup={{
+            lineNumbers: true,
+            highlightActiveLine: true,
+            highlightActiveLineGutter: true,
+            bracketMatching: true,
+            closeBrackets: true,
+            autocompletion: true,
+            foldGutter: true,
+            indentOnInput: true,
+          }}
+          style={{
+            flex: 1,
+            minHeight: 0,
+            height: '100%',
+            fontSize: 13,
+          }}
+          height="100%"
+        />
+      </div>
+      <div
+        ref={minimapRef}
+        className="canvas-minimap"
+        title="Overview ruler — click or drag to jump through the file"
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          scrollToMinimapPointer(event.clientY);
+        }}
+        onPointerMove={(event) => {
+          if (event.buttons === 1) {
+            scrollToMinimapPointer(event.clientY);
+          }
+        }}
+      >
+        <div className="canvas-minimap-lines">
+          {minimapLines.map((line) => (
+            <span
+              key={line.key}
+              className={`canvas-minimap-line is-${line.accent}`}
+              style={{ width: line.width }}
+            />
+          ))}
+        </div>
+        <div
+          className="canvas-minimap-viewport"
+          style={{
+            top: `${viewportTop}%`,
+            height: `${viewportHeight}%`,
+          }}
+        />
+      </div>
+      <div className="canvas-editor-position">
+        Ln {navState.cursorLine.toLocaleString()}, Col {navState.cursorColumn.toLocaleString()} ·{' '}
+        {navState.lineCount.toLocaleString()} lines
+      </div>
+    </div>
   );
 };
 

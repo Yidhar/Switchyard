@@ -49,6 +49,12 @@ pub struct AntigravityProvider {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    /// Stored for UI/config symmetry. Antigravity's CLI currently has no
+    /// stable `--model`, so this adapter deliberately does not emit it.
+    pub model: Option<String>,
+    /// Stored for UI/config symmetry. No stable thinking/reasoning flag exists
+    /// for `agy` today; advanced users can still provide raw args manually.
+    pub thinking_level: Option<String>,
     pub timeout_secs: u64,
     /// Per-turn results stash used by `finalize_turn` to hand back the
     /// composed `TurnResult` after `start_turn` completes.
@@ -62,6 +68,17 @@ impl AntigravityProvider {
         env: HashMap<String, String>,
         timeout_secs: u64,
     ) -> Self {
+        Self::new_with_options(command, args, env, timeout_secs, None, None)
+    }
+
+    pub fn new_with_options(
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        timeout_secs: u64,
+        model: Option<String>,
+        thinking_level: Option<String>,
+    ) -> Self {
         let original_command = command.into();
         let command = resolve_command(&original_command);
         Self {
@@ -69,17 +86,21 @@ impl AntigravityProvider {
             command,
             args,
             env,
+            model,
+            thinking_level,
             timeout_secs,
             results: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn from_config(cfg: &switchyard_config::ProviderConfig) -> Self {
-        Self::new(
+        Self::new_with_options(
             cfg.command.clone(),
             cfg.args.clone(),
             cfg.env.clone(),
             cfg.timeout_secs,
+            cfg.model.clone(),
+            cfg.thinking_level.clone(),
         )
     }
 }

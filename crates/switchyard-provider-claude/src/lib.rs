@@ -28,6 +28,8 @@ pub struct ClaudeProvider {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    pub model: Option<String>,
+    pub thinking_level: Option<String>,
     pub timeout_secs: u64,
     results: Arc<Mutex<HashMap<Uuid, (TurnResult, ArtifactBundle)>>>,
 }
@@ -39,6 +41,17 @@ impl ClaudeProvider {
         env: HashMap<String, String>,
         timeout_secs: u64,
     ) -> Self {
+        Self::new_with_options(command, args, env, timeout_secs, None, None)
+    }
+
+    pub fn new_with_options(
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        timeout_secs: u64,
+        model: Option<String>,
+        thinking_level: Option<String>,
+    ) -> Self {
         let original_command = command.into();
         let command = resolve_command(&original_command);
         Self {
@@ -46,18 +59,29 @@ impl ClaudeProvider {
             command,
             args,
             env,
+            model,
+            thinking_level,
             timeout_secs,
             results: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn from_config(cfg: &switchyard_config::ProviderConfig) -> Self {
-        Self::new(
+        Self::new_with_options(
             cfg.command.clone(),
             cfg.args.clone(),
             cfg.env.clone(),
             cfg.timeout_secs,
+            cfg.model.clone(),
+            cfg.thinking_level.clone(),
         )
+    }
+
+    fn effective_args(&self) -> Vec<String> {
+        let mut args =
+            turn::claude_runtime_args(self.model.as_deref(), self.thinking_level.as_deref());
+        args.extend(self.args.clone());
+        args
     }
 }
 
@@ -77,11 +101,12 @@ impl Provider for ClaudeProvider {
         cancel: CancellationToken,
     ) -> Result<(), ProviderError> {
         let timeout_secs = effective_timeout_secs(self.timeout_secs, policy.timeout_secs);
+        let effective_args = self.effective_args();
         let result = turn::run_claude_turn(
             turn_id,
             &self.original_command,
             &self.command,
-            &self.args,
+            &effective_args,
             &input,
             timeout_secs,
             Some(&self.env),
@@ -119,8 +144,9 @@ impl PersistentProvider for ClaudeProvider {
         cwd: std::path::PathBuf,
         envs: HashMap<String, String>,
     ) -> Result<Box<dyn LiveInstance>, ProviderError> {
+        let effective_args = self.effective_args();
         let instance =
-            ClaudeLiveInstance::spawn(&self.command, &self.args, envs, Some(&cwd)).await?;
+            ClaudeLiveInstance::spawn(&self.command, &effective_args, envs, Some(&cwd)).await?;
         Ok(Box::new(instance))
     }
 
@@ -135,9 +161,10 @@ impl PersistentProvider for ClaudeProvider {
         // missing (project moved, transcript deleted), claude still spawns
         // with the same id but no prior context. Either way the call never
         // fails because of a stale token, matching the Codex G semantics.
+        let effective_args = self.effective_args();
         let instance = ClaudeLiveInstance::spawn_with_resume(
             &self.command,
-            &self.args,
+            &effective_args,
             envs,
             Some(&cwd),
             resume_token.as_deref(),
