@@ -602,37 +602,60 @@ body {
 }
 
 .canvas-minimap {
-  width: 76px;
-  flex: 0 0 76px;
-  position: relative;
+  width: 56px;
+  position: absolute;
+  top: 0;
+  right: 12px;
+  bottom: 0;
+  z-index: 4;
   overflow: hidden;
-  cursor: ns-resize;
-  border-left: 1px solid var(--border-muted);
+  cursor: default;
+  border-left: 1px solid rgba(96, 165, 250, 0.18);
   background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.018), rgba(255, 255, 255, 0.035)),
-    rgba(0, 0, 0, 0.12);
+    linear-gradient(90deg, rgba(15, 23, 42, 0.08), rgba(15, 23, 42, 0.48)),
+    rgba(2, 6, 23, 0.22);
   user-select: none;
+  opacity: 0.74;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.canvas-minimap.is-scrollable {
+  cursor: ns-resize;
+}
+
+.canvas-minimap.is-short-file {
+  pointer-events: none;
+  border-left-color: transparent;
+  background: transparent;
+  opacity: 0.5;
+}
+
+.canvas-minimap:hover {
+  opacity: 1;
+  background:
+    linear-gradient(90deg, rgba(15, 23, 42, 0.12), rgba(15, 23, 42, 0.62)),
+    rgba(2, 6, 23, 0.28);
 }
 
 .canvas-minimap-lines {
   position: absolute;
-  inset: 6px 8px;
+  top: 6px;
+  left: 6px;
+  right: 6px;
   display: flex;
   flex-direction: column;
-  justify-content: stretch;
-  gap: 0;
+  justify-content: flex-start;
   opacity: 0.84;
   pointer-events: none;
 }
 
 .canvas-minimap-line {
   display: block;
-  height: auto;
+  height: var(--canvas-minimap-line-height, 2px);
   max-width: 100%;
-  min-height: 0;
   border-radius: 2px;
   background: rgba(148, 163, 184, 0.28);
-  flex: 1 1 0;
+  flex: 0 0 var(--canvas-minimap-line-height, 2px);
 }
 
 .canvas-minimap-line.is-strong {
@@ -656,7 +679,7 @@ body {
 
 .canvas-editor-position {
   position: absolute;
-  right: 86px;
+  right: 82px;
   bottom: 8px;
   padding: 3px 7px;
   border: 1px solid rgba(148, 163, 184, 0.18);

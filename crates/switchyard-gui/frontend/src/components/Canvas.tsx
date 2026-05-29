@@ -530,6 +530,10 @@ const CanvasBody: React.FC<{
 };
 
 const MAX_MINIMAP_LINES = 1600;
+const MINIMAP_VERTICAL_PADDING = 6;
+const MINIMAP_SHORT_FILE_LINE_HEIGHT = 2;
+const MINIMAP_SHORT_FILE_LINE_GAP = 1;
+const MINIMAP_MIN_VIEWPORT_HEIGHT = 10;
 
 const vscodeEditorTheme = EditorView.theme({
   '&': {
@@ -686,7 +690,7 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
       .filter((_, index) => index % sampleEvery === 0)
       .map((line, index) => {
         const trimmed = line.trimEnd();
-        const width = Math.max(8, Math.min(66, trimmed.length * 2.4));
+        const width = Math.max(6, Math.min(44, trimmed.length * 1.85));
         return {
           key: `${index}-${trimmed.length}`,
           width,
@@ -700,31 +704,76 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
       });
   }, [value]);
 
-  const viewportHeight = Math.max(
-    8,
-    Math.min(100, (navState.clientHeight / Math.max(1, navState.scrollHeight)) * 100),
-  );
-  const viewportTop = Math.max(
-    0,
-    Math.min(
-      100 - viewportHeight,
-      (navState.scrollTop / Math.max(1, navState.scrollHeight - navState.clientHeight)) *
-        (100 - viewportHeight),
-    ),
-  );
+  const minimapGeometry = useMemo(() => {
+    const renderedLineCount = Math.max(1, minimapLines.length);
+    const availableHeight = Math.max(1, navState.clientHeight - MINIMAP_VERTICAL_PADDING * 2);
+    const naturalHeight =
+      renderedLineCount * MINIMAP_SHORT_FILE_LINE_HEIGHT +
+      Math.max(0, renderedLineCount - 1) * MINIMAP_SHORT_FILE_LINE_GAP;
+    const shouldFitToViewport = naturalHeight > availableHeight;
+    const lineGap = shouldFitToViewport ? 0 : MINIMAP_SHORT_FILE_LINE_GAP;
+    const lineHeight = shouldFitToViewport
+      ? availableHeight / renderedLineCount
+      : MINIMAP_SHORT_FILE_LINE_HEIGHT;
+    const contentHeight = shouldFitToViewport ? availableHeight : naturalHeight;
+    const isScrollable = navState.scrollHeight > navState.clientHeight + 1;
+    const viewportHeight = isScrollable
+      ? Math.max(
+          MINIMAP_MIN_VIEWPORT_HEIGHT,
+          Math.min(contentHeight, (navState.clientHeight / Math.max(1, navState.scrollHeight)) * contentHeight),
+        )
+      : 0;
+    const viewportTop = isScrollable
+      ? Math.max(
+          0,
+          Math.min(
+            contentHeight - viewportHeight,
+            (navState.scrollTop / Math.max(1, navState.scrollHeight - navState.clientHeight)) *
+              (contentHeight - viewportHeight),
+          ),
+        )
+      : 0;
+
+    return {
+      contentHeight,
+      isScrollable,
+      lineGap,
+      lineHeight,
+      viewportHeight,
+      viewportTop,
+    };
+  }, [
+    minimapLines.length,
+    navState.clientHeight,
+    navState.scrollHeight,
+    navState.scrollTop,
+  ]);
 
   const scrollToMinimapPointer = useCallback(
     (clientY: number) => {
       const minimap = minimapRef.current;
       const view = viewRef.current;
-      if (!minimap || !view) return;
+      if (!minimap || !view || !minimapGeometry.isScrollable) return;
       const rect = minimap.getBoundingClientRect();
-      const ratio = Math.max(0, Math.min(1, (clientY - rect.top) / Math.max(1, rect.height)));
+      const ratio = Math.max(
+        0,
+        Math.min(
+          1,
+          (clientY - rect.top - MINIMAP_VERTICAL_PADDING) /
+            Math.max(1, minimapGeometry.contentHeight),
+        ),
+      );
       const maxScroll = Math.max(0, navState.scrollHeight - navState.clientHeight);
       view.scrollDOM.scrollTop = ratio * maxScroll;
       readEditorState(view);
     },
-    [navState.clientHeight, navState.scrollHeight, readEditorState],
+    [
+      minimapGeometry.contentHeight,
+      minimapGeometry.isScrollable,
+      navState.clientHeight,
+      navState.scrollHeight,
+      readEditorState,
+    ],
   );
 
   return (
@@ -757,9 +806,10 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
       </div>
       <div
         ref={minimapRef}
-        className="canvas-minimap"
+        className={`canvas-minimap ${minimapGeometry.isScrollable ? 'is-scrollable' : 'is-short-file'}`}
         title="Overview ruler — click or drag to jump through the file"
         onPointerDown={(event) => {
+          if (!minimapGeometry.isScrollable) return;
           event.preventDefault();
           event.currentTarget.setPointerCapture(event.pointerId);
           scrollToMinimapPointer(event.clientY);
@@ -770,7 +820,14 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
           }
         }}
       >
-        <div className="canvas-minimap-lines">
+        <div
+          className="canvas-minimap-lines"
+          style={{
+            height: minimapGeometry.contentHeight,
+            gap: minimapGeometry.lineGap,
+            '--canvas-minimap-line-height': `${minimapGeometry.lineHeight}px`,
+          } as React.CSSProperties}
+        >
           {minimapLines.map((line) => (
             <span
               key={line.key}
@@ -779,13 +836,15 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
             />
           ))}
         </div>
-        <div
-          className="canvas-minimap-viewport"
-          style={{
-            top: `${viewportTop}%`,
-            height: `${viewportHeight}%`,
-          }}
-        />
+        {minimapGeometry.isScrollable && (
+          <div
+            className="canvas-minimap-viewport"
+            style={{
+              top: MINIMAP_VERTICAL_PADDING + minimapGeometry.viewportTop,
+              height: minimapGeometry.viewportHeight,
+            }}
+          />
+        )}
       </div>
       <div className="canvas-editor-position">
         Ln {navState.cursorLine.toLocaleString()}, Col {navState.cursorColumn.toLocaleString()} ·{' '}
