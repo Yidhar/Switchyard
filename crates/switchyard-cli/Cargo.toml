@@ -12,16 +12,13 @@ name = "switchyard"
 path = "src/main.rs"
 
 [dependencies]
+switchyard-app-providers = { workspace = true }
 switchyard-config = { workspace = true }
 switchyard-core = { workspace = true }
 switchyard-host-jobs = { workspace = true }
 switchyard-session = { workspace = true }
 switchyard-store = { workspace = true }
 switchyard-provider-api = { workspace = true }
-switchyard-provider-codex = { workspace = true }
-switchyard-provider-claude = { workspace = true }
-switchyard-provider-gemini = { workspace = true }
-switchyard-provider-antigravity = { workspace = true }
 switchyard-provider-subprocess = { workspace = true }
 switchyard-runtime = { workspace = true }
 switchyard-tui = { workspace = true }

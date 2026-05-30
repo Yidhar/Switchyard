@@ -19,19 +19,16 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 use file_watcher::{CapturedChange, FileWatcherState};
 
+use switchyard_app_providers::{build_provider_registry, default_provider_config};
 use switchyard_config::{SandboxMode, SwitchyardConfig};
 use switchyard_core::{
-    ProviderRegistry, RouterPromptInjection, RuntimeEvent, build_peer_catalog_probed,
+    RouterPromptInjection, RuntimeEvent, build_peer_catalog_probed,
     execution_policy_from_config_with_overrides,
     run_routed_turn_observable_with_policy_attachments_and_prompt_injection,
 };
-use switchyard_provider_antigravity::AntigravityProvider;
 use switchyard_provider_api::{
-    CancellationToken, HostSurfaceProbe, InputAttachment, LiveInstanceRegistry, Provider,
+    CancellationToken, HostSurfaceProbe, InputAttachment, LiveInstanceRegistry,
 };
-use switchyard_provider_claude::ClaudeProvider;
-use switchyard_provider_codex::CodexProvider;
-use switchyard_provider_gemini::GeminiProvider;
 use switchyard_runtime::{RuntimeDb, RuntimeIpcMessage, RuntimeIpcRequest, RuntimeSnapshot};
 use switchyard_session::{Artifact, Event, Session, Turn, Workspace};
 use switchyard_store::{
@@ -2423,215 +2420,6 @@ fn infer_language(path: &Path) -> String {
     .to_string()
 }
 
-fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
-    let mut registry = ProviderRegistry::new();
-
-    // Register all configured providers dynamically!
-    for (name, prov_cfg) in &config.providers {
-        let name_lower = name.to_ascii_lowercase();
-        let backend = prov_cfg.backend.as_deref().unwrap_or_else(|| {
-            if name_lower.contains("codex") {
-                "codex"
-            } else if name_lower.contains("claude") {
-                "claude"
-            } else if name_lower.contains("antigravity") || name_lower.contains("agy") {
-                // Match "antigravity" / "agy" BEFORE the gemini check —
-                // Antigravity shares Gemini's config tree under `~/.gemini/`
-                // but the binary and protocol are different. Provider name
-                // disambiguates.
-                "antigravity"
-            } else if name_lower.contains("gemini") {
-                "gemini"
-            } else {
-                ""
-            }
-        });
-        match backend {
-            "codex" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(CodexProvider::from_config(c)),
-                            None => Box::new(CodexProvider::new(
-                                "codex",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "claude" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                            None => Box::new(ClaudeProvider::new(
-                                "claude",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "gemini" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(GeminiProvider::from_config(c)),
-                            None => Box::new(GeminiProvider::new(
-                                "gemini",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "antigravity" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(AntigravityProvider::from_config(c)),
-                            None => Box::new(AntigravityProvider::new(
-                                "agy",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            _ => {}
-        }
-    }
-
-    // Always ensure the built-in provider aliases are registered even if not in config.
-    if !registry.has("codex") {
-        registry.register(
-            "codex",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(CodexProvider::from_config(c)),
-                    None => Box::new(CodexProvider::new(
-                        "codex",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("claude") {
-        registry.register(
-            "claude",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                    None => Box::new(ClaudeProvider::new(
-                        "claude",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("gemini") {
-        registry.register(
-            "gemini",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(GeminiProvider::from_config(c)),
-                    None => Box::new(GeminiProvider::new(
-                        "gemini",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("antigravity") {
-        registry.register(
-            "antigravity",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(AntigravityProvider::from_config(c)),
-                    None => Box::new(AntigravityProvider::new(
-                        "agy",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-
-    registry
-}
-
-fn inferred_provider_backend(name: &str) -> Option<&'static str> {
-    let name = name.to_ascii_lowercase();
-    if name.contains("codex") {
-        Some("codex")
-    } else if name.contains("claude") {
-        Some("claude")
-    } else if name.contains("antigravity") || name.contains("agy") {
-        // Match Antigravity before Gemini: `agy` stores data under the Gemini
-        // config tree, but it has a different CLI/protocol surface.
-        Some("antigravity")
-    } else if name.contains("gemini") {
-        Some("gemini")
-    } else {
-        None
-    }
-}
-
-fn default_provider_command(backend: &str) -> &str {
-    match backend {
-        "codex" => "codex",
-        "claude" => "claude",
-        "gemini" => "gemini",
-        "antigravity" => "agy",
-        other => other,
-    }
-}
-
-fn default_provider_config(provider_id: &str) -> switchyard_config::ProviderConfig {
-    let backend = inferred_provider_backend(provider_id).unwrap_or(provider_id);
-    switchyard_config::ProviderConfig {
-        command: default_provider_command(backend).to_string(),
-        args: Vec::new(),
-        env: std::collections::HashMap::new(),
-        model: None,
-        thinking_level: None,
-        timeout_secs: 0,
-        backend: Some(backend.to_string()),
-    }
-}
-
 fn normalize_optional_config_text(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim().to_string();
@@ -2725,7 +2513,7 @@ async fn collect_provider_statuses(
         .current()
         .map(|ws| SwitchyardConfig::resolve(&ws.primary_root).unwrap_or_default())
         .unwrap_or_default();
-    let registry = build_registry(&config);
+    let registry = build_provider_registry(&config);
     let checked_at = chrono::Utc::now().to_rfc3339();
 
     let mut provider_names = BTreeSet::new();
@@ -3600,7 +3388,7 @@ async fn run_turn(
     let provider = provider.unwrap_or_else(|| session.active_core.clone());
     let mut effective_config = base_config.clone();
     apply_session_provider_overrides(&mut effective_config, &provider, &session);
-    let registry = build_registry(&effective_config);
+    let registry = build_provider_registry(&effective_config);
     let bridge_debug = env_flag_enabled("SWITCHYARD_DEBUG_RUNTIME_BRIDGE");
     let tx = spawn_runtime_event_bridge(app.clone(), bridge_debug);
     tx.send(switchyard_core::RuntimeEvent::TurnPreparing {
@@ -4121,7 +3909,7 @@ async fn start_instance(
     let ws = workspace_state.current()?;
     let cwd = ws.primary_root.clone();
     let config = SwitchyardConfig::resolve(&cwd).unwrap_or_default();
-    let registry = build_registry(&config);
+    let registry = build_provider_registry(&config);
 
     let provider_impl = registry
         .create(&provider, config.providers.get(&provider))

@@ -13,6 +13,7 @@ name = "switchyard-tui"
 path = "../crates/switchyard-tui/src/main.rs"
 
 [dependencies]
+switchyard-app-providers = { workspace = true }
 switchyard-core = { workspace = true }
 switchyard-session = { workspace = true }
 switchyard-store = { workspace = true }

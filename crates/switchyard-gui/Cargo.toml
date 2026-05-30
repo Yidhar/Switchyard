@@ -11,6 +11,7 @@ tauri-plugin-dialog = "2"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+switchyard-app-providers = { workspace = true }
 switchyard-config = { workspace = true }
 switchyard-core = { workspace = true }
 switchyard-orchestrator = { workspace = true }
@@ -19,9 +20,6 @@ switchyard-session = { workspace = true }
 switchyard-store = { workspace = true }
 switchyard-provider-api = { workspace = true }
 switchyard-provider-codex = { workspace = true }
-switchyard-provider-claude = { workspace = true }
-switchyard-provider-gemini = { workspace = true }
-switchyard-provider-antigravity = { workspace = true }
 toml = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

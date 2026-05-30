@@ -1,13 +1,8 @@
 use std::{path::PathBuf, process};
 
 use clap::Parser;
+use switchyard_app_providers::build_provider_registry;
 use switchyard_config::SwitchyardConfig;
-use switchyard_core::ProviderRegistry;
-use switchyard_provider_antigravity::AntigravityProvider;
-use switchyard_provider_api::Provider;
-use switchyard_provider_claude::ClaudeProvider;
-use switchyard_provider_codex::CodexProvider;
-use switchyard_provider_gemini::GeminiProvider;
 use switchyard_store::{SessionRepository, StoreHandle};
 use switchyard_tui::app::App;
 use switchyard_tui::launch::{resolve_resume_session, resolve_work_dir};
@@ -32,177 +27,13 @@ struct Cli {
     cwd: PathBuf,
 }
 
-fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
-    let mut registry = ProviderRegistry::new();
-
-    // Register all configured providers dynamically!
-    for (name, prov_cfg) in &config.providers {
-        let backend = prov_cfg.backend.as_deref().unwrap_or_else(|| {
-            if name.contains("codex") {
-                "codex"
-            } else if name.contains("claude") {
-                "claude"
-            } else if name.contains("antigravity") || name.contains("agy") {
-                "antigravity"
-            } else if name.contains("gemini") {
-                "gemini"
-            } else {
-                ""
-            }
-        });
-        match backend {
-            "codex" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(CodexProvider::from_config(c)),
-                            None => Box::new(CodexProvider::new(
-                                "codex",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "claude" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                            None => Box::new(ClaudeProvider::new(
-                                "claude",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "gemini" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(GeminiProvider::from_config(c)),
-                            None => Box::new(GeminiProvider::new(
-                                "gemini",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "antigravity" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(AntigravityProvider::from_config(c)),
-                            None => Box::new(AntigravityProvider::new(
-                                "agy",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            _ => {}
-        }
-    }
-
-    // Always ensure the default three are registered even if not in config
-    if !registry.has("codex") {
-        registry.register(
-            "codex",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(CodexProvider::from_config(c)),
-                    None => Box::new(CodexProvider::new(
-                        "codex",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("claude") {
-        registry.register(
-            "claude",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                    None => Box::new(ClaudeProvider::new(
-                        "claude",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("gemini") {
-        registry.register(
-            "gemini",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(GeminiProvider::from_config(c)),
-                    None => Box::new(GeminiProvider::new(
-                        "gemini",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("antigravity") {
-        registry.register(
-            "antigravity",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(AntigravityProvider::from_config(c)),
-                    None => Box::new(AntigravityProvider::new(
-                        "agy",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-
-    registry
-}
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let tui_cwd = resolve_work_dir(&cwd, &cli.cwd);
     let config = SwitchyardConfig::resolve(&tui_cwd).unwrap_or_default();
-    let registry = build_registry(&config);
+    let registry = build_provider_registry(&config);
     let store_backend = config.store_backend(&tui_cwd);
     let store_path = config.store_path(&tui_cwd);
     let job_dir = config.job_dir(&tui_cwd);

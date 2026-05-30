@@ -3585,6 +3585,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchyard-app-providers"
+version = "0.1.2"
+dependencies = [
+ "switchyard-config",
+ "switchyard-core",
+ "switchyard-provider-antigravity",
+ "switchyard-provider-api",
+ "switchyard-provider-claude",
+ "switchyard-provider-codex",
+ "switchyard-provider-gemini",
+]
+
+[[package]]
 name = "switchyard-artifacts"
 version = "0.1.2"
 dependencies = [
@@ -3603,14 +3616,11 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "switchyard-app-providers",
  "switchyard-config",
  "switchyard-core",
  "switchyard-host-jobs",
- "switchyard-provider-antigravity",
  "switchyard-provider-api",
- "switchyard-provider-claude",
- "switchyard-provider-codex",
- "switchyard-provider-gemini",
  "switchyard-provider-subprocess",
  "switchyard-runtime",
  "switchyard-session",
@@ -3682,14 +3692,12 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "switchyard-app-providers",
  "switchyard-config",
  "switchyard-core",
  "switchyard-orchestrator",
- "switchyard-provider-antigravity",
  "switchyard-provider-api",
- "switchyard-provider-claude",
  "switchyard-provider-codex",
- "switchyard-provider-gemini",
  "switchyard-runtime",
  "switchyard-session",
  "switchyard-store",
@@ -3877,6 +3885,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "switchyard-app-providers",
  "switchyard-cli",
  "switchyard-config",
  "switchyard-core",
@@ -3914,14 +3923,11 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "switchyard-app-providers",
  "switchyard-config",
  "switchyard-core",
  "switchyard-host-jobs",
- "switchyard-provider-antigravity",
  "switchyard-provider-api",
- "switchyard-provider-claude",
- "switchyard-provider-codex",
- "switchyard-provider-gemini",
  "switchyard-provider-subprocess",
  "switchyard-session",
  "switchyard-store",

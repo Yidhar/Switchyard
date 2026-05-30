@@ -5,6 +5,7 @@ members = [
     "crates/switchyard-tui",
     "crates/switchyard-text",
     "crates/switchyard-host-jobs",
+    "crates/switchyard-app-providers",
     "crates/switchyard-runtime",
     "crates/switchyard-config",
     "crates/switchyard-core",
@@ -35,6 +36,7 @@ switchyard-cli = { path = "crates/switchyard-cli" }
 switchyard-tui = { path = "crates/switchyard-tui" }
 switchyard-text = { path = "crates/switchyard-text" }
 switchyard-host-jobs = { path = "crates/switchyard-host-jobs" }
+switchyard-app-providers = { path = "crates/switchyard-app-providers" }
 switchyard-runtime = { path = "crates/switchyard-runtime" }
 switchyard-config = { path = "crates/switchyard-config" }
 switchyard-core = { path = "crates/switchyard-core" }

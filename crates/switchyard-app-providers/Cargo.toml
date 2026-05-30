@@ -1,0 +1,15 @@
+[package]
+name = "switchyard-app-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+switchyard-config = { workspace = true }
+switchyard-core = { workspace = true }
+switchyard-provider-api = { workspace = true }
+switchyard-provider-codex = { workspace = true }
+switchyard-provider-claude = { workspace = true }
+switchyard-provider-gemini = { workspace = true }
+switchyard-provider-antigravity = { workspace = true }

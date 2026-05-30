@@ -8,16 +8,13 @@ use std::process;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use switchyard_app_providers::build_provider_registry;
 use switchyard_config::{SandboxMode, SwitchyardConfig};
 use switchyard_core::{
-    ProviderRegistry, build_peer_catalog_probed, execution_policy_from_config_with_overrides,
+    build_peer_catalog_probed, execution_policy_from_config_with_overrides,
     run_routed_turn_with_archive_and_policy,
 };
-use switchyard_provider_antigravity::AntigravityProvider;
-use switchyard_provider_api::{HostSurfaceProbe, Provider};
-use switchyard_provider_claude::ClaudeProvider;
-use switchyard_provider_codex::CodexProvider;
-use switchyard_provider_gemini::GeminiProvider;
+use switchyard_provider_api::HostSurfaceProbe;
 use switchyard_provider_subprocess::{find_on_path, probe_version};
 use switchyard_session::Session;
 use switchyard_store::{SessionRepository, StoreHandle};
@@ -269,171 +266,6 @@ enum HookCli {
     Status,
 }
 
-/// Build the provider registry with all known adapters.
-fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
-    let mut registry = ProviderRegistry::new();
-
-    // Register all configured providers dynamically!
-    for (name, prov_cfg) in &config.providers {
-        let backend = prov_cfg.backend.as_deref().unwrap_or_else(|| {
-            if name.contains("codex") {
-                "codex"
-            } else if name.contains("claude") {
-                "claude"
-            } else if name.contains("antigravity") || name.contains("agy") {
-                "antigravity"
-            } else if name.contains("gemini") {
-                "gemini"
-            } else {
-                ""
-            }
-        });
-        match backend {
-            "codex" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(CodexProvider::from_config(c)),
-                            None => Box::new(CodexProvider::new(
-                                "codex",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "claude" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                            None => Box::new(ClaudeProvider::new(
-                                "claude",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "gemini" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(GeminiProvider::from_config(c)),
-                            None => Box::new(GeminiProvider::new(
-                                "gemini",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            "antigravity" => {
-                registry.register(
-                    name.clone(),
-                    Box::new(|cfg| {
-                        let p: Box<dyn Provider> = match cfg {
-                            Some(c) => Box::new(AntigravityProvider::from_config(c)),
-                            None => Box::new(AntigravityProvider::new(
-                                "agy",
-                                vec![],
-                                std::collections::HashMap::new(),
-                                0,
-                            )),
-                        };
-                        p
-                    }),
-                );
-            }
-            _ => {}
-        }
-    }
-
-    // Always ensure the default three are registered even if not in config
-    if !registry.has("codex") {
-        registry.register(
-            "codex",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(CodexProvider::from_config(c)),
-                    None => Box::new(CodexProvider::new(
-                        "codex",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("claude") {
-        registry.register(
-            "claude",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(ClaudeProvider::from_config(c)),
-                    None => Box::new(ClaudeProvider::new(
-                        "claude",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("gemini") {
-        registry.register(
-            "gemini",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(GeminiProvider::from_config(c)),
-                    None => Box::new(GeminiProvider::new(
-                        "gemini",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-    if !registry.has("antigravity") {
-        registry.register(
-            "antigravity",
-            Box::new(|cfg| {
-                let p: Box<dyn Provider> = match cfg {
-                    Some(c) => Box::new(AntigravityProvider::from_config(c)),
-                    None => Box::new(AntigravityProvider::new(
-                        "agy",
-                        vec![],
-                        std::collections::HashMap::new(),
-                        0,
-                    )),
-                };
-                p
-            }),
-        );
-    }
-
-    registry
-}
-
 /// Known CLI command names for auto-discovery.
 const KNOWN_CLIS: &[&str] = &["codex", "claude", "gemini", "agy"];
 
@@ -464,7 +296,7 @@ async fn main() {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = SwitchyardConfig::resolve(&cwd).unwrap_or_default();
-    let registry = build_registry(&config);
+    let registry = build_provider_registry(&config);
 
     match cli.command {
         Commands::Run {
@@ -476,7 +308,7 @@ async fn main() {
         } => {
             let run_cwd = resolve_work_dir(&cwd, &work_dir);
             let run_config = SwitchyardConfig::resolve(&run_cwd).unwrap_or_else(|_| config.clone());
-            let registry = build_registry(&run_config);
+            let registry = build_provider_registry(&run_config);
             let provider = provider.unwrap_or_else(|| run_config.core.default_provider.clone());
 
             let issues = run_config.validate();
