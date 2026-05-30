@@ -299,7 +299,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                                 "codex",
                                 vec![],
                                 std::collections::HashMap::new(),
-                                900,
+                                0,
                             )),
                         };
                         p
@@ -316,7 +316,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                                 "claude",
                                 vec![],
                                 std::collections::HashMap::new(),
-                                900,
+                                0,
                             )),
                         };
                         p
@@ -333,7 +333,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                                 "gemini",
                                 vec![],
                                 std::collections::HashMap::new(),
-                                900,
+                                0,
                             )),
                         };
                         p
@@ -350,7 +350,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                                 "agy",
                                 vec![],
                                 std::collections::HashMap::new(),
-                                900,
+                                0,
                             )),
                         };
                         p
@@ -372,7 +372,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                         "codex",
                         vec![],
                         std::collections::HashMap::new(),
-                        900,
+                        0,
                     )),
                 };
                 p
@@ -389,7 +389,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                         "claude",
                         vec![],
                         std::collections::HashMap::new(),
-                        900,
+                        0,
                     )),
                 };
                 p
@@ -406,7 +406,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                         "gemini",
                         vec![],
                         std::collections::HashMap::new(),
-                        900,
+                        0,
                     )),
                 };
                 p
@@ -423,7 +423,7 @@ fn build_registry(config: &SwitchyardConfig) -> ProviderRegistry {
                         "agy",
                         vec![],
                         std::collections::HashMap::new(),
-                        900,
+                        0,
                     )),
                 };
                 p

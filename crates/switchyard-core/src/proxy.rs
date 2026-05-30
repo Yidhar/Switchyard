@@ -693,8 +693,8 @@ mod tests {
     fn persistent_turn_timeout_zero_disables_hard_timeout() {
         assert_eq!(persistent_turn_hard_timeout(0), None);
         assert_eq!(
-            persistent_turn_hard_timeout(900),
-            Some(Duration::from_secs(900))
+            persistent_turn_hard_timeout(120),
+            Some(Duration::from_secs(120))
         );
     }
 

@@ -96,6 +96,23 @@ fn delegate_request_roundtrip() {
 }
 
 #[test]
+fn delegate_request_missing_timeout_defaults_to_no_hard_deadline() {
+    let json = r#"{
+        "type": "delegate",
+        "requests": [{
+            "id": "t1",
+            "provider": "claude",
+            "role": "reviewer",
+            "task": "review this code"
+        }]
+    }"#;
+
+    let req: DelegateRequest = serde_json::from_str(json).unwrap();
+
+    assert_eq!(req.requests[0].timeout_sec, 0);
+}
+
+#[test]
 fn delegate_response_roundtrip() {
     let result = DelegateTaskResult {
         id: "t1".to_string(),

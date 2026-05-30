@@ -25,11 +25,13 @@ Emit a delegate block in your response:
     "role": "reviewer",
     "task": "Review the authentication module for security issues",
     "write_access": false,
-    "timeout_sec": 900
+    "timeout_sec": 0
   }]
 }
 <<<SWITCHYARD_JSON_END>>>
 ```
+
+`timeout_sec = 0` means no hard wall-clock timeout. Set a positive value only when the caller intentionally wants a deadline.
 
 ### In host-native mode (/hyard)
 

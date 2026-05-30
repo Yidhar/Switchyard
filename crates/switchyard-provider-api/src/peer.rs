@@ -102,11 +102,11 @@ impl PeerCatalog {
                 lines.push("To delegate a task, emit a Switchyard delegate block:".to_string());
                 lines.push("<<<SWITCHYARD_JSON_BEGIN>>>".to_string());
                 lines.push(
-                    r#"{"type":"delegate","requests":[{"id":"<unique>","provider":"<name>","role":"<role>","task":"<description>","write_access":false,"timeout_sec":900}]}"#.to_string(),
+                    r#"{"type":"delegate","requests":[{"id":"<unique>","provider":"<name>","role":"<role>","task":"<description>","write_access":false,"timeout_sec":0}]}"#.to_string(),
                 );
                 lines.push("<<<SWITCHYARD_JSON_END>>>".to_string());
                 lines.push(
-                    "Set timeout_sec to match scope; deep research or multi-step team tasks often need 600-1800 seconds."
+                    "Use timeout_sec=0 for no hard wall-clock timeout; set a positive timeout only when the caller intentionally wants a deadline."
                         .to_string(),
                 );
             }
@@ -234,8 +234,9 @@ mod tests {
     #[test]
     fn sentinel_prompt_keeps_timeout_guidance() {
         let prompt = sample_catalog().render_prompt(PromptMode::Sentinel);
-        assert!(prompt.contains("\"timeout_sec\":900"));
-        assert!(prompt.contains("600-1800 seconds"));
+        assert!(prompt.contains("\"timeout_sec\":0"));
+        assert!(prompt.contains("no hard wall-clock timeout"));
+        assert!(prompt.contains("intentionally wants a deadline"));
         assert!(prompt.contains("Do NOT invoke provider CLIs directly."));
     }
 

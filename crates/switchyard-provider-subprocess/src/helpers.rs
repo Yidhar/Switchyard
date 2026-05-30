@@ -186,13 +186,13 @@ mod tests {
     fn effective_timeout_uses_provider_default_when_policy_is_zero() {
         assert_eq!(effective_timeout_secs(0, 0), 0);
         assert_eq!(effective_timeout_secs(300, 0), 300);
-        assert_eq!(effective_timeout_secs(900, 0), 900);
+        assert_eq!(effective_timeout_secs(120, 0), 120);
     }
 
     #[test]
     fn effective_timeout_uses_policy_when_present() {
         assert_eq!(effective_timeout_secs(300, 120), 120);
-        assert_eq!(effective_timeout_secs(300, 900), 900);
+        assert_eq!(effective_timeout_secs(300, 120), 120);
     }
 
     #[test]

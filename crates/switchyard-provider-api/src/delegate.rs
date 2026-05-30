@@ -29,7 +29,9 @@ pub struct DelegateTask {
 }
 
 fn default_timeout() -> u64 {
-    120
+    // 0 means no hard wall-clock timeout. Delegation callers that need
+    // a deadline must opt in with a positive timeout_sec.
+    0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

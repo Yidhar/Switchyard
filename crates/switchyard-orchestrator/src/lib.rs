@@ -774,6 +774,10 @@ mod tests {
     use switchyard_provider_api::{EffectiveSandboxMode, ProviderRole};
 
     fn delegate_task(write_access: bool) -> DelegateTask {
+        delegate_task_with_timeout(write_access, 120)
+    }
+
+    fn delegate_task_with_timeout(write_access: bool, timeout_sec: u64) -> DelegateTask {
         DelegateTask {
             id: "task-1".to_string(),
             provider: "codex".to_string(),
@@ -782,7 +786,7 @@ mod tests {
             write_access,
             cwd: Some(PathBuf::from("/project/app")),
             allowed_paths: Vec::new(),
-            timeout_sec: 900,
+            timeout_sec,
         }
     }
 
@@ -791,7 +795,7 @@ mod tests {
         let task = delegate_task(false);
         let policy = execution_policy_from_delegate_task(&task);
 
-        assert_eq!(policy.timeout_secs, 900);
+        assert_eq!(policy.timeout_secs, 120);
         assert_eq!(policy.cwd, PathBuf::from("/project/app"));
         assert!(!policy.write_access);
         assert!(policy.allowed_paths.is_empty());
@@ -806,13 +810,21 @@ mod tests {
         let task = delegate_task(true);
         let policy = execution_policy_from_delegate_task(&task);
 
-        assert_eq!(policy.timeout_secs, 900);
+        assert_eq!(policy.timeout_secs, 120);
         assert!(policy.write_access);
         assert_eq!(policy.allowed_paths, vec![PathBuf::from("/project/app")]);
         assert_eq!(
             policy.effective_sandbox_mode(),
             EffectiveSandboxMode::WorkspaceWrite
         );
+    }
+
+    #[test]
+    fn delegate_policy_preserves_zero_timeout_as_no_hard_deadline() {
+        let task = delegate_task_with_timeout(false, 0);
+        let policy = execution_policy_from_delegate_task(&task);
+
+        assert_eq!(policy.timeout_secs, 0);
     }
 
     #[test]
