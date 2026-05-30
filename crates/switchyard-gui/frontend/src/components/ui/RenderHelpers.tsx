@@ -574,7 +574,7 @@ export function renderMessageBody(
             <div
               key={idx}
               className="code-block-container"
-              style={{ margin: '8px 0', position: 'relative' }}
+              style={{ margin: '6px 0', position: 'relative' }}
             >
               {language && (
                 <div
