@@ -3586,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-app-providers"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "switchyard-config",
  "switchyard-core",
@@ -3600,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-artifacts"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3611,7 +3611,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "clap",
@@ -3636,7 +3636,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-config"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "switchyard-store",
@@ -3647,7 +3647,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-context"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3659,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3684,7 +3684,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-gui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3714,7 +3714,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-host-jobs"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "serde",
@@ -3728,7 +3728,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-orchestrator"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3748,7 +3748,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-provider-antigravity"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "serde",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-provider-api"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3777,7 +3777,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-provider-claude"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "serde",
@@ -3791,7 +3791,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-provider-codex"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3807,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-provider-gemini"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "serde",
@@ -3821,7 +3821,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-provider-kohaku"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "serde",
@@ -3835,7 +3835,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-provider-subprocess"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "portable-pty",
@@ -3851,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-runtime"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -3865,7 +3865,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-session"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "serde",
@@ -3875,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-store"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -3890,7 +3890,7 @@ dependencies = [
 
 [[package]]
 name = "switchyard-tests"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3927,11 +3927,11 @@ dependencies = [
 
 [[package]]
 name = "switchyard-text"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "switchyard-tui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
