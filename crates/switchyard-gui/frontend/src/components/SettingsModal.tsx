@@ -8,7 +8,12 @@ import {
   defaultProviderConfigFor,
   inferProviderBackend,
 } from '../providerCliCapabilities';
-import { listKohakuModels } from '../services/api';
+import {
+  listKohakuModels,
+  listKohakuCreatures,
+  kohakuInstallBiome,
+  type KohakuCreature,
+} from '../services/api';
 
 interface SettingsModalProps {
   config: SwitchyardConfig;
@@ -48,16 +53,36 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   // KohakuTerrarium model selectors are listed dynamically from `kt model
   // list` (the user's configured llm profiles), like KT's own app.
   const [kohakuModels, setKohakuModels] = React.useState<string[]>([]);
+  const [kohakuCreatures, setKohakuCreatures] = React.useState<KohakuCreature[]>([]);
+  const [installingBiome, setInstallingBiome] = React.useState(false);
+  const [biomeMsg, setBiomeMsg] = React.useState<string | null>(null);
   React.useEffect(() => {
     const prov = config.providers[settingsTab] || defaultProviderConfigFor(settingsTab);
     if (inferProviderBackend(settingsTab, prov.backend) === 'kohaku') {
-      listKohakuModels(prov.command || 'kt')
-        .then(setKohakuModels)
-        .catch(() => setKohakuModels([]));
+      const cmd = prov.command || 'kt';
+      listKohakuModels(cmd).then(setKohakuModels).catch(() => setKohakuModels([]));
+      listKohakuCreatures(cmd).then(setKohakuCreatures).catch(() => setKohakuCreatures([]));
     } else {
       setKohakuModels([]);
+      setKohakuCreatures([]);
     }
+    setBiomeMsg(null);
   }, [settingsTab, config]);
+
+  const handleInstallBiome = async (command: string) => {
+    setInstallingBiome(true);
+    setBiomeMsg(null);
+    try {
+      await kohakuInstallBiome(command);
+      const list = await listKohakuCreatures(command);
+      setKohakuCreatures(list);
+      setBiomeMsg(`Installed. ${list.length} creatures/terrariums available.`);
+    } catch (e) {
+      setBiomeMsg(`Install failed: ${String(e)}`);
+    } finally {
+      setInstallingBiome(false);
+    }
+  };
 
   return (
     <div className="settings-overlay">
@@ -186,10 +211,55 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     />
                   </div>
 
+                  {cliMapping.backend === 'kohaku' && (
+                    <div className="settings-form-group">
+                      <label
+                        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                      >
+                        <span>Creature (KohakuTerrarium agent)</span>
+                        <button
+                          className="btn-add-row"
+                          style={{ padding: '2px 8px' }}
+                          disabled={installingBiome}
+                          onClick={() => handleInstallBiome(prov.command || 'kt')}
+                        >
+                          {installingBiome ? 'Installing…' : 'Install kt-biome'}
+                        </button>
+                      </label>
+                      <input
+                        type="text"
+                        list={`creatures-${pName}`}
+                        className="settings-input settings-input-mono"
+                        placeholder="@kt-biome/creatures/general"
+                        value={prov.args[0] ?? ''}
+                        onChange={(e) => {
+                          const ref = e.target.value.trim();
+                          const rest = prov.args.slice(1);
+                          onProviderFieldChange(pName, 'args', ref ? [ref, ...rest] : rest);
+                        }}
+                      />
+                      {kohakuCreatures.length > 0 && (
+                        <datalist id={`creatures-${pName}`}>
+                          {kohakuCreatures.map((c) => (
+                            <option key={c.reference} value={c.reference}>
+                              {`${c.kind}: ${c.package}/${c.name}`}
+                            </option>
+                          ))}
+                        </datalist>
+                      )}
+                      <div style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
+                        {biomeMsg ??
+                          (kohakuCreatures.length === 0
+                            ? 'No creatures found — install the kt-biome pack, or type a config-folder path.'
+                            : 'The kt agent run each turn. Becomes the first CLI argument.')}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="settings-form-group">
                     <label>CLI Execution Arguments (comma separated)</label>
-                    <input 
-                      type="text" 
+                    <input
+                      type="text"
                       className="settings-input settings-input-mono"
                       value={prov.args.join(', ')}
                       onChange={(e) => {
