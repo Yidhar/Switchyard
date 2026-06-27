@@ -552,6 +552,15 @@ export function renderMessageBody(
     }
   }
 
+  // Defense-in-depth: a sentinel is a routing/control artifact and must never
+  // appear in the bubble, even when it isn't a recognized delegate or arrives
+  // in fragments mid-stream. Strip every complete block, then drop an unclosed
+  // trailing block (a dangling BEGIN with no END yet). Mirrors the Rust
+  // strip_sentinel_blocks semantics.
+  remainingText = remainingText
+    .replace(/<<<SWITCHYARD_JSON_BEGIN>>>[\s\S]*?<<<SWITCHYARD_JSON_END>>>/g, '')
+    .replace(/<<<SWITCHYARD_JSON_BEGIN>>>[\s\S]*$/, '');
+
   if (!remainingText.trim() && !delegateCard) return null;
 
   // Split by code blocks first
@@ -2597,12 +2606,19 @@ export function renderTurnActivitySummary(
   const phaseIsActive = runtimePhase === 'running' || runtimePhase === 'output_completed' || runtimePhase === 'finalizing';
   const showSpinner = phaseIsActive || turnIsActive || hasRunningTool || hasLiveTerminal;
   const detailToolCalls = displayToolCalls.filter((tool) => !actionableTools.includes(tool));
-  const commandActivity = runningCommand
-    ? activeToolInputLabel(runningCommand)
+  // Prefer a currently-running command; otherwise fall back to the most recent
+  // command that already ran. Without this, a provider whose tools have all
+  // completed (e.g. kohaku between tool batches, with no launcher commandLine)
+  // would fall through to the "暂无工具事件" status even though `commandCount`
+  // shows commands ran — a confusing contradiction.
+  const latestCommandTool = runningCommand
+    ?? [...displayToolCalls].reverse().find((tool) => isCommandTool(tool));
+  const commandActivity = latestCommandTool
+    ? activeToolInputLabel(latestCommandTool)
     : commandLine
       ? truncateActivityText(`${commandLine}${commandArgsSuffix(state.commandArgs)}`, 180)
       : null;
-  const commandVerb = runningCommand || hasRunningTool || hasLiveTerminal || runtimePhase === 'running'
+  const commandVerb = runningCommand || hasRunningTool || hasLiveTerminal || (!latestCommandTool && runtimePhase === 'running')
     ? '正在运行'
     : '已运行';
   const editActivity = latestEdit

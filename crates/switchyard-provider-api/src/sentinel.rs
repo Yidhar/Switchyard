@@ -1,7 +1,10 @@
 use crate::ProviderError;
 
-const SENTINEL_BEGIN: &str = "<<<SWITCHYARD_JSON_BEGIN>>>";
-const SENTINEL_END: &str = "<<<SWITCHYARD_JSON_END>>>";
+/// The opening marker of a Switchyard control-channel (e.g. delegate) block.
+/// Public so streaming adapters can gate it out of the live display channel.
+pub const SENTINEL_BEGIN: &str = "<<<SWITCHYARD_JSON_BEGIN>>>";
+/// The closing marker of a Switchyard control-channel block.
+pub const SENTINEL_END: &str = "<<<SWITCHYARD_JSON_END>>>";
 
 /// Extract all JSON blocks delimited by sentinel markers from provider text output.
 pub fn extract_sentinel_blocks(text: &str) -> Vec<&str> {
@@ -37,7 +40,10 @@ pub fn strip_sentinel_blocks(text: &str) -> String {
         if let Some(end) = text[json_start..].find(SENTINEL_END) {
             search_from = json_start + end + SENTINEL_END.len();
         } else {
-            // Unclosed block — keep the rest as-is
+            // Unclosed block — keep the rest as-is. This shared strip stays
+            // conservative (it runs on every provider's final response); a
+            // streaming adapter that needs to withhold a pending block does so
+            // in its own display channel (see the kohaku SentinelDisplayFilter).
             search_from = abs_begin + SENTINEL_BEGIN.len();
         }
     }

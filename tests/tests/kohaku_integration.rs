@@ -100,6 +100,84 @@ async fn kohaku_headless_turn_maps_jsonl_to_events() {
 }
 
 #[tokio::test]
+async fn kohaku_keeps_chat_clean_of_protocol_and_sentinel() {
+    // The fake emits an activity stream, a fragmented SWITCHYARD sentinel block,
+    // and the usual text — the chat path must show only the model's prose: no
+    // terminal mirror of the JSONL protocol, and no sentinel leakage.
+    let mut env = HashMap::new();
+    env.insert("FAKE_KT_SENTINEL".to_string(), "1".to_string());
+    let provider = KohakuProvider::new(fake_kt(), vec!["@fake/creature".to_string()], env, 30);
+    let turn_id = uuid::Uuid::now_v7();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+
+    provider
+        .start_turn(
+            turn_id,
+            input("ping"),
+            policy(),
+            context(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start_turn ok");
+
+    let mut display = String::new();
+    let mut terminal_outputs = 0;
+    let mut execution_telemetry = 0;
+    let mut command_executions: Vec<String> = vec![];
+    while let Some(e) = rx.recv().await {
+        match e.payload.get("item_type").and_then(|v| v.as_str()) {
+            Some("agent_message") => {
+                if let Some(t) = e.payload.get("text").and_then(|v| v.as_str()) {
+                    display.push_str(t);
+                }
+            }
+            Some("terminal_output") => terminal_outputs += 1,
+            Some("execution_telemetry") => execution_telemetry += 1,
+            Some("command_execution") => {
+                if let Some(c) = e.payload.get("command").and_then(|v| v.as_str()) {
+                    command_executions.push(c.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        terminal_outputs, 0,
+        "kt --json protocol lines must not be mirrored as terminal output"
+    );
+    assert_eq!(
+        execution_telemetry, 0,
+        "the kt.exe driver must not be surfaced as execution_telemetry (it would \
+         headline the live card as '正在运行 kt.exe' and inflate the command count)"
+    );
+    // The fake runs a `read` tool — it must reach the live card as a counted
+    // command_execution (start->done), not vanish.
+    assert!(
+        command_executions.iter().any(|c| c == "read"),
+        "kt tool activity should surface as command_execution items, got: {command_executions:?}"
+    );
+    assert!(
+        !display.contains("SWITCHYARD_JSON"),
+        "sentinel must never leak into the chat display, got: {display:?}"
+    );
+    // The surrounding prose still streams (block is withheld, not the text).
+    assert!(display.contains("echo: ping"), "got: {display:?}");
+    assert!(display.contains("Plan:"), "got: {display:?}");
+    assert!(display.contains("done"), "got: {display:?}");
+
+    // The router still sees the full body (block included) for delegation.
+    let (result, _) = provider.finalize_turn(turn_id).await.expect("finalize");
+    assert!(
+        result.response_text.contains("SWITCHYARD_JSON"),
+        "response_text (routing input) keeps the sentinel: {:?}",
+        result.response_text
+    );
+}
+
+#[tokio::test]
 async fn kohaku_headless_turn_failure_propagates() {
     let mut env = HashMap::new();
     env.insert("FAKE_KT_FAIL".to_string(), "1".to_string());
