@@ -42,7 +42,10 @@ pub fn classify(json: &Value) -> KohakuEvent {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            error: json.get("error").and_then(Value::as_str).map(str::to_string),
+            error: json
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         },
         _ => KohakuEvent::Other,
     }

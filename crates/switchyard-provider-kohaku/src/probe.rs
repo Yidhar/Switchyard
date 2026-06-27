@@ -7,8 +7,7 @@ use switchyard_provider_subprocess::{
 };
 
 /// Marker the fork prints in `kt --version` (see `cli/version.py`).
-const HEADLESS_FORK_HINT: &str =
-    "install the switchyard-headless fork: pip install 'git+https://github.com/Yidhar/KohakuTerrarium@headless'";
+const HEADLESS_FORK_HINT: &str = "install the switchyard-headless fork: pip install 'git+https://github.com/Yidhar/KohakuTerrarium@headless'";
 
 pub async fn run_probe(command: &str) -> Result<ProbeResult, ProviderError> {
     let args = vec!["--version".to_string()];

@@ -50,7 +50,11 @@ pub async fn run_kohaku_turn(
                 .to_string(),
         );
         event_tx
-            .send(ProviderEvent::turn_failed(turn_id, "kohaku", err.to_string()))
+            .send(ProviderEvent::turn_failed(
+                turn_id,
+                "kohaku",
+                err.to_string(),
+            ))
             .await
             .ok();
         return Err(err);
@@ -151,7 +155,11 @@ pub async fn run_kohaku_turn(
                 // Non-JSON line — surface as text so unexpected output is
                 // visible when debugging.
                 event_tx_clone
-                    .send(ProviderEvent::text_message(turn_id, "kohaku", protocol_line))
+                    .send(ProviderEvent::text_message(
+                        turn_id,
+                        "kohaku",
+                        protocol_line,
+                    ))
                     .await
                     .ok();
             }
@@ -231,10 +239,7 @@ mod tests {
             kohaku_runtime_args(Some("enzi/gpt-5.5-custom"), Some("high")),
             vec!["--llm", "enzi/gpt-5.5-custom"]
         );
-        assert_eq!(
-            kohaku_runtime_args(Some("  "), None),
-            Vec::<String>::new()
-        );
+        assert_eq!(kohaku_runtime_args(Some("  "), None), Vec::<String>::new());
         assert_eq!(kohaku_runtime_args(None, Some("low")), Vec::<String>::new());
     }
 

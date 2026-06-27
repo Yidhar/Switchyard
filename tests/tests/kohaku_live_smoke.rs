@@ -59,8 +59,14 @@ async fn kohaku_minimal_turn() {
     };
     let model = std::env::var("SWITCHYARD_KOHAKU_LLM").ok();
 
-    let provider =
-        KohakuProvider::new_with_options(kt_cmd(), vec![creature], HashMap::new(), 120, model, None);
+    let provider = KohakuProvider::new_with_options(
+        kt_cmd(),
+        vec![creature],
+        HashMap::new(),
+        120,
+        model,
+        None,
+    );
     let turn_id = uuid::Uuid::now_v7();
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
 
@@ -83,7 +89,14 @@ async fn kohaku_minimal_turn() {
     };
 
     match provider
-        .start_turn(turn_id, input, policy, context, tx, CancellationToken::new())
+        .start_turn(
+            turn_id,
+            input,
+            policy,
+            context,
+            tx,
+            CancellationToken::new(),
+        )
         .await
     {
         Ok(()) => {

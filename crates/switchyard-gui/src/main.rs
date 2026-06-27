@@ -2265,7 +2265,10 @@ async fn fs_paste_entry(
         resolve_workspace_path(&ws, &dest_dir, repo_root.as_deref())?
     };
     if !dest_parent.is_dir() {
-        return Err(format!("destination is not a folder: {}", dest_parent.display()));
+        return Err(format!(
+            "destination is not a folder: {}",
+            dest_parent.display()
+        ));
     }
     let name = src_path
         .file_name()
