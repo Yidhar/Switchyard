@@ -33,6 +33,11 @@ export const saveConfig = (config: SwitchyardConfig): Promise<void> => {
   return invoke<void>('save_config', { config });
 };
 
+// List KohakuTerrarium model selectors (provider/preset) for the model dropdown.
+export const listKohakuModels = (command?: string): Promise<string[]> => {
+  return invoke<string[]>('list_kohaku_models', { command: command ?? null });
+};
+
 export const runTurn = (
   sessionId: string,
   message: string,

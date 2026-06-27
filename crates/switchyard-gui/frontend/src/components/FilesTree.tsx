@@ -82,17 +82,25 @@ interface FilesTreeProps {
   onOpenFile: (path: string) => void;
   onAddFolder: () => void;
   onRemoveExtraRoot: (root: string) => void;
+  /// Stage a file as a context chip in the chat composer (AI-IDE "Add to Chat").
+  onAddToChat?: (path: string) => void;
 }
 
 /// Top-level Explorer. Unlike the first version, it renders synthetic
 /// root nodes instead of only showing the primary root's children, which
 /// makes workspace scope explicit and allows additional project folders.
+function parentDirOf(p: string): string {
+  const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+  return i >= 0 ? p.slice(0, i) : '';
+}
+
 export const FilesTree: React.FC<FilesTreeProps> = ({
   workspace,
   gitRefreshNonce,
   onOpenFile,
   onAddFolder,
   onRemoveExtraRoot,
+  onAddToChat,
 }) => {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [treeRefreshNonce, setTreeRefreshNonce] = useState(0);
@@ -177,6 +185,20 @@ export const FilesTree: React.FC<FilesTreeProps> = ({
     setTreeRefreshNonce((value) => value + 1);
   };
 
+  // Explorer cut/copy → paste clipboard. Paths are workspace-relative
+  // (same scope as list_dir); the backend `fs_paste_entry` resolves + copies/moves.
+  const [clipboard, setClipboard] = useState<{ path: string; mode: 'copy' | 'cut' } | null>(null);
+  const pasteInto = async (destDir: string) => {
+    if (!clipboard) return;
+    try {
+      await invoke('fs_paste_entry', { src: clipboard.path, destDir, mode: clipboard.mode });
+    } catch (error) {
+      console.error('paste failed', error);
+    }
+    if (clipboard.mode === 'cut') setClipboard(null);
+    refreshTree();
+  };
+
   const showContextMenu = (
     event: React.MouseEvent,
     items: ContextMenuItem[],
@@ -194,6 +216,15 @@ export const FilesTree: React.FC<FilesTreeProps> = ({
         onSelect: onAddFolder,
       },
       { id: 'refresh', label: 'Refresh Explorer', onSelect: refreshTree },
+      ...(clipboard
+        ? [
+            {
+              id: 'paste',
+              label: 'Paste',
+              onSelect: () => pasteInto('.'),
+            } satisfies ContextMenuItem,
+          ]
+        : []),
     ]);
   };
 
@@ -264,6 +295,11 @@ export const FilesTree: React.FC<FilesTreeProps> = ({
             onOpenFile={onOpenFile}
             onAddFolder={onAddFolder}
             onRemoveExtraRoot={onRemoveExtraRoot}
+            onAddToChat={onAddToChat}
+            clipboardActive={clipboard != null}
+            onCut={(p) => setClipboard({ path: p, mode: 'cut' })}
+            onCopy={(p) => setClipboard({ path: p, mode: 'copy' })}
+            onPaste={pasteInto}
             decorations={decorations}
             copyText={copyText}
             showContextMenu={showContextMenu}
@@ -293,6 +329,11 @@ const FilesTreeNode: React.FC<{
   onOpenFile: (path: string) => void;
   onAddFolder: () => void;
   onRemoveExtraRoot: (root: string) => void;
+  onAddToChat?: (path: string) => void;
+  clipboardActive?: boolean;
+  onCut?: (path: string) => void;
+  onCopy?: (path: string) => void;
+  onPaste?: (destDir: string) => void;
   decorations: Map<string, Decoration>;
   copyText: (text: string) => Promise<void>;
   showContextMenu: (event: React.MouseEvent, items: ContextMenuItem[]) => void;
@@ -303,6 +344,11 @@ const FilesTreeNode: React.FC<{
   onOpenFile,
   onAddFolder,
   onRemoveExtraRoot,
+  onAddToChat,
+  clipboardActive,
+  onCut,
+  onCopy,
+  onPaste,
   decorations,
   copyText,
   showContextMenu,
@@ -413,15 +459,31 @@ const FilesTreeNode: React.FC<{
           onSelect: expanded ? collapseNode : expandNode,
         },
         { id: 'refresh', label: 'Refresh', onSelect: refreshNode },
+        { id: 'sep-cut', separator: true },
+        ...(!node.isRoot
+          ? [
+              { id: 'cut', label: 'Cut', onSelect: () => onCut?.(node.path) } satisfies ContextMenuItem,
+              { id: 'copy', label: 'Copy', onSelect: () => onCopy?.(node.path) } satisfies ContextMenuItem,
+            ]
+          : []),
+        ...(clipboardActive
+          ? [
+              {
+                id: 'paste',
+                label: 'Paste',
+                onSelect: () => onPaste?.(node.path),
+              } satisfies ContextMenuItem,
+            ]
+          : []),
         { id: 'sep-open', separator: true },
         {
           id: 'copy-path',
-          label: 'Copy Path',
+          label: 'Copy as Path',
           onSelect: () => copyText(absolutePath),
         },
         {
           id: 'copy-relative-path',
-          label: 'Copy Relative Path',
+          label: 'Copy as Relative Path',
           onSelect: () => copyText(relativePath),
         },
         { id: 'sep-workspace', separator: true },
@@ -442,16 +504,33 @@ const FilesTreeNode: React.FC<{
           : []),
       ]
     : [
+        {
+          id: 'add-to-chat',
+          label: 'Add to Chat',
+          onSelect: () => onAddToChat?.(absolutePath),
+        },
+        { id: 'sep-chat', separator: true },
+        { id: 'cut', label: 'Cut', onSelect: () => onCut?.(node.path) },
+        { id: 'copy', label: 'Copy', onSelect: () => onCopy?.(node.path) },
+        ...(clipboardActive
+          ? [
+              {
+                id: 'paste',
+                label: 'Paste',
+                onSelect: () => onPaste?.(parentDirOf(node.path)),
+              } satisfies ContextMenuItem,
+            ]
+          : []),
         { id: 'open', label: 'Open', onSelect: () => onOpenFile(node.path) },
         { id: 'sep-open', separator: true },
         {
           id: 'copy-path',
-          label: 'Copy Path',
+          label: 'Copy as Path',
           onSelect: () => copyText(absolutePath),
         },
         {
           id: 'copy-relative-path',
-          label: 'Copy Relative Path',
+          label: 'Copy as Relative Path',
           onSelect: () => copyText(relativePath),
         },
       ];
@@ -569,6 +648,11 @@ const FilesTreeNode: React.FC<{
               onOpenFile={onOpenFile}
               onAddFolder={onAddFolder}
               onRemoveExtraRoot={onRemoveExtraRoot}
+              onAddToChat={onAddToChat}
+              clipboardActive={clipboardActive}
+              onCut={onCut}
+              onCopy={onCopy}
+              onPaste={onPaste}
               decorations={decorations}
               copyText={copyText}
               showContextMenu={showContextMenu}

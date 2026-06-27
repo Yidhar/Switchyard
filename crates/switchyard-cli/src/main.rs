@@ -92,6 +92,13 @@ enum Commands {
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },
+    /// Launch the Switchyard desktop GUI app (spawns the `switchyard-gui`
+    /// binary located next to this executable).
+    App {
+        /// Extra arguments forwarded to the GUI executable.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Validate configuration and check provider availability.
     Check {
         /// Output machine-readable JSON report after probes complete.
@@ -267,6 +274,9 @@ enum HookCli {
 }
 
 /// Known CLI command names for auto-discovery.
+// `kt` is intentionally absent: the KohakuTerrarium provider is registered as
+// `kohaku` (command `kt`), so it already appears via the registry. Listing the
+// bare `kt` here would add a confusing "adapter not implemented" duplicate.
 const KNOWN_CLIS: &[&str] = &["codex", "claude", "gemini", "agy"];
 
 #[derive(Clone, Serialize)]
@@ -429,6 +439,15 @@ async fn main() {
                 process::exit(1);
             }
         }
+        Commands::App { args } => match launch_gui(&args) {
+            Ok(path) => {
+                println!("launched Switchyard GUI: {}", path.display());
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        },
         Commands::Check { json } => {
             let config_issues = config.validate();
 
@@ -755,4 +774,54 @@ async fn main() {
             }
         }
     }
+}
+
+/// Launch the Switchyard desktop GUI by spawning the `switchyard-gui`
+/// executable. Searched in order: next to the running `switchyard` binary
+/// (packaged install / same target dir), then `<cwd>/target/{release,debug}`
+/// (source checkout — `switchyard` may be installed in ~/.cargo/bin while the
+/// GUI lives in the repo target dir), then PATH. Spawns detached so the
+/// terminal is freed; returns the launched path.
+fn launch_gui(extra: &[String]) -> Result<PathBuf, String> {
+    const NAMES: [&str; 2] = ["switchyard-gui.exe", "switchyard-gui"];
+
+    let exe = std::env::current_exe().map_err(|e| format!("cannot resolve current exe: {e}"))?;
+    let exe_dir = exe
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for n in NAMES {
+        candidates.push(exe_dir.join(n));
+    }
+    for profile in ["release", "debug"] {
+        for n in NAMES {
+            candidates.push(cwd.join("target").join(profile).join(n));
+        }
+    }
+
+    let gui = candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .or_else(|| find_on_path("switchyard-gui").map(PathBuf::from));
+
+    let Some(gui) = gui else {
+        return Err(format!(
+            "switchyard-gui not found (looked next to {}, under {}\\target\\{{release,debug}}, \
+             and on PATH).\n\
+             Build it with `cargo build -p switchyard-gui` (and \
+             `npm --prefix crates/switchyard-gui/frontend run build` so the bundled \
+             frontend exists), or use `.\\start-gui.ps1` for a dev run.",
+            exe_dir.display(),
+            cwd.display()
+        ));
+    };
+
+    process::Command::new(&gui)
+        .args(extra)
+        .spawn()
+        .map_err(|e| format!("failed to spawn {}: {e}", gui.display()))?;
+    Ok(gui)
 }

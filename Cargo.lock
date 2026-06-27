@@ -3595,6 +3595,7 @@ dependencies = [
  "switchyard-provider-claude",
  "switchyard-provider-codex",
  "switchyard-provider-gemini",
+ "switchyard-provider-kohaku",
 ]
 
 [[package]]
@@ -3690,6 +3691,7 @@ dependencies = [
  "filetime",
  "notify",
  "portable-pty",
+ "regex",
  "serde",
  "serde_json",
  "switchyard-app-providers",
@@ -3818,6 +3820,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchyard-provider-kohaku"
+version = "0.1.3"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "switchyard-config",
+ "switchyard-provider-api",
+ "switchyard-provider-subprocess",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "switchyard-provider-subprocess"
 version = "0.1.3"
 dependencies = [
@@ -3896,6 +3912,7 @@ dependencies = [
  "switchyard-provider-claude",
  "switchyard-provider-codex",
  "switchyard-provider-gemini",
+ "switchyard-provider-kohaku",
  "switchyard-provider-subprocess",
  "switchyard-runtime",
  "switchyard-session",

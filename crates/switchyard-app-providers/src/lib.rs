@@ -11,9 +11,11 @@ use switchyard_provider_api::Provider;
 use switchyard_provider_claude::ClaudeProvider;
 use switchyard_provider_codex::CodexProvider;
 use switchyard_provider_gemini::GeminiProvider;
+use switchyard_provider_kohaku::KohakuProvider;
 
 /// Built-in provider aliases exposed even when the local config omits them.
-pub const BUILT_IN_PROVIDER_ALIASES: &[&str] = &["codex", "claude", "gemini", "antigravity"];
+pub const BUILT_IN_PROVIDER_ALIASES: &[&str] =
+    &["codex", "claude", "gemini", "antigravity", "kohaku"];
 
 /// Default timeout for built-in provider fallbacks.
 ///
@@ -58,6 +60,8 @@ pub fn inferred_provider_backend(name: &str) -> Option<&'static str> {
         Some("antigravity")
     } else if name.contains("gemini") {
         Some("gemini")
+    } else if name.contains("kohaku") {
+        Some("kohaku")
     } else {
         None
     }
@@ -70,6 +74,7 @@ pub fn default_provider_command(backend: &str) -> String {
         "claude" => "claude".to_string(),
         "gemini" => "gemini".to_string(),
         "antigravity" => "agy".to_string(),
+        "kohaku" => "kt".to_string(),
         other => other.to_string(),
     }
 }
@@ -81,9 +86,17 @@ pub fn default_provider_config(provider_id: &str) -> ProviderConfig {
 }
 
 fn default_provider_config_for_backend(backend: &str) -> ProviderConfig {
+    // KohakuTerrarium needs a creature as args[0]; default to the official
+    // `general` creature from the kt-biome pack (`kt install @kt-biome`) so
+    // kohaku works out of the box instead of erroring on an empty creature.
+    let args = if backend == "kohaku" {
+        vec!["@kt-biome/creatures/general".to_string()]
+    } else {
+        Vec::new()
+    };
     ProviderConfig {
         command: default_provider_command(backend),
-        args: Vec::new(),
+        args,
         env: std::collections::HashMap::new(),
         model: None,
         thinking_level: None,
@@ -150,6 +163,19 @@ fn register_provider_backend(
                 p
             }),
         ),
+        "kohaku" => registry.register(
+            name,
+            Box::new(|cfg| {
+                let p: Box<dyn Provider> = match cfg {
+                    Some(c) => Box::new(KohakuProvider::from_config(c)),
+                    None => {
+                        let c = default_provider_config_for_backend("kohaku");
+                        Box::new(KohakuProvider::from_config(&c))
+                    }
+                };
+                p
+            }),
+        ),
         _ => {}
     }
 }
@@ -161,6 +187,7 @@ mod tests {
     use switchyard_provider_claude::ClaudeProvider;
     use switchyard_provider_codex::CodexProvider;
     use switchyard_provider_gemini::GeminiProvider;
+    use switchyard_provider_kohaku::KohakuProvider;
 
     #[test]
     fn built_in_fallback_configs_have_no_hard_timeout() {
@@ -176,11 +203,13 @@ mod tests {
         let claude = ClaudeProvider::from_config(&default_provider_config("claude"));
         let gemini = GeminiProvider::from_config(&default_provider_config("gemini"));
         let antigravity = AntigravityProvider::from_config(&default_provider_config("antigravity"));
+        let kohaku = KohakuProvider::from_config(&default_provider_config("kohaku"));
 
         assert_eq!(codex.timeout_secs, 0);
         assert_eq!(claude.timeout_secs, 0);
         assert_eq!(gemini.timeout_secs, 0);
         assert_eq!(antigravity.timeout_secs, 0);
+        assert_eq!(kohaku.timeout_secs, 0);
     }
 
     #[test]
@@ -198,6 +227,7 @@ mod tests {
         assert_eq!(inferred_provider_backend("CLAUDE"), Some("claude"));
         assert_eq!(inferred_provider_backend("agy"), Some("antigravity"));
         assert_eq!(inferred_provider_backend("google-gemini"), Some("gemini"));
+        assert_eq!(inferred_provider_backend("kohaku"), Some("kohaku"));
         assert_eq!(inferred_provider_backend("unknown"), None);
     }
 }

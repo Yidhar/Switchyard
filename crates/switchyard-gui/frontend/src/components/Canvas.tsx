@@ -60,6 +60,9 @@ export interface CanvasTab {
   /// Revert/Dismiss controls. Set by the TurnCompleted-driven artifact
   /// intake in App.tsx.
   ai_before_content: string | null;
+  /// 1-based line to scroll to + select on open (e.g. from a search hit).
+  /// Transient — bumped each time a "go to match" requests this file.
+  gotoLine?: number | null;
 }
 
 interface CanvasProps {
@@ -523,6 +526,7 @@ const CanvasBody: React.FC<{
       key={tab.id}
       tabId={tab.id}
       value={value}
+      gotoLine={tab.gotoLine}
       languageExtensions={languageExtensions}
       onDraftChange={onDraftChange}
     />
@@ -574,6 +578,7 @@ const vscodeEditorTheme = EditorView.theme({
 interface CanvasEditorProps {
   tabId: string;
   value: string;
+  gotoLine?: number | null;
   languageExtensions: Extension[];
   onDraftChange: (tabId: string, draft: string) => void;
 }
@@ -581,6 +586,7 @@ interface CanvasEditorProps {
 const CanvasEditor: React.FC<CanvasEditorProps> = ({
   tabId,
   value,
+  gotoLine,
   languageExtensions,
   onDraftChange,
 }) => {
@@ -652,6 +658,22 @@ const CanvasEditor: React.FC<CanvasEditorProps> = ({
   useEffect(() => {
     scheduleEditorStateRead();
   }, [scheduleEditorStateRead, value]);
+
+  // Jump to a requested line (search "go to match"): scroll it to center +
+  // place the cursor there. Re-runs on `value` so it still fires once the
+  // file content finishes loading after the tab opens.
+  useEffect(() => {
+    if (gotoLine == null || gotoLine < 1) return;
+    const view = viewRef.current;
+    if (!view) return;
+    const ln = Math.min(gotoLine, view.state.doc.lines);
+    const info = view.state.doc.line(ln);
+    view.dispatch({
+      selection: { anchor: info.from },
+      effects: EditorView.scrollIntoView(info.from, { y: 'center' }),
+    });
+    view.focus();
+  }, [gotoLine, value]);
 
   useEffect(() => {
     return () => {

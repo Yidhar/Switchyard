@@ -38,6 +38,20 @@ backend = "claude"
 
 [providers.claude.env]
 
+[providers.kohaku]
+# KohakuTerrarium. Requires a `kt` with headless support (switchyard-headless
+# fork) and an installed creature pack (`kt install @kt-biome`).
+# args[0] MUST be a creature ref (a config-folder path or `@pkg/creatures/<name>`);
+# the adapter appends `--headless --json -p <prompt>`.
+command = "kt"
+args = ["@kt-biome/creatures/general"]
+# Maps to `kt --llm <selector>`. Leave empty to use the creature's own model.
+model = "enzi/gpt-5.5-custom"
+timeout_secs = 0
+backend = "kohaku"
+
+[providers.kohaku.env]
+
 [sandbox]
 mode = "danger-full-access"
 allowed_paths = []

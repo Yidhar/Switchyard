@@ -20,6 +20,7 @@ members = [
     "crates/switchyard-provider-claude",
     "crates/switchyard-provider-gemini",
     "crates/switchyard-provider-antigravity",
+    "crates/switchyard-provider-kohaku",
     "crates/switchyard-gui",
     "tests",
 ]
@@ -51,6 +52,7 @@ switchyard-provider-codex = { path = "crates/switchyard-provider-codex" }
 switchyard-provider-claude = { path = "crates/switchyard-provider-claude" }
 switchyard-provider-gemini = { path = "crates/switchyard-provider-gemini" }
 switchyard-provider-antigravity = { path = "crates/switchyard-provider-antigravity" }
+switchyard-provider-kohaku = { path = "crates/switchyard-provider-kohaku" }
 
 # External dependencies
 tokio = { version = "1", features = ["full"] }

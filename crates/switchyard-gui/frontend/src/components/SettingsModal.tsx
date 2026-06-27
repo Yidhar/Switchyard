@@ -1,7 +1,14 @@
 import React from 'react';
 import { X, Plus, Trash } from 'lucide-react';
 import type { SwitchyardConfig, ProviderConfig } from '../types';
-import { THINKING_LEVEL_OPTIONS, providerCliMapping } from '../providerCliCapabilities';
+import {
+  THINKING_LEVEL_OPTIONS,
+  providerCliMapping,
+  BUILTIN_PROVIDER_NAMES,
+  defaultProviderConfigFor,
+  inferProviderBackend,
+} from '../providerCliCapabilities';
+import { listKohakuModels } from '../services/api';
 
 interface SettingsModalProps {
   config: SwitchyardConfig;
@@ -30,6 +37,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onRemoveEnvVar,
   onDeleteProvider,
 }) => {
+  // Built-in providers are always offered (even when absent from the active
+  // workspace's switchyard.toml), so kohaku/codex/claude/... are configurable
+  // out of the box. Editing one seeds a complete default entry (see
+  // handleProviderFieldChange / addEnvVar in App.tsx).
+  const providerNames = Array.from(
+    new Set([...Object.keys(config.providers || {}), ...BUILTIN_PROVIDER_NAMES]),
+  );
+
+  // KohakuTerrarium model selectors are listed dynamically from `kt model
+  // list` (the user's configured llm profiles), like KT's own app.
+  const [kohakuModels, setKohakuModels] = React.useState<string[]>([]);
+  React.useEffect(() => {
+    const prov = config.providers[settingsTab] || defaultProviderConfigFor(settingsTab);
+    if (inferProviderBackend(settingsTab, prov.backend) === 'kohaku') {
+      listKohakuModels(prov.command || 'kt')
+        .then(setKohakuModels)
+        .catch(() => setKohakuModels([]));
+    } else {
+      setKohakuModels([]);
+    }
+  }, [settingsTab, config]);
+
   return (
     <div className="settings-overlay">
       <div className="settings-modal glass-panel">
@@ -51,7 +80,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </button>
               
               {/* Dynamic tabs for configured providers */}
-              {Object.keys(config.providers || {}).map((pName) => (
+              {providerNames.map((pName) => (
                 <button 
                   key={pName}
                   className={`settings-tab-btn ${settingsTab === pName ? 'active' : ''}`}
@@ -93,7 +122,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     value={config.core.default_provider}
                     onChange={(e) => onFieldChange('core', 'default_provider', e.target.value)}
                   >
-                    {Object.keys(config.providers || {}).map((pName) => (
+                    {providerNames.map((pName) => (
                       <option key={pName} value={pName}>{pName}</option>
                     ))}
                   </select>
@@ -102,7 +131,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div className="settings-form-group">
                   <label>Default Peers</label>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '4px' }}>
-                    {Object.keys(config.providers || {}).map((peer) => (
+                    {providerNames.map((peer) => (
                       <label key={peer} style={{ display: 'flex', alignItems: 'center', gap: '8px', textTransform: 'none', fontSize: '13px' }}>
                         <input 
                           type="checkbox"
@@ -125,17 +154,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </>
             )}
 
-            {Object.keys(config.providers || {}).includes(settingsTab) && (() => {
+            {providerNames.includes(settingsTab) && (() => {
               const pName = settingsTab;
-              const prov = config.providers[pName] || {
-                command: '',
-                args: [],
-                env: {},
-                model: null,
-                thinking_level: null,
-                timeout_secs: 0,
-                backend: null,
-              };
+              const prov = config.providers[pName] || defaultProviderConfigFor(pName);
               const cliMapping = providerCliMapping(pName, prov.backend);
               return (
                 <>
@@ -151,6 +172,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <option value="claude">Claude Factory</option>
                       <option value="gemini">Gemini Factory</option>
                       <option value="antigravity">Antigravity Factory</option>
+                      <option value="kohaku">KohakuTerrarium Factory</option>
                     </select>
                   </div>
 
@@ -194,20 +216,48 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                   </div>
 
-                  <div className="settings-form-group">
-                    <label>Default Model</label>
-                    <input
-                      type="text"
-                      className="settings-input settings-input-mono"
-                      value={prov.model ?? ''}
-                      placeholder={
-                        cliMapping.modelMapped
-                          ? 'e.g. gpt-5-codex, claude-sonnet-4-5, gemini-2.5-pro'
-                          : 'Stored only; this backend does not map it to a stable CLI flag'
-                      }
-                      onChange={(e) => onProviderFieldChange(pName, 'model', e.target.value || null)}
-                    />
-                  </div>
+                  {(() => {
+                    // kohaku pulls kt's live model table; other backends have
+                    // no machine-readable model list, so free text (no stale
+                    // hardcoded suggestions).
+                    const modelOptions =
+                      cliMapping.backend === 'kohaku' ? kohakuModels : [];
+                    const listId = `model-options-${pName}`;
+                    return (
+                      <div className="settings-form-group">
+                        <label>Default Model</label>
+                        <input
+                          type="text"
+                          list={modelOptions.length > 0 ? listId : undefined}
+                          className="settings-input settings-input-mono"
+                          value={prov.model ?? ''}
+                          placeholder={
+                            cliMapping.backend === 'kohaku'
+                              ? 'Pick a kt profile (provider/preset) or type one, e.g. enzi/gpt-5.5-custom'
+                              : cliMapping.modelMapped
+                                ? 'Pick or type, e.g. gpt-5-codex, claude-sonnet-4-5, gemini-2.5-pro'
+                                : 'Stored only; this backend does not map it to a stable CLI flag'
+                          }
+                          onChange={(e) =>
+                            onProviderFieldChange(pName, 'model', e.target.value || null)
+                          }
+                        />
+                        {modelOptions.length > 0 && (
+                          <datalist id={listId}>
+                            {modelOptions.map((m) => (
+                              <option key={m} value={m} />
+                            ))}
+                          </datalist>
+                        )}
+                        {cliMapping.backend === 'kohaku' && kohakuModels.length === 0 && (
+                          <div style={{ color: 'var(--text-muted)', fontSize: '12px', marginTop: '4px' }}>
+                            No kt profiles found. Add one with `kt config key set &lt;provider&gt;` /
+                            `kt login &lt;provider&gt;`, then reopen settings.
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
 
                   <div className="settings-form-group">
                     <label>Default Thinking / Reasoning Level</label>
