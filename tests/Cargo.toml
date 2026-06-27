@@ -12,6 +12,12 @@ path = "../crates/switchyard-cli/src/main.rs"
 name = "switchyard-tui"
 path = "../crates/switchyard-tui/src/main.rs"
 
+# Fake `kt` for the deterministic KohakuTerrarium provider integration test
+# (kohaku_integration.rs locates it via CARGO_BIN_EXE_fake_kt).
+[[bin]]
+name = "fake_kt"
+path = "bin/fake_kt.rs"
+
 [dependencies]
 switchyard-app-providers = { workspace = true }
 switchyard-core = { workspace = true }
@@ -25,6 +31,7 @@ switchyard-provider-claude = { workspace = true }
 switchyard-provider-codex = { workspace = true }
 switchyard-provider-gemini = { workspace = true }
 switchyard-provider-antigravity = { workspace = true }
+switchyard-provider-kohaku = { workspace = true }
 switchyard-cli = { workspace = true }
 switchyard-tui = { workspace = true }
 switchyard-host-jobs = { workspace = true }

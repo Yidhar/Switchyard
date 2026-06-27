@@ -453,6 +453,15 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The global (user-level) config path: `~/.switchyard/switchyard.toml`.
+///
+/// This is the app's own config home, used when no workspace is open so
+/// global settings can be saved/loaded without a project. [`SwitchyardConfig::resolve`]
+/// already falls back to reading this file.
+pub fn global_config_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(DOT_DIR).join(CONFIG_FILENAME))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

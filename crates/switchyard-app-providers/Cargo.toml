@@ -13,3 +13,4 @@ switchyard-provider-codex = { workspace = true }
 switchyard-provider-claude = { workspace = true }
 switchyard-provider-gemini = { workspace = true }
 switchyard-provider-antigravity = { workspace = true }
+switchyard-provider-kohaku = { workspace = true }
