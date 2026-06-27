@@ -1614,6 +1614,26 @@ fn update_workspace(
     Ok(updated)
 }
 
+/// Record the core provider last used in a workspace so reopening it restores
+/// the same default. Persisted in workspaces.json; does not bump `updated_at`
+/// (a provider switch shouldn't reorder the recents list).
+#[tauri::command]
+fn set_workspace_core(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    workspace_id: String,
+    provider: String,
+) -> Result<(), String> {
+    let id =
+        uuid::Uuid::parse_str(&workspace_id).map_err(|e| format!("invalid workspace ID: {}", e))?;
+    workspace_state.mutate(|idx| {
+        let ws = idx
+            .get_mut(id)
+            .ok_or_else(|| format!("workspace {id} not found"))?;
+        ws.core_provider = Some(provider.clone()).filter(|p| !p.trim().is_empty());
+        Ok(())
+    })
+}
+
 #[tauri::command]
 fn delete_workspace(
     app: tauri::AppHandle,
@@ -5096,6 +5116,7 @@ fn main() {
             clear_current_workspace,
             create_workspace,
             update_workspace,
+            set_workspace_core,
             delete_workspace,
             // Filesystem (workspace-scoped)
             read_file,

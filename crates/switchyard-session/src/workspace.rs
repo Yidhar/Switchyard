@@ -34,6 +34,10 @@ pub struct Workspace {
     /// not a CLI argument.
     #[serde(default)]
     pub extra_roots: Vec<PathBuf>,
+    /// The core provider (session backend) last used in this workspace, so
+    /// reopening it restores the same default. `None` until first set.
+    #[serde(default)]
+    pub core_provider: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -54,6 +58,7 @@ impl Workspace {
             name,
             primary_root,
             extra_roots: Vec::new(),
+            core_provider: None,
             created_at: now,
             updated_at: now,
         }

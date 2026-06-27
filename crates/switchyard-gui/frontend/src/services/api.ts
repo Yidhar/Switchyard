@@ -38,6 +38,11 @@ export const listKohakuModels = (command?: string): Promise<string[]> => {
   return invoke<string[]>('list_kohaku_models', { command: command ?? null });
 };
 
+// Record the core provider last used in a workspace (restored on reopen).
+export const setWorkspaceCore = (workspaceId: string, provider: string): Promise<void> => {
+  return invoke<void>('set_workspace_core', { workspaceId, provider });
+};
+
 export const runTurn = (
   sessionId: string,
   message: string,

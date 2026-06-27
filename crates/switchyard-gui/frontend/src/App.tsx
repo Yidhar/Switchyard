@@ -2377,6 +2377,7 @@ function App() {
       setWorkspaces(list);
       const current = await invoke<Workspace | null>('get_current_workspace');
       setCurrentWorkspace(current);
+      if (current?.core_provider) setNewSessionProvider(current.core_provider);
       return current;
     } catch (e) {
       console.error('Failed to load workspaces:', e);
@@ -2390,6 +2391,8 @@ function App() {
     try {
       const next = await invoke<Workspace>('set_current_workspace', { workspaceId });
       setCurrentWorkspace(next);
+      // Restore the core provider this workspace last used (or default).
+      setNewSessionProvider(next.core_provider ?? 'codex');
       // Wipe per-workspace UI state — sessions, turns, events all belong
       // to the previous workspace and would be confusing if left visible.
       resetWorkspaceScopedUi();
@@ -2399,6 +2402,20 @@ function App() {
     } catch (e) {
       console.error('Failed to switch workspace:', e);
       alert('Failed to switch workspace: ' + e);
+    }
+  };
+
+  // Selecting a core provider persists it on the active workspace so reopening
+  // the workspace restores the same core.
+  const handleSelectCoreProvider = (provider: string) => {
+    setNewSessionProvider(provider);
+    const ws = currentWorkspace;
+    if (ws && ws.core_provider !== provider) {
+      setCurrentWorkspace({ ...ws, core_provider: provider });
+      void invoke('set_workspace_core', {
+        workspaceId: ws.workspace_id,
+        provider,
+      }).catch((e) => console.error('failed to persist workspace core', e));
     }
   };
 
@@ -5731,7 +5748,7 @@ function App() {
             selectedSession={selectedSession}
             config={config}
             newSessionProvider={newSessionProvider}
-            setNewSessionProvider={setNewSessionProvider}
+            setNewSessionProvider={handleSelectCoreProvider}
             onCreateSession={createNewSession}
             onSelectSession={selectSession}
             onDeleteSession={handleDeleteSession}
