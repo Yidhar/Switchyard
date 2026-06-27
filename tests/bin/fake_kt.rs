@@ -7,6 +7,9 @@
 //!
 //! Behaviour switches:
 //! - `FAKE_KT_FAIL=1` → emit a failed `turn_end` and exit 1.
+//! - `FAKE_KT_SENTINEL=1` → emit a SWITCHYARD sentinel block split across two
+//!   `text` deltas (marker broken mid-string) to exercise the adapter's
+//!   display gating.
 
 use std::io::Write;
 
@@ -54,6 +57,22 @@ fn main() {
 
     let echo = format!("echo: {prompt}");
     emit(&mut out, serde_json::json!({"type":"text","content": echo}));
+
+    // Optionally stream a routing sentinel block fragmented across two `text`
+    // deltas (the BEGIN marker is split mid-string). The adapter must withhold
+    // the whole block from the chat display while still accumulating it for the
+    // router.
+    if std::env::var("FAKE_KT_SENTINEL").is_ok() {
+        emit(
+            &mut out,
+            serde_json::json!({"type":"text","content":" Plan: <<<SWITCHYARD_JSON"}),
+        );
+        emit(
+            &mut out,
+            serde_json::json!({"type":"text","content":"_BEGIN>>>{\"type\":\"note\"}<<<SWITCHYARD_JSON_END>>> done"}),
+        );
+    }
+
     emit(
         &mut out,
         serde_json::json!({"type":"activity","activity_type":"tool_start","detail":"read","metadata":{"name":"read","args":{"path":"x"}}}),

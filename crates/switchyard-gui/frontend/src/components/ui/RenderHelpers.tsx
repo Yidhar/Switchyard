@@ -552,6 +552,15 @@ export function renderMessageBody(
     }
   }
 
+  // Defense-in-depth: a sentinel is a routing/control artifact and must never
+  // appear in the bubble, even when it isn't a recognized delegate or arrives
+  // in fragments mid-stream. Strip every complete block, then drop an unclosed
+  // trailing block (a dangling BEGIN with no END yet). Mirrors the Rust
+  // strip_sentinel_blocks semantics.
+  remainingText = remainingText
+    .replace(/<<<SWITCHYARD_JSON_BEGIN>>>[\s\S]*?<<<SWITCHYARD_JSON_END>>>/g, '')
+    .replace(/<<<SWITCHYARD_JSON_BEGIN>>>[\s\S]*$/, '');
+
   if (!remainingText.trim() && !delegateCard) return null;
 
   // Split by code blocks first

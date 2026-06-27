@@ -9,6 +9,7 @@
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use switchyard_provider_api::sentinel::{SENTINEL_BEGIN, SENTINEL_END};
 use switchyard_provider_api::*;
 use switchyard_provider_subprocess::{
     StreamingOutputLine, SubprocessConfig, build_subprocess_invocation_plan, build_turn_result,
@@ -102,93 +103,263 @@ pub async fn run_kohaku_turn(
 
     let event_tx_clone = event_tx.clone();
     let consumer = tokio::spawn(async move {
-        // `assistant_message` accumulates streamed `text` deltas (the primary
-        // response body). `final_text` is the consolidated `turn_end.text`,
-        // used only when no deltas arrived (e.g. a tool-only turn).
+        // `assistant_message` accumulates the FULL streamed body — including any
+        // routing sentinel block, plus a consolidated `turn_end.text` on the
+        // no-delta path — and is what the router parses for delegation (it
+        // strips the block for the final display). `display` gates what reaches
+        // the chat bubble so a sentinel never flickers into view while
+        // streaming. `turn_error` captures a structured failure so we surface
+        // the reason instead of dumping the raw JSONL as the response body.
         let mut assistant_message = String::new();
-        let mut final_text: Option<String> = None;
+        let mut turn_error: Option<String> = None;
+        let mut display = SentinelDisplayFilter::new();
         while let Some(output_line) = line_rx.recv().await {
             let line = output_line.text;
             let protocol_line = line.trim_end_matches(['\r', '\n']);
-            event_tx_clone
-                .send(ProviderEvent::terminal_output(
-                    turn_id,
-                    "kohaku",
-                    &line,
-                    Some("merged"),
-                    Some(output_line.transport.as_str()),
-                ))
-                .await
-                .ok();
             if protocol_line.is_empty() {
                 continue;
             }
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(protocol_line) {
-                match classify(&json) {
-                    KohakuEvent::Text(text) if !text.is_empty() => {
-                        assistant_message.push_str(&text);
+
+            // `kt --json` stdout is pure machine protocol, one JSON object per
+            // line. Mirroring it to the terminal channel would replay the whole
+            // protocol into the live-execution card (runtime-detail flood), so
+            // only genuine NON-JSON stdout is surfaced as terminal output.
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(protocol_line) else {
+                event_tx_clone
+                    .send(ProviderEvent::terminal_output(
+                        turn_id,
+                        "kohaku",
+                        &line,
+                        Some("merged"),
+                        Some(output_line.transport.as_str()),
+                    ))
+                    .await
+                    .ok();
+                continue;
+            };
+
+            match classify(&json) {
+                KohakuEvent::Text(text) if !text.is_empty() => {
+                    assistant_message.push_str(&text);
+                    let revealed = display.push(&text);
+                    if !revealed.is_empty() {
                         event_tx_clone
-                            .send(ProviderEvent::text_message(turn_id, "kohaku", &text))
+                            .send(ProviderEvent::text_message(turn_id, "kohaku", &revealed))
                             .await
                             .ok();
                     }
-                    KohakuEvent::TurnEnd { text, .. } => {
-                        if final_text.is_none() && !text.is_empty() {
-                            final_text = Some(text);
+                }
+                KohakuEvent::TurnEnd {
+                    status,
+                    text,
+                    error,
+                } => {
+                    if status == "error" {
+                        if turn_error.is_none() {
+                            turn_error = error
+                                .filter(|e| !e.trim().is_empty())
+                                .or_else(|| (!text.trim().is_empty()).then(|| text.clone()))
+                                .or_else(|| Some("kohaku: turn ended with error".to_string()));
+                        }
+                    } else if assistant_message.is_empty() && !text.is_empty() {
+                        // No `text` deltas arrived — the body was delivered
+                        // consolidated in `turn_end.text`. Stream it now (gated)
+                        // so the bubble fills live instead of only appearing
+                        // after finalize + DB refresh.
+                        assistant_message.push_str(&text);
+                        let revealed = display.push(&text);
+                        if !revealed.is_empty() {
+                            event_tx_clone
+                                .send(ProviderEvent::text_message(turn_id, "kohaku", &revealed))
+                                .await
+                                .ok();
                         }
                     }
-                    _ => {}
                 }
-
-                // Pass the raw JSON through for the diagnostics drawer and any
-                // downstream observability (tool/subagent activity, usage).
-                event_tx_clone
-                    .send(ProviderEvent::new(
-                        turn_id,
-                        EventType::ItemUpdated,
-                        "kohaku",
-                        json,
-                    ))
-                    .await
-                    .ok();
-            } else if !protocol_line.trim().is_empty() {
-                // Non-JSON line — surface as text so unexpected output is
-                // visible when debugging.
-                event_tx_clone
-                    .send(ProviderEvent::text_message(
-                        turn_id,
-                        "kohaku",
-                        protocol_line,
-                    ))
-                    .await
-                    .ok();
+                KohakuEvent::Error(message) => {
+                    if turn_error.is_none() && !message.is_empty() {
+                        turn_error = Some(message);
+                    }
+                }
+                KohakuEvent::Activity {
+                    activity_type,
+                    value,
+                } => {
+                    // Translate genuine tool/subagent calls into the shared
+                    // normalized vocabulary so they render as clean, collapsed
+                    // tool cards (matching codex/claude). Pure KT runtime
+                    // telemetry (processing_*, token_usage, session_info,
+                    // compact_*, …) is backend noise and is dropped so the chat
+                    // shows only the model's message.
+                    if let Some(item) = normalize_tool_activity(&activity_type, &value) {
+                        event_tx_clone
+                            .send(ProviderEvent::new(
+                                turn_id,
+                                EventType::ItemUpdated,
+                                "kohaku",
+                                item,
+                            ))
+                            .await
+                            .ok();
+                    }
+                }
+                // Empty text, turn_start, and unrecognized lines carry no
+                // user-facing signal — drop them from the chat stream.
+                KohakuEvent::Text(_) | KohakuEvent::TurnStart | KohakuEvent::Other => {}
             }
         }
-        if assistant_message.is_empty() {
-            final_text.unwrap_or_default()
-        } else {
-            assistant_message
+        ConsumerResult {
+            assistant_message,
+            turn_error,
         }
     });
 
     let result = run_subprocess_streaming(&config, &line_tx, cancel).await;
     drop(line_tx);
-    let streamed_text = consumer.await.unwrap_or_default();
+    let consumed = consumer.await.unwrap_or_default();
 
     let output = match result {
         Ok(o) => o,
         Err(e) => return Err(handle_subprocess_error(e, turn_id, "kohaku", event_tx).await),
     };
 
+    // `emit_completion_event` derives the lifecycle from the exit code — kt
+    // exits non-zero on a turn error, so a failure already surfaces a
+    // `turn_failed` event (don't double-emit one here).
     emit_completion_event(&output, turn_id, "kohaku", event_tx).await;
 
-    let response_text = if streamed_text.is_empty() {
-        output.stdout.trim().to_string()
-    } else {
-        streamed_text
+    // Use the full streamed assistant body (the router strips any sentinel for
+    // display). On failure, surface the structured error message so the reason
+    // isn't lost — appended after any partial prose, never replacing the raw
+    // JSONL protocol dump.
+    let response_text = match consumed.turn_error {
+        Some(error) if consumed.assistant_message.trim().is_empty() => error,
+        Some(error) => format!(
+            "{}\n\n[KohakuTerrarium 错误] {error}",
+            consumed.assistant_message.trim_end()
+        ),
+        None => consumed.assistant_message,
     };
 
     Ok(build_turn_result(response_text, &output, "kohaku"))
+}
+
+/// Accumulated outcome of the JSONL consumer task.
+#[derive(Default)]
+struct ConsumerResult {
+    /// Full streamed assistant body (including any routing sentinel block, and
+    /// any consolidated `turn_end.text` for the no-delta path).
+    assistant_message: String,
+    /// Structured failure message (`turn_end` error or a top-level `error`).
+    turn_error: Option<String>,
+}
+
+/// Gates the chat display channel so a routing sentinel block never streams into
+/// the bubble. Deltas are accumulated; each `push` returns only the
+/// sentinel-safe text that has not yet been shown. The caller keeps the full
+/// (ungated) text separately for routing.
+#[derive(Default)]
+struct SentinelDisplayFilter {
+    buf: String,
+    shown: usize,
+}
+
+impl SentinelDisplayFilter {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append `delta`; return the newly-revealed sentinel-safe text, if any.
+    fn push(&mut self, delta: &str) -> String {
+        self.buf.push_str(delta);
+        let safe = sentinel_safe_display(&self.buf);
+        if safe.len() > self.shown {
+            let revealed = safe[self.shown..].to_string();
+            self.shown = safe.len();
+            revealed
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// The portion of `text` that is safe to display now: prose outside any
+/// complete sentinel block, withholding a pending (unclosed) block and any
+/// trailing fragment that could be the start of a `BEGIN` marker. The returned
+/// prefix grows monotonically as more deltas arrive.
+fn sentinel_safe_display(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    loop {
+        match text[cursor..].find(SENTINEL_BEGIN) {
+            Some(rel) => {
+                let begin = cursor + rel;
+                out.push_str(&text[cursor..begin]);
+                let after = begin + SENTINEL_BEGIN.len();
+                match text[after..].find(SENTINEL_END) {
+                    Some(rel_end) => cursor = after + rel_end + SENTINEL_END.len(),
+                    // Pending block — withhold everything from the marker on.
+                    None => return out,
+                }
+            }
+            None => {
+                let tail = &text[cursor..];
+                let keep = tail.len() - partial_begin_suffix_len(tail);
+                out.push_str(&tail[..keep]);
+                return out;
+            }
+        }
+    }
+}
+
+/// Length of the longest suffix of `tail` that is a proper prefix of the
+/// `BEGIN` marker, so a marker split across deltas is withheld until complete.
+fn partial_begin_suffix_len(tail: &str) -> usize {
+    let begin = SENTINEL_BEGIN.as_bytes();
+    let bytes = tail.as_bytes();
+    let max = (begin.len() - 1).min(bytes.len());
+    (1..=max)
+        .rev()
+        .find(|&k| bytes[bytes.len() - k..] == begin[..k])
+        .unwrap_or(0)
+}
+
+/// Map a KohakuTerrarium `activity` event onto Switchyard's normalized item
+/// vocabulary, or `None` if it is backend runtime *telemetry* that should not
+/// reach the chat. Only genuine tool/subagent calls are surfaced (as
+/// collapsed `tool_call` cards, matching codex/claude); a `*_start` becomes a
+/// running card that the frontend merges with its later `*_done`/`*_error` (by
+/// name) into one transitioning card. Pure telemetry (processing_*,
+/// token_usage, *_token_update, session_info, compact_*, tool_promoted,
+/// job_cancelled, interrupt, …) and unknown types are dropped so a vocabulary
+/// drift in the KT fork never reintroduces flooding.
+fn normalize_tool_activity(
+    activity_type: &str,
+    value: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let status = match activity_type {
+        "tool_start" | "subagent_tool_start" | "subagent_start" => "running",
+        "tool_done" | "subagent_tool_done" | "subagent_done" => "completed",
+        "tool_error" | "subagent_tool_error" | "subagent_error" => "failed",
+        _ => return None,
+    };
+    let name = value
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            value
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("tool");
+    Some(serde_json::json!({
+        "item_type": "tool_call",
+        "name": name,
+        "status": status,
+    }))
 }
 
 /// Map Switchyard's sandbox mode + workspace onto `kt` headless flags.
@@ -241,6 +412,79 @@ mod tests {
         );
         assert_eq!(kohaku_runtime_args(Some("  "), None), Vec::<String>::new());
         assert_eq!(kohaku_runtime_args(None, Some("low")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn sentinel_filter_withholds_block_split_across_deltas() {
+        let mut filter = SentinelDisplayFilter::new();
+        assert_eq!(filter.push("Hello "), "Hello ");
+        // The BEGIN marker is split across two deltas — nothing must leak.
+        assert_eq!(filter.push("<<<SWITCHYARD_JSON"), "");
+        assert_eq!(filter.push("_BEGIN>>>{\"type\":\"deleg"), "");
+        assert_eq!(filter.push("ate\"}<<<SWITCHYARD_JSON_END>>>"), "");
+        // Prose after the closed block resumes streaming.
+        assert_eq!(filter.push(" world"), " world");
+    }
+
+    #[test]
+    fn sentinel_filter_passes_plain_text_incrementally() {
+        let mut filter = SentinelDisplayFilter::new();
+        assert_eq!(filter.push("a"), "a");
+        assert_eq!(filter.push("bc"), "bc");
+        assert_eq!(filter.push(""), "");
+    }
+
+    #[test]
+    fn sentinel_safe_display_strips_a_complete_block() {
+        let text = "before <<<SWITCHYARD_JSON_BEGIN>>>X<<<SWITCHYARD_JSON_END>>> after";
+        assert_eq!(sentinel_safe_display(text), "before  after");
+    }
+
+    #[test]
+    fn sentinel_safe_display_withholds_pending_block() {
+        let text = "keep <<<SWITCHYARD_JSON_BEGIN>>>{\"partial\":true";
+        assert_eq!(sentinel_safe_display(text), "keep ");
+    }
+
+    #[test]
+    fn normalize_tool_activity_surfaces_tools_and_drops_telemetry() {
+        // Pure telemetry and unknown types are dropped.
+        assert!(normalize_tool_activity("token_usage", &serde_json::json!({})).is_none());
+        assert!(normalize_tool_activity("processing_start", &serde_json::json!({})).is_none());
+        assert!(normalize_tool_activity("session_info", &serde_json::json!({})).is_none());
+        assert!(normalize_tool_activity("brand_new_event", &serde_json::json!({})).is_none());
+
+        // A tool start becomes a running card (the frontend merges it with the
+        // later done/error by name into one transitioning card).
+        let start =
+            normalize_tool_activity("tool_start", &serde_json::json!({"detail": "read"})).unwrap();
+        assert_eq!(
+            start.get("item_type").and_then(|v| v.as_str()),
+            Some("tool_call")
+        );
+        assert_eq!(start.get("name").and_then(|v| v.as_str()), Some("read"));
+        assert_eq!(
+            start.get("status").and_then(|v| v.as_str()),
+            Some("running")
+        );
+
+        let done =
+            normalize_tool_activity("tool_done", &serde_json::json!({"detail": "read"})).unwrap();
+        assert_eq!(
+            done.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
+
+        let errored = normalize_tool_activity(
+            "tool_error",
+            &serde_json::json!({"metadata": {"name": "write"}}),
+        )
+        .unwrap();
+        assert_eq!(errored.get("name").and_then(|v| v.as_str()), Some("write"));
+        assert_eq!(
+            errored.get("status").and_then(|v| v.as_str()),
+            Some("failed")
+        );
     }
 
     #[test]

@@ -100,6 +100,65 @@ async fn kohaku_headless_turn_maps_jsonl_to_events() {
 }
 
 #[tokio::test]
+async fn kohaku_keeps_chat_clean_of_protocol_and_sentinel() {
+    // The fake emits an activity stream, a fragmented SWITCHYARD sentinel block,
+    // and the usual text — the chat path must show only the model's prose: no
+    // terminal mirror of the JSONL protocol, and no sentinel leakage.
+    let mut env = HashMap::new();
+    env.insert("FAKE_KT_SENTINEL".to_string(), "1".to_string());
+    let provider = KohakuProvider::new(fake_kt(), vec!["@fake/creature".to_string()], env, 30);
+    let turn_id = uuid::Uuid::now_v7();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+
+    provider
+        .start_turn(
+            turn_id,
+            input("ping"),
+            policy(),
+            context(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start_turn ok");
+
+    let mut display = String::new();
+    let mut terminal_outputs = 0;
+    while let Some(e) = rx.recv().await {
+        match e.payload.get("item_type").and_then(|v| v.as_str()) {
+            Some("agent_message") => {
+                if let Some(t) = e.payload.get("text").and_then(|v| v.as_str()) {
+                    display.push_str(t);
+                }
+            }
+            Some("terminal_output") => terminal_outputs += 1,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        terminal_outputs, 0,
+        "kt --json protocol lines must not be mirrored as terminal output"
+    );
+    assert!(
+        !display.contains("SWITCHYARD_JSON"),
+        "sentinel must never leak into the chat display, got: {display:?}"
+    );
+    // The surrounding prose still streams (block is withheld, not the text).
+    assert!(display.contains("echo: ping"), "got: {display:?}");
+    assert!(display.contains("Plan:"), "got: {display:?}");
+    assert!(display.contains("done"), "got: {display:?}");
+
+    // The router still sees the full body (block included) for delegation.
+    let (result, _) = provider.finalize_turn(turn_id).await.expect("finalize");
+    assert!(
+        result.response_text.contains("SWITCHYARD_JSON"),
+        "response_text (routing input) keeps the sentinel: {:?}",
+        result.response_text
+    );
+}
+
+#[tokio::test]
 async fn kohaku_headless_turn_failure_propagates() {
     let mut env = HashMap::new();
     env.insert("FAKE_KT_FAIL".to_string(), "1".to_string());

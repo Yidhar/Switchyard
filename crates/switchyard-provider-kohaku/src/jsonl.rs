@@ -2,14 +2,18 @@
 //!
 //! The `switchyard-headless` fork emits one JSON object per line on stdout:
 //! `turn_start`, `text`, `activity` (with `activity_type` + nested
-//! `metadata`), `turn_end` (`status`/`text`/`error`/`usage`), and `error`.
-//! Every line is also passed through verbatim as an `ItemUpdated` event for
-//! the diagnostics drawer; this module only classifies the lines that affect
-//! the assistant text and the turn outcome.
+//! `metadata`), `turn_end` (`status`/`text`/`error`/`usage`), and a top-level
+//! `error`. This module classifies each line into a [`KohakuEvent`]; the
+//! adapter (`turn.rs`) then maps only the user-facing signal onto events:
+//! assistant `text` deltas (sentinel-gated), genuine tool/subagent `activity`
+//! (normalized to collapsed tool cards), and the turn outcome/error. Pure
+//! runtime telemetry and `turn_start` are dropped so the chat shows only the
+//! model's message; the raw protocol is preserved solely in the archived
+//! stdout artifact, not as live `ItemUpdated` events.
 
 use serde_json::Value;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum KohakuEvent {
     /// An assistant text delta (`{"type":"text","content":...}`).
     Text(String),
@@ -19,7 +23,16 @@ pub enum KohakuEvent {
         text: String,
         error: Option<String>,
     },
-    /// activity / turn_start / error / anything else — passed through as-is.
+    /// Runtime activity (`{"type":"activity","activity_type":...,"metadata":...}`).
+    /// `value` is the whole activity object so the adapter can read
+    /// `activity_type` / `detail` / `metadata` when deciding what (if anything)
+    /// to surface.
+    Activity { activity_type: String, value: Value },
+    /// The turn-start marker (`{"type":"turn_start",...}`).
+    TurnStart,
+    /// A top-level fatal error (`{"type":"error","content":...}`).
+    Error(String),
+    /// Anything else — carries no user-facing signal.
     Other,
 }
 
@@ -47,6 +60,23 @@ pub fn classify(json: &Value) -> KohakuEvent {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         },
+        Some("activity") => KohakuEvent::Activity {
+            activity_type: json
+                .get("activity_type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            value: json.clone(),
+        },
+        Some("turn_start") => KohakuEvent::TurnStart,
+        Some("error") => KohakuEvent::Error(
+            json.get("content")
+                .and_then(Value::as_str)
+                .or_else(|| json.get("error").and_then(Value::as_str))
+                .or_else(|| json.get("message").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string(),
+        ),
         _ => KohakuEvent::Other,
     }
 }
@@ -100,14 +130,34 @@ mod tests {
     }
 
     #[test]
-    fn activity_and_turn_start_are_other() {
+    fn classifies_activity_with_type() {
         assert_eq!(
-            classify(&json!({"type": "activity", "activity_type": "tool_start"})),
-            KohakuEvent::Other
+            classify(&json!({"type": "activity", "activity_type": "tool_start", "detail": "read"})),
+            KohakuEvent::Activity {
+                activity_type: "tool_start".to_string(),
+                value: json!({"type": "activity", "activity_type": "tool_start", "detail": "read"}),
+            }
         );
+    }
+
+    #[test]
+    fn classifies_turn_start() {
         assert_eq!(
             classify(&json!({"type": "turn_start", "agent": "x"})),
-            KohakuEvent::Other
+            KohakuEvent::TurnStart
         );
+    }
+
+    #[test]
+    fn classifies_top_level_error() {
+        assert_eq!(
+            classify(&json!({"type": "error", "content": "fatal boom"})),
+            KohakuEvent::Error("fatal boom".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_type_is_other() {
+        assert_eq!(classify(&json!({"type": "mystery"})), KohakuEvent::Other);
     }
 }
