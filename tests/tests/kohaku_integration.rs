@@ -124,6 +124,8 @@ async fn kohaku_keeps_chat_clean_of_protocol_and_sentinel() {
 
     let mut display = String::new();
     let mut terminal_outputs = 0;
+    let mut execution_telemetry = 0;
+    let mut command_executions: Vec<String> = vec![];
     while let Some(e) = rx.recv().await {
         match e.payload.get("item_type").and_then(|v| v.as_str()) {
             Some("agent_message") => {
@@ -132,6 +134,12 @@ async fn kohaku_keeps_chat_clean_of_protocol_and_sentinel() {
                 }
             }
             Some("terminal_output") => terminal_outputs += 1,
+            Some("execution_telemetry") => execution_telemetry += 1,
+            Some("command_execution") => {
+                if let Some(c) = e.payload.get("command").and_then(|v| v.as_str()) {
+                    command_executions.push(c.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -139,6 +147,17 @@ async fn kohaku_keeps_chat_clean_of_protocol_and_sentinel() {
     assert_eq!(
         terminal_outputs, 0,
         "kt --json protocol lines must not be mirrored as terminal output"
+    );
+    assert_eq!(
+        execution_telemetry, 0,
+        "the kt.exe driver must not be surfaced as execution_telemetry (it would \
+         headline the live card as '正在运行 kt.exe' and inflate the command count)"
+    );
+    // The fake runs a `read` tool — it must reach the live card as a counted
+    // command_execution (start->done), not vanish.
+    assert!(
+        command_executions.iter().any(|c| c == "read"),
+        "kt tool activity should surface as command_execution items, got: {command_executions:?}"
     );
     assert!(
         !display.contains("SWITCHYARD_JSON"),

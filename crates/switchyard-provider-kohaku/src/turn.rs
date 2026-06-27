@@ -92,14 +92,12 @@ pub async fn run_kohaku_turn(
 
     let (line_tx, mut line_rx) = mpsc::channel::<StreamingOutputLine>(256);
 
-    event_tx
-        .send(ProviderEvent::execution_telemetry(
-            turn_id,
-            "kohaku",
-            &plan.execution,
-        ))
-        .await
-        .ok();
+    // NOTE: kohaku deliberately does NOT emit execution_telemetry. `kt.exe` is
+    // Switchyard's own driver, not a model action — surfacing it would make the
+    // live-execution card headline read "正在运行 kt.exe" and count the driver
+    // as a command. The real per-tool activity (below) drives the headline and
+    // the command count instead; the resolved invocation is still recorded in
+    // the archived raw-output artifact for replay/diagnostics.
 
     let event_tx_clone = event_tx.clone();
     let consumer = tokio::spawn(async move {
@@ -185,10 +183,10 @@ pub async fn run_kohaku_turn(
                     activity_type,
                     value,
                 } => {
-                    // Translate genuine tool/subagent calls into the shared
-                    // normalized vocabulary so they render as clean, collapsed
-                    // tool cards (matching codex/claude). Pure KT runtime
-                    // telemetry (processing_*, token_usage, session_info,
+                    // Translate genuine tool/subagent calls into normalized
+                    // command_execution items so they're counted and surfaced in
+                    // the live-execution card (matching codex/claude). Pure KT
+                    // runtime telemetry (processing_*, token_usage, session_info,
                     // compact_*, …) is backend noise and is dropped so the chat
                     // shows only the model's message.
                     if let Some(item) = normalize_tool_activity(&activity_type, &value) {
@@ -326,13 +324,15 @@ fn partial_begin_suffix_len(tail: &str) -> usize {
 
 /// Map a KohakuTerrarium `activity` event onto Switchyard's normalized item
 /// vocabulary, or `None` if it is backend runtime *telemetry* that should not
-/// reach the chat. Only genuine tool/subagent calls are surfaced (as
-/// collapsed `tool_call` cards, matching codex/claude); a `*_start` becomes a
-/// running card that the frontend merges with its later `*_done`/`*_error` (by
-/// name) into one transitioning card. Pure telemetry (processing_*,
-/// token_usage, *_token_update, session_info, compact_*, tool_promoted,
-/// job_cancelled, interrupt, …) and unknown types are dropped so a vocabulary
-/// drift in the KT fork never reintroduces flooding.
+/// reach the chat. Genuine tool/subagent calls become `command_execution`
+/// items so the live-execution card counts them ("已运行 N 条命令") and shows
+/// the running one in its headline ("正在运行 <tool>") — the same surfaces
+/// codex/claude drive via their command items. A `*_start` becomes a running
+/// item that the frontend merges (by command) with its later `*_done`/`*_error`
+/// into one transitioning card. Pure telemetry (processing_*, token_usage,
+/// *_token_update, session_info, compact_*, tool_promoted, job_cancelled,
+/// interrupt, …) and unknown types are dropped so a vocabulary drift in the KT
+/// fork never reintroduces flooding.
 fn normalize_tool_activity(
     activity_type: &str,
     value: &serde_json::Value,
@@ -356,8 +356,8 @@ fn normalize_tool_activity(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("tool");
     Some(serde_json::json!({
-        "item_type": "tool_call",
-        "name": name,
+        "item_type": "command_execution",
+        "command": name,
         "status": status,
     }))
 }
@@ -454,15 +454,16 @@ mod tests {
         assert!(normalize_tool_activity("session_info", &serde_json::json!({})).is_none());
         assert!(normalize_tool_activity("brand_new_event", &serde_json::json!({})).is_none());
 
-        // A tool start becomes a running card (the frontend merges it with the
-        // later done/error by name into one transitioning card).
+        // A tool start becomes a running command_execution (the frontend merges
+        // it with the later done/error by command into one transitioning card),
+        // so the live card counts it and shows it in the headline.
         let start =
             normalize_tool_activity("tool_start", &serde_json::json!({"detail": "read"})).unwrap();
         assert_eq!(
             start.get("item_type").and_then(|v| v.as_str()),
-            Some("tool_call")
+            Some("command_execution")
         );
-        assert_eq!(start.get("name").and_then(|v| v.as_str()), Some("read"));
+        assert_eq!(start.get("command").and_then(|v| v.as_str()), Some("read"));
         assert_eq!(
             start.get("status").and_then(|v| v.as_str()),
             Some("running")
@@ -480,7 +481,10 @@ mod tests {
             &serde_json::json!({"metadata": {"name": "write"}}),
         )
         .unwrap();
-        assert_eq!(errored.get("name").and_then(|v| v.as_str()), Some("write"));
+        assert_eq!(
+            errored.get("command").and_then(|v| v.as_str()),
+            Some("write")
+        );
         assert_eq!(
             errored.get("status").and_then(|v| v.as_str()),
             Some("failed")
