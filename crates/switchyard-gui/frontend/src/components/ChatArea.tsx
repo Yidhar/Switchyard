@@ -77,6 +77,9 @@ interface ChatAreaProps {
   historyHasMoreBefore?: boolean;
   onLoadOlderHistory?: () => void | Promise<void>;
   isLoadingOlderHistory?: boolean;
+  /// Registers the composer's imperative API (used by the Explorer's
+  /// "Add to Chat" to stage context files as chips).
+  onComposerReady?: (api: ComposerApi) => void;
 }
 
 const SANDBOX_OPTIONS: Array<{
@@ -1599,6 +1602,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   historyHasMoreBefore = false,
   onLoadOlderHistory,
   isLoadingOlderHistory = false,
+  onComposerReady,
 }) => {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesContentRef = useRef<HTMLDivElement>(null);
@@ -2761,10 +2765,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         handleCancel={composerCancel}
         sandboxMode={sandboxMode}
         onSandboxModeChange={onSandboxModeChange}
+        onReady={onComposerReady}
       />
     </div>
   );
 };
+
+/// Imperative handle the composer registers so other panes (e.g. the file
+/// Explorer's "Add to Chat") can attach context files as removable chips
+/// instead of pasting raw text — the standard AI-IDE pattern.
+export interface ComposerApi {
+  addAttachmentsFromPaths: (paths: string[]) => void;
+}
 
 interface ChatComposerProps {
   selectedSession: Session | null;
@@ -2773,6 +2785,7 @@ interface ChatComposerProps {
   handleCancel: () => void;
   sandboxMode: SandboxMode;
   onSandboxModeChange: (mode: SandboxMode) => void | Promise<void>;
+  onReady?: (api: ComposerApi) => void;
 }
 
 /// Keep the hot typing state local to the composer. Previously `inputText`
@@ -2788,6 +2801,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
   handleCancel,
   sandboxMode,
   onSandboxModeChange,
+  onReady,
 }) => {
   const [inputText, setInputText] = useState('');
   const [attachments, setAttachments] = useState<InputAttachment[]>([]);
@@ -2828,6 +2842,12 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(({
       return next;
     });
   }, []);
+
+  // Expose the composer API so other panes (file Explorer "Add to Chat")
+  // can stage context files as removable chips here.
+  useEffect(() => {
+    onReady?.({ addAttachmentsFromPaths });
+  }, [onReady, addAttachmentsFromPaths]);
 
   const addOrPersistNativeAttachmentPaths = useCallback(async (paths: string[]) => {
     const savedPaths: string[] = [];

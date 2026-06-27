@@ -21,11 +21,12 @@ import { Sidebar } from './components/Sidebar';
 import { IconRail, type RailMode } from './components/IconRail';
 import { AppTopBar } from './components/AppTopBar';
 import { WelcomeWorkspace } from './components/WelcomeWorkspace';
-import { ChatArea } from './components/ChatArea';
+import { ChatArea, type ComposerApi } from './components/ChatArea';
 import type { CanvasMode, CanvasTab } from './components/Canvas';
 import { fetchSnapshot, saveFile } from './components/canvasApi';
 import { StatusBar } from './components/StatusBar';
 import { parseSlash, type SlashContext } from './components/slashCommands';
+import { defaultProviderConfigFor } from './providerCliCapabilities';
 // ArtifactDrawer is no longer rendered — its bottom-bar UX didn't fit
 // the new layout. The import + state are dropped along with the bar.
 import { renderMessageBody, isSystemStatusText, renderTurnEvents, renderTurnActivitySummary } from './components/ui/RenderHelpers';
@@ -50,6 +51,7 @@ import {
 const Canvas = lazy(() => import('./components/Canvas'));
 const ControlCenter = lazy(() => import('./components/ControlCenter'));
 const FilesTree = lazy(() => import('./components/FilesTree'));
+const SearchPanel = lazy(() => import('./components/SearchPanel'));
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
 const SourceControl = lazy(() => import('./components/SourceControl'));
 const TerminalPanel = lazy(() => import('./components/TerminalPanel'));
@@ -1954,6 +1956,23 @@ function App() {
   // Left-rail mode. `chat` shows the session list (current behavior);
   // `files` / `terminal` are placeholders wired to land in later phases.
   const [railMode, setRailMode] = useState<RailMode>('chat');
+  // VS Code-style collapsible side bar: clicking the active rail icon toggles
+  // the second column; switching to a different mode always re-expands it.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const handleRailModeClick = (mode: RailMode) => {
+    if (mode === railMode) {
+      setSidebarCollapsed((c) => !c);
+    } else {
+      setRailMode(mode);
+      setSidebarCollapsed(false);
+    }
+  };
+  // Composer imperative API — the Explorer's "Add to Chat" stages files as
+  // removable context chips here (AI-IDE style), not as pasted text.
+  const composerApiRef = useRef<ComposerApi | null>(null);
+  const handleAddPathsToChat = useCallback((paths: string[]) => {
+    composerApiRef.current?.addAttachmentsFromPaths(paths);
+  }, []);
   const [leftColumnWidth, setLeftColumnWidth] = useState(() =>
     readStoredLayoutNumber(
       'switchyard.leftColumnWidth',
@@ -2032,12 +2051,15 @@ function App() {
   const [canvasTabs, setCanvasTabs] = useState<CanvasTab[]>([]);
   const [activeCanvasTabId, setActiveCanvasTabId] = useState<string | null>(null);
 
-  const openFileInCanvas = useCallback(async (path: string) => {
+  const openFileInCanvas = useCallback(async (path: string, line?: number) => {
     const id = path;
-    // If the tab already exists, focus it without re-reading. User can
-    // hit the refresh button if they want a fresh read.
+    const goto = line ?? null;
+    // If the tab already exists, focus it (and update the goto-line so a
+    // search "go to match" still jumps) without re-reading.
     setCanvasTabs((prev) => {
-      if (prev.some((t) => t.id === id)) return prev;
+      if (prev.some((t) => t.id === id)) {
+        return prev.map((t) => (t.id === id ? { ...t, gotoLine: goto } : t));
+      }
       return [
         ...prev,
         {
@@ -2051,6 +2073,7 @@ function App() {
           dirty: false,
           saving: false,
           ai_before_content: null,
+          gotoLine: goto,
         },
       ];
     });
@@ -5370,8 +5393,11 @@ function App() {
     setConfig((prev) => {
       if (!prev) return null;
       const providersCopy = { ...prev.providers };
+      // Seed a complete default for a built-in that isn't in the config yet,
+      // so editing a single field never produces a partial/broken entry.
+      const base = providersCopy[provider] ?? defaultProviderConfigFor(provider);
       providersCopy[provider] = {
-        ...providersCopy[provider],
+        ...base,
         [field]: value
       };
       return {
@@ -5391,10 +5417,11 @@ function App() {
     setConfig((prev) => {
       if (!prev) return null;
       const providersCopy = { ...prev.providers };
-      const envCopy = { ...providersCopy[provider].env };
+      const base = providersCopy[provider] ?? defaultProviderConfigFor(provider);
+      const envCopy = { ...base.env };
       envCopy[key] = value;
       providersCopy[provider] = {
-        ...providersCopy[provider],
+        ...base,
         env: envCopy
       };
       return { ...prev, providers: providersCopy };
@@ -5429,13 +5456,13 @@ function App() {
     
     // Choose standard backend template
     const backend = prompt(
-      'Choose provider backend type (codex, claude, gemini, antigravity):',
+      'Choose provider backend type (codex, claude, gemini, antigravity, kohaku):',
       'codex',
     );
     if (backend === null) return;
     const trimmedBackend = backend.trim().toLowerCase();
-    if (!['codex', 'claude', 'gemini', 'antigravity'].includes(trimmedBackend)) {
-      alert('Backend must be one of: codex, claude, gemini, antigravity');
+    if (!['codex', 'claude', 'gemini', 'antigravity', 'kohaku'].includes(trimmedBackend)) {
+      alert('Backend must be one of: codex, claude, gemini, antigravity, kohaku');
       return;
     }
 
@@ -5446,7 +5473,9 @@ function App() {
           ? 'claude'
           : trimmedBackend === 'gemini'
             ? 'gemini'
-            : 'agy'; // antigravity ships as `agy`, not `antigravity-cli`
+            : trimmedBackend === 'kohaku'
+              ? 'kt' // KohakuTerrarium ships as `kt`
+              : 'agy'; // antigravity ships as `agy`, not `antigravity-cli`
     const defaultArgs: string[] = [];
 
     setConfig((prev) => {
@@ -5648,6 +5677,10 @@ function App() {
       style={{
         '--switchyard-left-column-width': `${Math.round(leftColumnWidthRef.current)}px`,
         '--switchyard-canvas-column-width': `${Math.round(canvasColumnWidthRef.current)}px`,
+        // Collapse the side bar + its sash to zero-width columns (VS Code-style).
+        ...(sidebarCollapsed
+          ? { gridTemplateColumns: 'auto 0px 0px minmax(0, 1fr)' }
+          : {}),
       } as CSSProperties}
     >
       <AppTopBar
@@ -5655,7 +5688,10 @@ function App() {
         workspaces={workspaces}
         railMode={railMode}
         terminalOpen={terminalOpen}
-        onRailModeChange={setRailMode}
+        onRailModeChange={(m) => {
+          setRailMode(m);
+          setSidebarCollapsed(false);
+        }}
         onSwitchWorkspace={handleSwitchWorkspace}
         onRenameWorkspace={handleRenameWorkspace}
         onOpenFolder={handleOpenFolderAsWorkspace}
@@ -5670,7 +5706,7 @@ function App() {
       {/* 0. Icon Rail — mode switcher + bottom settings control. */}
       <IconRail
         mode={railMode}
-        onModeChange={setRailMode}
+        onModeChange={handleRailModeClick}
         onOpenDiagnostics={() => setDrawerOpen((v) => !v)}
         onOpenSettings={() => setShowSettings(true)}
       />
@@ -5683,7 +5719,7 @@ function App() {
         className="left-column"
         style={{
           width: '100%',
-          display: 'flex',
+          display: sidebarCollapsed ? 'none' : 'flex',
           flexDirection: 'column',
           flexShrink: 0,
           borderRight: '1px solid var(--border-muted)',
@@ -5717,7 +5753,13 @@ function App() {
               onOpenFile={openFileInCanvas}
               onAddFolder={handleAddFolderToCurrentWorkspace}
               onRemoveExtraRoot={handleRemoveExtraRoot}
+              onAddToChat={(p) => handleAddPathsToChat([p])}
             />
+          </Suspense>
+        )}
+        {railMode === 'search' && (
+          <Suspense fallback={<LazyPanelFallback label="Loading search…" />}>
+            <SearchPanel onOpenFile={openFileInCanvas} />
           </Suspense>
         )}
         {railMode === 'source_control' && (
@@ -5740,6 +5782,7 @@ function App() {
         aria-orientation="vertical"
         className="layout-sash layout-sash-vertical layout-sash-sidebar"
         title="Drag to resize side bar · Double-click to reset"
+        style={{ display: sidebarCollapsed ? 'none' : undefined }}
         onPointerDown={startLeftColumnResize}
         onDoubleClick={() => {
           appContainerRef.current?.style.setProperty(
@@ -5783,6 +5826,9 @@ function App() {
           <div className="chat-pane" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
             {currentWorkspace ? (
               <ChatArea
+                onComposerReady={(api) => {
+                  composerApiRef.current = api;
+                }}
                 selectedSession={selectedSession}
                 isGenerating={isGenerating}
                 turns={turns}

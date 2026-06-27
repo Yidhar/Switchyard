@@ -2244,6 +2244,480 @@ async fn list_dir(
     Ok(entries)
 }
 
+/// Copy or move a file/folder within the current workspace (Explorer
+/// cut/copy → paste). `src` and `dest_dir` are workspace-relative (resolved
+/// the same scoped way as `list_dir`); an empty/"." `dest_dir` means the
+/// primary root. `mode` is "cut" (move) or "copy". Target name collisions are
+/// disambiguated with a " copy" suffix rather than clobbering.
+#[tauri::command]
+async fn fs_paste_entry(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    src: String,
+    dest_dir: String,
+    mode: String,
+) -> Result<(), String> {
+    let ws = workspace_state.current()?;
+    let repo_root = workspace_state.git_repo_root();
+    let src_path = resolve_workspace_path(&ws, &src, repo_root.as_deref())?;
+    let dest_parent = if dest_dir.trim().is_empty() || dest_dir == "." {
+        ws.primary_root.clone()
+    } else {
+        resolve_workspace_path(&ws, &dest_dir, repo_root.as_deref())?
+    };
+    if !dest_parent.is_dir() {
+        return Err(format!("destination is not a folder: {}", dest_parent.display()));
+    }
+    let name = src_path
+        .file_name()
+        .ok_or_else(|| "invalid source path".to_string())?
+        .to_owned();
+    let mut target = dest_parent.join(&name);
+    if target == src_path || target.exists() {
+        target = unique_paste_target(&dest_parent, &src_path);
+    }
+    if src_path.is_dir() && target.starts_with(&src_path) {
+        return Err("cannot paste a folder into itself".to_string());
+    }
+
+    let cut = mode == "cut";
+    let outcome = (|| -> std::io::Result<()> {
+        if cut {
+            if std::fs::rename(&src_path, &target).is_ok() {
+                return Ok(());
+            }
+            // Cross-device / non-empty-dir rename fallback: copy then delete.
+            copy_recursive(&src_path, &target)?;
+            if src_path.is_dir() {
+                std::fs::remove_dir_all(&src_path)?;
+            } else {
+                std::fs::remove_file(&src_path)?;
+            }
+            Ok(())
+        } else {
+            copy_recursive(&src_path, &target)
+        }
+    })();
+    outcome.map_err(|e| format!("paste failed: {e}"))
+}
+
+/// Pick a non-colliding target name in `dir` based on `src`'s name, e.g.
+/// `report.md` → `report copy.md` → `report copy 2.md`.
+fn unique_paste_target(dir: &std::path::Path, src: &std::path::Path) -> std::path::PathBuf {
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = src
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let mut n = 1u32;
+    loop {
+        let suffix = if n == 1 {
+            " copy".to_string()
+        } else {
+            format!(" copy {n}")
+        };
+        let candidate = dir.join(format!("{stem}{suffix}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Recursively copy a file or directory tree.
+fn copy_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SearchMatch {
+    path: String,
+    line: u32,
+    text: String,
+    /// Char-offset [start, end) spans of matches within `text`, for highlighting.
+    spans: Vec<[u32; 2]>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceSummary {
+    files_changed: u32,
+    replacements: u32,
+}
+
+#[derive(serde::Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SearchOptions {
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default)]
+    whole_word: bool,
+    #[serde(default)]
+    regex: bool,
+    /// Match file paths instead of file contents.
+    #[serde(default)]
+    filename: bool,
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+/// Build a Rust regex from the query + toggles (used for filename search and
+/// replace; content search uses ripgrep with matching flags).
+fn build_search_regex(query: &str, opts: &SearchOptions) -> Result<regex::Regex, String> {
+    let mut pattern = if opts.regex {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    };
+    if opts.whole_word {
+        pattern = format!(r"\b(?:{pattern})\b");
+    }
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(!opts.case_sensitive)
+        .build()
+        .map_err(|e| format!("invalid pattern: {e}"))
+}
+
+/// Number of chars before byte offset `byte_idx` in `s` (byte → char index).
+fn byte_to_char(s: &str, byte_idx: usize) -> u32 {
+    s.char_indices().take_while(|(b, _)| *b < byte_idx).count() as u32
+}
+
+/// VS Code-style workspace search across the primary root. Content mode uses
+/// ripgrep (fast, .gitignore-aware) when available, else a bounded built-in
+/// walk; filename mode matches file paths. Honors case / whole-word / regex.
+/// `path` is workspace-relative; `spans` mark hits for highlighting.
+#[tauri::command]
+async fn search_workspace(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    query: String,
+    options: Option<SearchOptions>,
+) -> Result<Vec<SearchMatch>, String> {
+    let ws = workspace_state.current()?;
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let opts = options.unwrap_or_default();
+    let root = ws.primary_root.clone();
+    let cap = opts.max_results.unwrap_or(500).min(2000);
+    if opts.filename {
+        return filename_search(&root, &query, &opts, cap).await;
+    }
+    if let Some(hits) = ripgrep_search(&root, &query, &opts, cap).await {
+        return Ok(hits);
+    }
+    fallback_search(&root, &query, &opts, cap)
+}
+
+fn rg_match_flags(cmd: &mut tokio::process::Command, opts: &SearchOptions) {
+    if !opts.regex {
+        cmd.arg("--fixed-strings");
+    }
+    if opts.whole_word {
+        cmd.arg("--word-regexp");
+    }
+    if opts.case_sensitive {
+        cmd.arg("--case-sensitive");
+    } else {
+        cmd.arg("--ignore-case");
+    }
+}
+
+#[cfg(windows)]
+fn rg_no_window(cmd: &mut tokio::process::Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn rg_no_window(_cmd: &mut tokio::process::Command) {}
+
+async fn ripgrep_search(
+    root: &std::path::Path,
+    query: &str,
+    opts: &SearchOptions,
+    cap: usize,
+) -> Option<Vec<SearchMatch>> {
+    let mut cmd = tokio::process::Command::new("rg");
+    cmd.arg("--json")
+        .arg("--line-number")
+        .arg("--no-heading")
+        .arg("--max-count")
+        .arg("200");
+    rg_match_flags(&mut cmd, opts);
+    cmd.arg("-e").arg(query).arg(root);
+    rg_no_window(&mut cmd);
+    // Spawn failure (rg not installed) → None so we fall back. A non-zero exit
+    // (no matches) still yields Ok with empty stdout, which is fine.
+    let output = cmd.output().await.ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hits = Vec::new();
+    for line in stdout.lines() {
+        if hits.len() >= cap {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("match") {
+            continue;
+        }
+        let Some(data) = v.get("data") else { continue };
+        let abs = data
+            .get("path")
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str());
+        let line_no = data.get("line_number").and_then(|n| n.as_u64());
+        let raw = data
+            .get("lines")
+            .and_then(|l| l.get("text"))
+            .and_then(|t| t.as_str());
+        let (Some(abs), Some(line_no), Some(raw)) = (abs, line_no, raw) else {
+            continue;
+        };
+        let trimmed = raw.trim_end_matches(['\r', '\n']);
+        let display: String = trimmed.chars().take(400).collect();
+        let max_char = display.chars().count() as u32;
+        let mut spans = Vec::new();
+        if let Some(subs) = data.get("submatches").and_then(|s| s.as_array()) {
+            for sm in subs {
+                let bs = sm.get("start").and_then(|x| x.as_u64());
+                let be = sm.get("end").and_then(|x| x.as_u64());
+                if let (Some(bs), Some(be)) = (bs, be) {
+                    let cs = byte_to_char(trimmed, bs as usize);
+                    let ce = byte_to_char(trimmed, be as usize).min(max_char);
+                    if cs < max_char && ce > cs {
+                        spans.push([cs, ce]);
+                    }
+                }
+            }
+        }
+        let rel = std::path::Path::new(abs)
+            .strip_prefix(root)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| abs.to_string());
+        hits.push(SearchMatch {
+            path: rel,
+            line: line_no as u32,
+            text: display,
+            spans,
+        });
+    }
+    Some(hits)
+}
+
+fn fallback_search(
+    root: &std::path::Path,
+    query: &str,
+    opts: &SearchOptions,
+    cap: usize,
+) -> Result<Vec<SearchMatch>, String> {
+    let re = build_search_regex(query, opts)?;
+    let mut out = Vec::new();
+    for file in walk_collect_files(root, 50_000) {
+        if out.len() >= cap {
+            break;
+        }
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .to_string();
+        for (i, line) in content.lines().enumerate() {
+            if out.len() >= cap {
+                break;
+            }
+            let display: String = line.chars().take(400).collect();
+            let max_char = display.chars().count() as u32;
+            let spans: Vec<[u32; 2]> = re
+                .find_iter(line)
+                .map(|m| {
+                    [
+                        byte_to_char(line, m.start()),
+                        byte_to_char(line, m.end()).min(max_char),
+                    ]
+                })
+                .filter(|s| s[0] < max_char && s[1] > s[0])
+                .collect();
+            if !spans.is_empty() {
+                out.push(SearchMatch {
+                    path: rel.clone(),
+                    line: (i + 1) as u32,
+                    text: display,
+                    spans,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn filename_search(
+    root: &std::path::Path,
+    query: &str,
+    opts: &SearchOptions,
+    cap: usize,
+) -> Result<Vec<SearchMatch>, String> {
+    let re = build_search_regex(query, opts)?;
+    let files = match ripgrep_list_files(root).await {
+        Some(f) => f,
+        None => walk_collect_files(root, 50_000),
+    };
+    let mut out = Vec::new();
+    for file in files {
+        if out.len() >= cap {
+            break;
+        }
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .to_string();
+        if let Some(m) = re.find(&rel) {
+            let cs = byte_to_char(&rel, m.start());
+            let ce = byte_to_char(&rel, m.end());
+            out.push(SearchMatch {
+                path: rel.clone(),
+                line: 0,
+                text: rel,
+                spans: vec![[cs, ce]],
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// List all files via `rg --files` (gitignore-aware). None if rg is absent.
+async fn ripgrep_list_files(root: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+    let mut cmd = tokio::process::Command::new("rg");
+    cmd.arg("--files").arg(root);
+    rg_no_window(&mut cmd);
+    let output = cmd.output().await.ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(stdout.lines().map(std::path::PathBuf::from).collect())
+}
+
+/// Bounded recursive file walk (fallback when ripgrep is unavailable).
+fn walk_collect_files(root: &std::path::Path, limit: usize) -> Vec<std::path::PathBuf> {
+    let skip = [
+        "node_modules",
+        ".git",
+        "target",
+        "dist",
+        ".venv",
+        "__pycache__",
+    ];
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if files.len() >= limit {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                if !name.starts_with('.') && !skip.contains(&name.as_str()) {
+                    stack.push(p);
+                }
+            } else if files.len() < limit {
+                files.push(p);
+            }
+        }
+    }
+    files
+}
+
+/// Files containing at least one match, via `rg --files-with-matches`. None if
+/// rg is absent (callers fall back to a full walk + per-file regex check).
+async fn ripgrep_files_with_matches(
+    root: &std::path::Path,
+    query: &str,
+    opts: &SearchOptions,
+) -> Option<Vec<std::path::PathBuf>> {
+    let mut cmd = tokio::process::Command::new("rg");
+    cmd.arg("--files-with-matches");
+    rg_match_flags(&mut cmd, opts);
+    cmd.arg("-e").arg(query).arg(root);
+    rg_no_window(&mut cmd);
+    let output = cmd.output().await.ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(stdout.lines().map(std::path::PathBuf::from).collect())
+}
+
+/// Batch find-and-replace across the workspace. Returns how many files changed
+/// and total replacements. Literal mode does not expand `$` in `replacement`.
+#[tauri::command]
+async fn replace_in_workspace(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    query: String,
+    replacement: String,
+    options: Option<SearchOptions>,
+) -> Result<ReplaceSummary, String> {
+    let ws = workspace_state.current()?;
+    if query.trim().is_empty() {
+        return Err("empty search query".to_string());
+    }
+    let opts = options.unwrap_or_default();
+    if opts.filename {
+        return Err("replace is not supported in filename mode".to_string());
+    }
+    let root = ws.primary_root.clone();
+    let re = build_search_regex(&query, &opts)?;
+    let files = match ripgrep_files_with_matches(&root, &query, &opts).await {
+        Some(f) => f,
+        None => walk_collect_files(&root, 50_000),
+    };
+    let mut files_changed = 0u32;
+    let mut replacements = 0u32;
+    for file in files {
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let count = re.find_iter(&content).count() as u32;
+        if count == 0 {
+            continue;
+        }
+        let new_content = if opts.regex {
+            re.replace_all(&content, replacement.as_str()).into_owned()
+        } else {
+            re.replace_all(&content, regex::NoExpand(replacement.as_str()))
+                .into_owned()
+        };
+        if new_content != content {
+            std::fs::write(&file, &new_content)
+                .map_err(|e| format!("write {}: {e}", file.display()))?;
+            files_changed += 1;
+            replacements += count;
+        }
+    }
+    Ok(ReplaceSummary {
+        files_changed,
+        replacements,
+    })
+}
+
 // ===========================================================================
 // Source Control (git) Tauri commands
 // ===========================================================================
@@ -2483,6 +2957,13 @@ fn default_role_names(name: &str) -> Vec<String> {
         // safe default is "worker" only — let the user opt it in to core
         // explicitly via config if they really want plain-text core.
         "antigravity" => vec!["worker".to_string()],
+        // KohakuTerrarium streams structured JSONL (headless fork), so it can
+        // serve as a core as well as a leaf worker/analyst peer.
+        "kohaku" => vec![
+            "worker".to_string(),
+            "analyst".to_string(),
+            "core".to_string(),
+        ],
         _ => vec!["worker".to_string()],
     }
 }
@@ -2522,6 +3003,7 @@ async fn collect_provider_statuses(
         "claude".to_string(),
         "gemini".to_string(),
         "antigravity".to_string(),
+        "kohaku".to_string(),
     ]);
     provider_names.extend(config.providers.keys().cloned());
     provider_names.extend(registry.names().into_iter().map(ToOwned::to_owned));
@@ -2629,9 +3111,15 @@ async fn load_config(
     workspace_state: tauri::State<'_, WorkspaceState>,
 ) -> Result<SwitchyardConfig, String> {
     let Ok(ws) = workspace_state.current() else {
-        // No workspace selected is now a first-class state. Return an
-        // in-memory default config and, importantly, do not create
+        // No workspace selected is now a first-class state. Load the global
+        // app config (~/.switchyard/switchyard.toml) if present so global
+        // settings persist; otherwise in-memory defaults. Never create
         // switchyard.toml in the GUI process cwd.
+        if let Some(path) = switchyard_config::global_config_path()
+            && path.is_file()
+        {
+            return Ok(SwitchyardConfig::from_file(&path).unwrap_or_default());
+        }
         return Ok(SwitchyardConfig::default());
     };
     let cwd = ws.primary_root;
@@ -2712,12 +3200,74 @@ async fn save_config(
     workspace_state: tauri::State<'_, WorkspaceState>,
     config: SwitchyardConfig,
 ) -> Result<(), String> {
-    let cwd = workspace_state.current()?.primary_root;
-    let config_path = cwd.join("switchyard.toml");
+    // With a workspace open, save to its switchyard.toml. With no workspace,
+    // persist to the global app config (~/.switchyard/switchyard.toml) so
+    // "global settings" don't require a project — the app has its own home.
+    let config_path = match workspace_state.current() {
+        Ok(ws) => ws.primary_root.join("switchyard.toml"),
+        Err(_) => {
+            let path = switchyard_config::global_config_path()
+                .ok_or_else(|| "cannot resolve home directory for global config".to_string())?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create global config dir: {e}"))?;
+            }
+            path
+        }
+    };
     config
         .write_to(&config_path)
         .map_err(|e| format!("failed to save config: {}", e))?;
     Ok(())
+}
+
+/// List KohakuTerrarium model selectors (`provider/preset`) by parsing
+/// `<command> model list`, to populate the Settings model dropdown. Best-effort:
+/// returns an empty list on any failure so the UI simply shows no suggestions.
+#[tauri::command]
+async fn list_kohaku_models(command: Option<String>) -> Result<Vec<String>, String> {
+    let cmd = command
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "kt".to_string());
+    let mut process = tokio::process::Command::new(&cmd);
+    // `config llm list --all` = kt's full model table: user presets +
+    // built-in presets (anthropic/codex/gemini/glm/...). Columns are
+    // `[marker] Name Provider Model ...`; the `--llm` selector is `provider/name`.
+    process.args(["config", "llm", "list", "--all"]);
+    #[cfg(windows)]
+    {
+        // tokio's Command has an inherent `creation_flags` on Windows.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        process.creation_flags(CREATE_NO_WINDOW);
+    }
+    let Ok(output) = process.output().await else {
+        return Ok(Vec::new());
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut models = Vec::new();
+    let mut past_separator = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("---") {
+            past_separator = true;
+            continue;
+        }
+        if !past_separator || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("Tip:") || trimmed.starts_with("Profiles file") {
+            continue;
+        }
+        // Drop the leading status marker (✓ default / · built-in) then read
+        // Name + Provider → `provider/name`.
+        let cleaned = trimmed.trim_start_matches(['✓', '·', ' ']);
+        let mut toks = cleaned.split_whitespace();
+        if let (Some(name), Some(provider)) = (toks.next(), toks.next()) {
+            models.push(format!("{provider}/{name}"));
+        }
+    }
+    Ok(models)
 }
 
 #[tauri::command]
@@ -4495,6 +5045,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             load_config,
             save_config,
+            list_kohaku_models,
             list_provider_status_quick,
             list_provider_status,
             list_sessions,
@@ -4547,6 +5098,9 @@ fn main() {
             read_file,
             write_file,
             list_dir,
+            fs_paste_entry,
+            search_workspace,
+            replace_in_workspace,
             // Hook installer surface
             hook_install,
             hook_uninstall,

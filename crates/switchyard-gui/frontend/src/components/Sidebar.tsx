@@ -51,7 +51,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onRenameSession,
 }) => {
   const providers = config ? Object.keys(config.providers || {}) : [];
-  const defaults = ['codex', 'claude', 'gemini', 'antigravity'];
+  const defaults = ['codex', 'claude', 'gemini', 'antigravity', 'kohaku'];
   const allProviders = Array.from(new Set([...providers, ...defaults]));
 
   const [editingSessionId, setEditingSessionId] = React.useState<string | null>(null);

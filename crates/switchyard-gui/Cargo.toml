@@ -26,6 +26,7 @@ uuid = { workspace = true }
 notify = "6"
 portable-pty = { workspace = true }
 base64 = "0.22"
+regex = "1"
 
 [build-dependencies]
 tauri-build = { version = "2.0.3", features = [] }

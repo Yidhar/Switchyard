@@ -2,15 +2,16 @@ import React from 'react';
 import {
   MessageSquare,
   FolderOpen,
+  Search,
   GitBranch,
   Activity,
   Settings as SettingsIcon,
 } from 'lucide-react';
 
-/// Modes the second column (Workspace / Files / Source Control) can show.
+/// Modes the second column (Workspace / Files / Search / Source Control) can show.
 /// Terminal is deliberately not a rail mode — its toggle lives in the
 /// bottom StatusBar (matching VS Code's status-bar-driven terminal panel).
-export type RailMode = 'chat' | 'files' | 'source_control';
+export type RailMode = 'chat' | 'files' | 'search' | 'source_control';
 
 interface IconRailProps {
   mode: RailMode;
@@ -126,6 +127,13 @@ export const IconRail: React.FC<IconRailProps> = ({
         title="Files — workspace file tree"
       >
         <FolderOpen size={18} />
+      </RailButton>
+      <RailButton
+        active={mode === 'search'}
+        onClick={() => onModeChange('search')}
+        title="Search — find in workspace"
+      >
+        <Search size={18} />
       </RailButton>
       <RailButton
         active={mode === 'source_control'}
