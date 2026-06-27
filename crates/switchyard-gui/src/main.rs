@@ -1614,6 +1614,26 @@ fn update_workspace(
     Ok(updated)
 }
 
+/// Record the core provider last used in a workspace so reopening it restores
+/// the same default. Persisted in workspaces.json; does not bump `updated_at`
+/// (a provider switch shouldn't reorder the recents list).
+#[tauri::command]
+fn set_workspace_core(
+    workspace_state: tauri::State<'_, WorkspaceState>,
+    workspace_id: String,
+    provider: String,
+) -> Result<(), String> {
+    let id =
+        uuid::Uuid::parse_str(&workspace_id).map_err(|e| format!("invalid workspace ID: {}", e))?;
+    workspace_state.mutate(|idx| {
+        let ws = idx
+            .get_mut(id)
+            .ok_or_else(|| format!("workspace {id} not found"))?;
+        ws.core_provider = Some(provider.clone()).filter(|p| !p.trim().is_empty());
+        Ok(())
+    })
+}
+
 #[tauri::command]
 fn delete_workspace(
     app: tauri::AppHandle,
@@ -3271,6 +3291,100 @@ async fn list_kohaku_models(command: Option<String>) -> Result<Vec<String>, Stri
         }
     }
     Ok(models)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KohakuCreature {
+    /// `@<package>/creatures/<name>` ref to pass as the kt agent_path.
+    reference: String,
+    package: String,
+    name: String,
+    /// "creature" or "terrarium".
+    kind: String,
+}
+
+/// List the creatures/terrariums available from KohakuTerrarium's installed
+/// packages (kt-biome / kohaku-creatures, the ecosystem YAML agents) by
+/// parsing `kt list`, so the GUI can offer them as the kt backend's agent
+/// instead of hand-typing a `@pkg/creatures/<name>` ref.
+#[tauri::command]
+async fn list_kohaku_creatures(command: Option<String>) -> Result<Vec<KohakuCreature>, String> {
+    let cmd = command
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "kt".to_string());
+    let mut process = tokio::process::Command::new(&cmd);
+    process.arg("list");
+    rg_no_window(&mut process);
+    let Ok(output) = process.output().await else {
+        return Ok(Vec::new());
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut out = Vec::new();
+    let mut pkg = String::new();
+    for line in stdout.lines() {
+        if line.starts_with("    ") {
+            // Detail line (4-space indent): Creatures:/Terrariums: lists.
+            let trimmed = line.trim();
+            let (rest, kind, segment) = if let Some(r) = trimmed.strip_prefix("Creatures:") {
+                (Some(r), "creature", "creatures")
+            } else if let Some(r) = trimmed.strip_prefix("Terrariums:") {
+                (Some(r), "terrarium", "terrariums")
+            } else {
+                (None, "", "")
+            };
+            if let Some(rest) = rest {
+                if pkg.is_empty() {
+                    continue;
+                }
+                for name in rest.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    out.push(KohakuCreature {
+                        reference: format!("@{pkg}/{segment}/{name}"),
+                        package: pkg.clone(),
+                        name: name.to_string(),
+                        kind: kind.to_string(),
+                    });
+                }
+            }
+        } else if line.starts_with("  ") {
+            // Package header (2-space indent): "<pkg> vX.Y.Z".
+            if let Some((name, ver)) = line.trim().split_once(' ') {
+                if ver.starts_with('v') {
+                    pkg = name.to_string();
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One-click install of the official kt-biome creature pack (`kt install
+/// @kt-biome`). Returns the CLI output; errors carry stderr for display.
+#[tauri::command]
+async fn kohaku_install_biome(command: Option<String>) -> Result<String, String> {
+    let cmd = command
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "kt".to_string());
+    let mut process = tokio::process::Command::new(&cmd);
+    process.arg("install").arg("@kt-biome");
+    rg_no_window(&mut process);
+    let output = process
+        .output()
+        .await
+        .map_err(|e| format!("run `{cmd} install @kt-biome`: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .trim()
+        .to_string())
+    }
 }
 
 #[tauri::command]
@@ -5049,6 +5163,8 @@ fn main() {
             load_config,
             save_config,
             list_kohaku_models,
+            list_kohaku_creatures,
+            kohaku_install_biome,
             list_provider_status_quick,
             list_provider_status,
             list_sessions,
@@ -5096,6 +5212,7 @@ fn main() {
             clear_current_workspace,
             create_workspace,
             update_workspace,
+            set_workspace_core,
             delete_workspace,
             // Filesystem (workspace-scoped)
             read_file,

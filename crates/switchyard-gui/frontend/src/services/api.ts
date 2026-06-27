@@ -38,6 +38,29 @@ export const listKohakuModels = (command?: string): Promise<string[]> => {
   return invoke<string[]>('list_kohaku_models', { command: command ?? null });
 };
 
+// Record the core provider last used in a workspace (restored on reopen).
+export const setWorkspaceCore = (workspaceId: string, provider: string): Promise<void> => {
+  return invoke<void>('set_workspace_core', { workspaceId, provider });
+};
+
+// A KohakuTerrarium ecosystem agent (creature/terrarium) from installed packages.
+export interface KohakuCreature {
+  reference: string;
+  package: string;
+  name: string;
+  kind: string;
+}
+
+// List creatures/terrariums available from kt's installed packages (kt-biome…).
+export const listKohakuCreatures = (command?: string): Promise<KohakuCreature[]> => {
+  return invoke<KohakuCreature[]>('list_kohaku_creatures', { command: command ?? null });
+};
+
+// One-click install of the official kt-biome creature pack.
+export const kohakuInstallBiome = (command?: string): Promise<string> => {
+  return invoke<string>('kohaku_install_biome', { command: command ?? null });
+};
+
 export const runTurn = (
   sessionId: string,
   message: string,

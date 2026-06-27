@@ -77,6 +77,8 @@ export interface Workspace {
   name: string;
   primary_root: string;
   extra_roots: string[];
+  /// Core provider last used in this workspace (restored on reopen).
+  core_provider: string | null;
   created_at: string;
   updated_at: string;
 }
