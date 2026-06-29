@@ -2585,7 +2585,7 @@ export function renderTurnActivitySummary(
   const latestTerminalLine = terminalTail[terminalTail.length - 1] ?? null;
   const runningEdit = editSummaries.find((item) => item.status === 'running' || item.status === 'pending');
   const latestEdit = runningEdit ?? (turnIsActive ? editSummaries[editSummaries.length - 1] : undefined);
-  const runningCommand = displayToolCalls.find((tool) => isCommandTool(tool) && (tool.status === 'running' || tool.status === 'pending'));
+  const runningTool = displayToolCalls.find((tool) => tool.status === 'running' || tool.status === 'pending');
   const hasActivity = Boolean(commandLine || displayToolCalls.length > 0 || combinedTerminal.length > 0);
   const runtimePhase = options.runtimePhase;
   const phaseStatusText = runtimePhaseStatusText(runtimePhase, turnIsActive);
@@ -2594,31 +2594,38 @@ export function renderTurnActivitySummary(
     runtimePhase === 'output_completed' ||
     runtimePhase === 'finalizing' ||
     runtimePhase === 'failed';
+  // Non-command, non-edit tool calls (read / search / …) — counted separately
+  // from shell commands and file edits so a provider that mostly calls tools
+  // (e.g. kohaku) still shows its activity in the summary.
+  const toolCallCount = displayToolCalls.filter(
+    (tool) => !isCommandTool(tool) && !isEditTool(tool),
+  ).length;
   const summaryParts = [
     createdCount > 0 ? `已创建 ${createdCount} 个文件` : null,
     editedCompletedCount > 0 ? `已编辑 ${editedCompletedCount} 个文件` : null,
     editingCount > 0 ? `正在编辑 ${editingCount} 个文件` : null,
     failedEditCount > 0 ? `${failedEditCount} 个文件编辑失败` : null,
     commandCount > 0 ? `已运行 ${commandCount} 条命令` : null,
+    toolCallCount > 0 ? `已调用 ${toolCallCount} 个工具` : null,
     showPhaseStatus ? phaseStatusText : null,
   ].filter(Boolean);
 
   const phaseIsActive = runtimePhase === 'running' || runtimePhase === 'output_completed' || runtimePhase === 'finalizing';
   const showSpinner = phaseIsActive || turnIsActive || hasRunningTool || hasLiveTerminal;
   const detailToolCalls = displayToolCalls.filter((tool) => !actionableTools.includes(tool));
-  // Prefer a currently-running command; otherwise fall back to the most recent
-  // command that already ran. Without this, a provider whose tools have all
-  // completed (e.g. kohaku between tool batches, with no launcher commandLine)
-  // would fall through to the "暂无工具事件" status even though `commandCount`
-  // shows commands ran — a confusing contradiction.
-  const latestCommandTool = runningCommand
-    ?? [...displayToolCalls].reverse().find((tool) => isCommandTool(tool));
-  const commandActivity = latestCommandTool
-    ? activeToolInputLabel(latestCommandTool)
+  // Headline: show the latest tool activity — a currently-running tool (command
+  // or otherwise), else the most recent tool that ran. The non-command fallback
+  // matters for providers whose tools are mostly non-command and complete fast
+  // (e.g. kohaku running read/write/edit): without it the card would fall
+  // through to the "暂无工具事件" status even though tools clearly ran.
+  const latestActivityTool = runningTool
+    ?? (displayToolCalls.length > 0 ? displayToolCalls[displayToolCalls.length - 1] : undefined);
+  const commandActivity = latestActivityTool
+    ? activeToolInputLabel(latestActivityTool)
     : commandLine
       ? truncateActivityText(`${commandLine}${commandArgsSuffix(state.commandArgs)}`, 180)
       : null;
-  const commandVerb = runningCommand || hasRunningTool || hasLiveTerminal || (!latestCommandTool && runtimePhase === 'running')
+  const commandVerb = runningTool || hasLiveTerminal || (!latestActivityTool && runtimePhase === 'running')
     ? '正在运行'
     : '已运行';
   const editActivity = latestEdit
@@ -2763,12 +2770,12 @@ export function renderTurnActivitySummary(
                 {commandLine}{commandArgsSuffix(state.commandArgs)}
               </code>
             )}
-            {detailToolCalls.slice(0, 5).map((tool, idx) => (
-              <ToolCard key={tool.id || idx} tool={tool} />
-            ))}
             {detailToolCalls.length > 5 && (
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>还有 {detailToolCalls.length - 5} 项执行详情会在回合结束后折叠显示。</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>更早的 {detailToolCalls.length - 5} 项执行详情已折叠，回合结束后可查看完整列表。</div>
             )}
+            {detailToolCalls.slice(-5).map((tool) => (
+              <ToolCard key={tool.id} tool={tool} />
+            ))}
             {combinedTerminal.length > 0 && (
               <pre style={{ margin: 0, padding: '8px 10px', background: '#0c0f1d', borderRadius: 6, color: '#38bdf8', fontFamily: 'monospace', fontSize: 11, maxHeight: 140, overflowY: 'auto', border: '1px solid #1e293b', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                 {combinedTerminal.slice(-80).join('\n')}
