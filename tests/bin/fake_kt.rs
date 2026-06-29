@@ -21,10 +21,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     eprintln!("[fake_kt] argv = {args:?}");
 
-    // The adapter must always request the headless JSONL surface.
+    // The adapter must always request the headless JSONL surface, and quiet
+    // kt's stderr to errors only so benign plugin warnings don't pollute the UI.
     if !args.iter().any(|a| a == "--headless") || !args.iter().any(|a| a == "--json") {
         eprintln!("[fake_kt] missing --headless/--json");
         std::process::exit(3);
+    }
+    if !args.iter().any(|a| a == "--log-level") {
+        eprintln!("[fake_kt] missing --log-level (stderr noise must be quieted)");
+        std::process::exit(4);
     }
 
     let prompt = args
@@ -73,13 +78,16 @@ fn main() {
         );
     }
 
+    // Real kt tool activity: start carries job_id ("<tool>_<shortid>") + args;
+    // done carries the same job_id + the result. The adapter derives the tool
+    // name from job_id and merges start/done into one card by that id.
     emit(
         &mut out,
-        serde_json::json!({"type":"activity","activity_type":"tool_start","detail":"read","metadata":{"name":"read","args":{"path":"x"}}}),
+        serde_json::json!({"type":"activity","activity_type":"tool_start","detail":"[read[ab12]] path=x","metadata":{"job_id":"read_ab12cd","args":{"path":"x"},"background":false}}),
     );
     emit(
         &mut out,
-        serde_json::json!({"type":"activity","activity_type":"tool_done","detail":"read","metadata":{}}),
+        serde_json::json!({"type":"activity","activity_type":"tool_done","detail":"[read[ab12]]","metadata":{"job_id":"read_ab12cd","result":"file body","tools_used":[]}}),
     );
     emit(
         &mut out,

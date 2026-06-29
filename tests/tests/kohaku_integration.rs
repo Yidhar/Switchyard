@@ -125,7 +125,7 @@ async fn kohaku_keeps_chat_clean_of_protocol_and_sentinel() {
     let mut display = String::new();
     let mut terminal_outputs = 0;
     let mut execution_telemetry = 0;
-    let mut command_executions: Vec<String> = vec![];
+    let mut tool_calls: Vec<(String, Option<String>)> = vec![];
     while let Some(e) = rx.recv().await {
         match e.payload.get("item_type").and_then(|v| v.as_str()) {
             Some("agent_message") => {
@@ -135,9 +135,14 @@ async fn kohaku_keeps_chat_clean_of_protocol_and_sentinel() {
             }
             Some("terminal_output") => terminal_outputs += 1,
             Some("execution_telemetry") => execution_telemetry += 1,
-            Some("command_execution") => {
-                if let Some(c) = e.payload.get("command").and_then(|v| v.as_str()) {
-                    command_executions.push(c.to_string());
+            Some("tool_call") => {
+                if let Some(name) = e.payload.get("name").and_then(|v| v.as_str()) {
+                    let id = e
+                        .payload
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    tool_calls.push((name.to_string(), id));
                 }
             }
             _ => {}
@@ -153,11 +158,19 @@ async fn kohaku_keeps_chat_clean_of_protocol_and_sentinel() {
         "the kt.exe driver must not be surfaced as execution_telemetry (it would \
          headline the live card as '正在运行 kt.exe' and inflate the command count)"
     );
-    // The fake runs a `read` tool — it must reach the live card as a counted
-    // command_execution (start->done), not vanish.
+    // The fake runs a `read` tool (start+done) — it must surface as tool_call
+    // items named "read" (not a generic "Execute Command"), carrying the stable
+    // job_id so the two merge into one card.
     assert!(
-        command_executions.iter().any(|c| c == "read"),
-        "kt tool activity should surface as command_execution items, got: {command_executions:?}"
+        tool_calls.iter().any(|(name, _)| name == "read"),
+        "kt tool activity should surface as named tool_call items, got: {tool_calls:?}"
+    );
+    assert!(
+        tool_calls
+            .iter()
+            .filter(|(name, _)| name == "read")
+            .all(|(_, id)| id.as_deref() == Some("read_ab12cd")),
+        "tool_call start/done must share the kt job_id so they merge, got: {tool_calls:?}"
     );
     assert!(
         !display.contains("SWITCHYARD_JSON"),

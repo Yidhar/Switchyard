@@ -61,7 +61,7 @@ pub async fn run_kohaku_turn(
         return Err(err);
     }
 
-    // argv: kt run <creature [+user extras]> --headless --json
+    // argv: kt run <creature [+user extras]> --headless --json --log-level error
     //          [--llm <sel>] --sandbox <preset> --cwd <dir> --no-subagents
     //          -p <prompt>
     // The creature ref must lead so it binds to the required `agent_path`
@@ -70,6 +70,14 @@ pub async fn run_kohaku_turn(
     args.extend_from_slice(configured_args);
     args.push("--headless".to_string());
     args.push("--json".to_string());
+    // Quiet kt's stderr to errors only. Plugins (e.g. kt-biome's PEV verifier
+    // and OpenTelemetry exporter) log benign WARNING-level "plugin disabled /
+    // no-op" noise on every build; Switchyard captures kt stderr and surfaces it
+    // as a failed turn's reason + a diagnostics artifact, so that noise would
+    // otherwise dominate the view. Real turn outcomes arrive on the stdout JSONL
+    // (`turn_end`), independent of this log level, so nothing actionable is lost.
+    args.push("--log-level".to_string());
+    args.push("ERROR".to_string());
     args.extend(kohaku_runtime_args(model, thinking_level));
     args.extend(kohaku_policy_args(policy));
     // Leaf execution: a routed/peer run must not spawn sub-agents.
@@ -184,11 +192,11 @@ pub async fn run_kohaku_turn(
                     value,
                 } => {
                     // Translate genuine tool/subagent calls into normalized
-                    // command_execution items so they're counted and surfaced in
-                    // the live-execution card (matching codex/claude). Pure KT
-                    // runtime telemetry (processing_*, token_usage, session_info,
-                    // compact_*, …) is backend noise and is dropped so the chat
-                    // shows only the model's message.
+                    // tool_call items (real name + args + result) so the
+                    // live-execution card shows what the model actually did.
+                    // Pure KT runtime telemetry (processing_*, token_usage,
+                    // session_info, compact_*, …) is backend noise and is
+                    // dropped so the chat shows only the model's message.
                     if let Some(item) = normalize_tool_activity(&activity_type, &value) {
                         event_tx_clone
                             .send(ProviderEvent::new(
@@ -324,15 +332,16 @@ fn partial_begin_suffix_len(tail: &str) -> usize {
 
 /// Map a KohakuTerrarium `activity` event onto Switchyard's normalized item
 /// vocabulary, or `None` if it is backend runtime *telemetry* that should not
-/// reach the chat. Genuine tool/subagent calls become `command_execution`
-/// items so the live-execution card counts them ("已运行 N 条命令") and shows
-/// the running one in its headline ("正在运行 <tool>") — the same surfaces
-/// codex/claude drive via their command items. A `*_start` becomes a running
-/// item that the frontend merges (by command) with its later `*_done`/`*_error`
-/// into one transitioning card. Pure telemetry (processing_*, token_usage,
-/// *_token_update, session_info, compact_*, tool_promoted, job_cancelled,
-/// interrupt, …) and unknown types are dropped so a vocabulary drift in the KT
-/// fork never reintroduces flooding.
+/// reach the chat. Genuine tool/subagent calls become `tool_call` items so the
+/// live-execution card shows the real tool name (not a generic "Execute
+/// Command"), the call arguments (file path / content, collapsible via the
+/// card's Show-Input toggle), and the result. The KT `job_id`
+/// (`<tool>_<shortid>`, stable across start/done) is used as the item id so a
+/// `*_start` (running, with args) and its later `*_done`/`*_error` (with the
+/// result) merge into ONE transitioning card. Pure telemetry (processing_*,
+/// token_usage, *_token_update, session_info, compact_*, tool_promoted,
+/// job_cancelled, interrupt, …) and unknown types are dropped so a vocabulary
+/// drift in the KT fork never reintroduces flooding.
 fn normalize_tool_activity(
     activity_type: &str,
     value: &serde_json::Value,
@@ -343,23 +352,53 @@ fn normalize_tool_activity(
         "tool_error" | "subagent_tool_error" | "subagent_error" => "failed",
         _ => return None,
     };
-    let name = value
-        .get("detail")
+    let metadata = value.get("metadata");
+    let job_id = metadata
+        .and_then(|m| m.get("job_id"))
         .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    // KT job_id is "<tool_name>_<shortid>"; strip the suffix for a clean title.
+    let name = job_id
+        .map(|id| id.rsplit_once('_').map(|(head, _)| head).unwrap_or(id))
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
-            value
-                .get("metadata")
+            metadata
                 .and_then(|m| m.get("name"))
                 .and_then(|v| v.as_str())
         })
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("tool");
-    Some(serde_json::json!({
-        "item_type": "command_execution",
-        "command": name,
-        "status": status,
-    }))
+
+    let mut item = serde_json::Map::new();
+    item.insert("item_type".into(), serde_json::json!("tool_call"));
+    item.insert("name".into(), serde_json::json!(name));
+    item.insert("status".into(), serde_json::json!(status));
+    // Stable id so start/done/error for the same call merge into one card.
+    if let Some(id) = job_id {
+        item.insert("id".into(), serde_json::json!(id));
+    }
+    // Call arguments (path / content / …) — shown via the card's Show-Input
+    // toggle, truncated there when long.
+    if let Some(args) = metadata.and_then(|m| m.get("args"))
+        && !args.is_null()
+    {
+        item.insert("arguments".into(), args.clone());
+    }
+    // Tool result (done/error) — shown as the card output (diff-aware,
+    // collapsed when large).
+    if let Some(result) = metadata.and_then(|m| m.get("result"))
+        && !result.is_null()
+        && result.as_str() != Some("")
+    {
+        item.insert("output".into(), result.clone());
+    }
+    if status == "failed"
+        && let Some(error) = metadata.and_then(|m| m.get("error"))
+        && !error.is_null()
+    {
+        item.insert("error".into(), error.clone());
+    }
+    Some(serde_json::Value::Object(item))
 }
 
 /// Map Switchyard's sandbox mode + workspace onto `kt` headless flags.
@@ -454,40 +493,68 @@ mod tests {
         assert!(normalize_tool_activity("session_info", &serde_json::json!({})).is_none());
         assert!(normalize_tool_activity("brand_new_event", &serde_json::json!({})).is_none());
 
-        // A tool start becomes a running command_execution (the frontend merges
-        // it with the later done/error by command into one transitioning card),
-        // so the live card counts it and shows it in the headline.
-        let start =
-            normalize_tool_activity("tool_start", &serde_json::json!({"detail": "read"})).unwrap();
+        // A tool start becomes a running tool_call carrying the real name (from
+        // the KT job_id), the call args (shown via Show-Input), and the stable
+        // id (so done/error merge into one card).
+        let start = normalize_tool_activity(
+            "tool_start",
+            &serde_json::json!({
+                "detail": "[read[ab12]] path=x",
+                "metadata": {"job_id": "read_ab12cd", "args": {"path": "x"}}
+            }),
+        )
+        .unwrap();
         assert_eq!(
             start.get("item_type").and_then(|v| v.as_str()),
-            Some("command_execution")
+            Some("tool_call")
         );
-        assert_eq!(start.get("command").and_then(|v| v.as_str()), Some("read"));
+        assert_eq!(start.get("name").and_then(|v| v.as_str()), Some("read"));
+        assert_eq!(
+            start.get("id").and_then(|v| v.as_str()),
+            Some("read_ab12cd")
+        );
         assert_eq!(
             start.get("status").and_then(|v| v.as_str()),
             Some("running")
         );
+        assert_eq!(
+            start
+                .get("arguments")
+                .and_then(|a| a.get("path"))
+                .and_then(|v| v.as_str()),
+            Some("x")
+        );
 
-        let done =
-            normalize_tool_activity("tool_done", &serde_json::json!({"detail": "read"})).unwrap();
+        // The matching done carries the same id (→ merge) and the result.
+        let done = normalize_tool_activity(
+            "tool_done",
+            &serde_json::json!({"metadata": {"job_id": "read_ab12cd", "result": "file body"}}),
+        )
+        .unwrap();
+        assert_eq!(done.get("id").and_then(|v| v.as_str()), Some("read_ab12cd"));
         assert_eq!(
             done.get("status").and_then(|v| v.as_str()),
             Some("completed")
         );
+        assert_eq!(
+            done.get("output").and_then(|v| v.as_str()),
+            Some("file body")
+        );
 
+        // tool_error surfaces the error and a failed status.
         let errored = normalize_tool_activity(
             "tool_error",
-            &serde_json::json!({"metadata": {"name": "write"}}),
+            &serde_json::json!({"metadata": {"job_id": "write_99", "error": "denied"}}),
         )
         .unwrap();
-        assert_eq!(
-            errored.get("command").and_then(|v| v.as_str()),
-            Some("write")
-        );
+        assert_eq!(errored.get("name").and_then(|v| v.as_str()), Some("write"));
         assert_eq!(
             errored.get("status").and_then(|v| v.as_str()),
             Some("failed")
+        );
+        assert_eq!(
+            errored.get("error").and_then(|v| v.as_str()),
+            Some("denied")
         );
     }
 
