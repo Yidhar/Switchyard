@@ -61,7 +61,7 @@ pub async fn run_kohaku_turn(
         return Err(err);
     }
 
-    // argv: kt run <creature [+user extras]> --headless --json
+    // argv: kt run <creature [+user extras]> --headless --json --log-level error
     //          [--llm <sel>] --sandbox <preset> --cwd <dir> --no-subagents
     //          -p <prompt>
     // The creature ref must lead so it binds to the required `agent_path`
@@ -70,6 +70,14 @@ pub async fn run_kohaku_turn(
     args.extend_from_slice(configured_args);
     args.push("--headless".to_string());
     args.push("--json".to_string());
+    // Quiet kt's stderr to errors only. Plugins (e.g. kt-biome's PEV verifier
+    // and OpenTelemetry exporter) log benign WARNING-level "plugin disabled /
+    // no-op" noise on every build; Switchyard captures kt stderr and surfaces it
+    // as a failed turn's reason + a diagnostics artifact, so that noise would
+    // otherwise dominate the view. Real turn outcomes arrive on the stdout JSONL
+    // (`turn_end`), independent of this log level, so nothing actionable is lost.
+    args.push("--log-level".to_string());
+    args.push("ERROR".to_string());
     args.extend(kohaku_runtime_args(model, thinking_level));
     args.extend(kohaku_policy_args(policy));
     // Leaf execution: a routed/peer run must not spawn sub-agents.

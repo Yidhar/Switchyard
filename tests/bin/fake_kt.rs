@@ -21,10 +21,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     eprintln!("[fake_kt] argv = {args:?}");
 
-    // The adapter must always request the headless JSONL surface.
+    // The adapter must always request the headless JSONL surface, and quiet
+    // kt's stderr to errors only so benign plugin warnings don't pollute the UI.
     if !args.iter().any(|a| a == "--headless") || !args.iter().any(|a| a == "--json") {
         eprintln!("[fake_kt] missing --headless/--json");
         std::process::exit(3);
+    }
+    if !args.iter().any(|a| a == "--log-level") {
+        eprintln!("[fake_kt] missing --log-level (stderr noise must be quieted)");
+        std::process::exit(4);
     }
 
     let prompt = args
